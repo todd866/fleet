@@ -210,9 +210,23 @@ def wire_accounts(config, users=None, admins=None):
     return out
 
 
+def wire_public_repos(config, text=None):
+    """Repositories anyone can read. Off unless the site sets "github": true (it needs `gh` signed in).
+    A private repository turning public is how work leaks from a Mac whose agents can push."""
+    if not config.get("github"):
+        return {}
+    if text is None:
+        text = run(["gh", "repo", "list", "--visibility", "public", "--json", "nameWithOwner", "--limit", "1000"],
+                   timeout=40)
+    try:
+        return {f"public repository {row['nameWithOwner']}": "public" for row in json.loads(text)}
+    except (TypeError, ValueError, KeyError):
+        return None  # offline, signed out or rate-limited: could not look
+
+
 REMEMBERED = {"listeners", "accounts"}
 WIRES = {"files": wire_files, "guards": wire_guards, "launchd": wire_launchd,
-         "listeners": wire_listeners, "accounts": wire_accounts}
+         "listeners": wire_listeners, "accounts": wire_accounts, "public_repos": wire_public_repos}
 
 
 def registered_labels(config):
