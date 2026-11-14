@@ -502,6 +502,14 @@ fn push_treats_plus_refspec_and_mirror_as_force_and_asks_on_remote_delete() {
     assert!(decide("push", "git push origin --delete old-branch", &c).is_ask());
     assert!(decide("push", "git push -d origin old-branch", &c).is_ask());
     assert!(decide("push", "git push origin :old-branch", &c).is_ask());
+    // the refusal tells the agent to rerun with the owner's marker, so the marker answers it
+    assert!(decide("push", "AGENTKIT_PUSH_APPROVED=1 git push origin --delete old-branch", &c).is_allow());
+    assert!(decide("push", "AGENTKIT_PUSH_APPROVED=1 git -C ../other push origin --delete a b c", &c).is_allow());
+    // only as a prefix of that one command, alone on the line; and never for force-with-lease
+    assert!(decide("push", "AGENTKIT_PUSH_APPROVED=1 git push --force-with-lease origin topic", &c).is_ask());
+    assert!(decide("push", "echo AGENTKIT_PUSH_APPROVED=1; git push origin --delete old-branch", &c).is_ask());
+    assert!(decide("push", "AGENTKIT_PUSH_APPROVED=1 git push origin main && git push origin --delete old-branch", &c).is_ask());
+    assert!(decide("push", "AGENTKIT_PUSH_APPROVED=1 git push origin --delete old-branch; git push origin --delete other", &c).is_ask());
     assert!(decide("push", "git push origin main", &c).is_allow());
     assert!(decide("push", "git push origin HEAD:main", &c).is_allow());
     assert!(decide("push", "git push -u origin feature/a+b", &c).is_allow());

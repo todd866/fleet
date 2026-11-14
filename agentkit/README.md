@@ -115,4 +115,23 @@ line is still checked.
 Project-only rules (shared-tree `git add -A`, a worktree `db:seed`) stay in that
 project's own hook. This crate does not replace them.
 
+### What the guards do not do
+
+They read a command line; they do not run a shell. They stop the accident and the
+plain command, and they refuse a line they cannot read when it is about their
+subject. They are not a sandbox, and an agent that sets out to get round one is
+breaking the rule that guards are satisfied, never dodged. Known gaps, kept on
+purpose because closing them would refuse ordinary work:
+
+- A delete or kill carried by another program's own option or API (a search tool's
+  preprocessor option, a pager variable, an interpreter calling `os.kill` or
+  `subprocess`) is caught only for the forms listed in the tests.
+- A path reached through a variable set earlier (`d=$HOME/Documents; ... "$d"`) or
+  through a glob is not resolved.
+- Only Claude's file-edit tools are judged by path; the Codex and Cursor hooks see
+  shell commands only.
+- An approval marker is an honour system: `AGENTKIT_PUSH_APPROVED=1` answers a gated
+  push, and a remote branch delete when it prefixes that one command alone on its
+  line. It never answers a force push or `--force-with-lease`.
+
 The switch checklist is [docs/agentkit/switch-provider.md](../docs/agentkit/switch-provider.md).

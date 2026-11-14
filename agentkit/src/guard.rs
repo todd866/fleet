@@ -1559,22 +1559,37 @@ fn push(cmd: &str, cfg: &GuardConfig) -> Decision {
             "A `+refspec` or `--mirror` push overwrites remote history, the same as --force. Use `--force-with-lease` only with the owner's approval.",
         );
     }
-    // Deleting a remote branch is routine but not undoable from here: confirm it.
+    let mut markers = cfg.push_markers.clone();
+    if !markers.iter().any(|m| m == "AGENTKIT_PUSH_APPROVED=1") {
+        markers.push("AGENTKIT_PUSH_APPROVED=1".into());
+    }
+    // Deleting a remote branch is routine but not undoable from here: confirm it. The refusal
+    // tells the caller to rerun with the owner's marker, so the marker answers it, but only as
+    // an assignment on that very `git push`, on a line that is that one command. A marker
+    // elsewhere on a compound line approves nothing here.
     if compiled(r"\bgit\s+push\b[^|;&]*\s(?:--delete\b|-d\b|:[^\s|;&]+)").is_match(&c) {
+        let lone = !compiled(r"[|;&`]|\$\(").is_match(c.trim()) && !cmd.trim().contains('\n');
+        let prefixed = markers.iter().any(|marker| {
+            let pat = format!(
+                r"^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*{}\s+(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*git\s+push\b",
+                escape_literal(marker)
+            );
+            compiled(&pat).is_match(&c)
+        });
+        if lone && prefixed {
+            return Decision::allow();
+        }
         return Decision::ask(
             "push-delete",
-            "This push deletes a branch or tag on the remote. Confirm it is merged or backed up.",
+            "This push deletes a branch or tag on the remote. Confirm it is merged or backed up and that the owner approved; then run it alone as `AGENTKIT_PUSH_APPROVED=1 git push ... --delete ...`.",
         );
     }
+    // Force-with-lease rewrites history: no marker answers it.
     if compiled(r"--force-with-lease\b").is_match(&c) {
         return Decision::ask(
             "force-with-lease",
             "Force-with-lease still rewrites the remote branch. Confirm this is your branch and the owner approved.",
         );
-    }
-    let mut markers = cfg.push_markers.clone();
-    if !markers.iter().any(|m| m == "AGENTKIT_PUSH_APPROVED=1") {
-        markers.push("AGENTKIT_PUSH_APPROVED=1".into());
     }
     for marker in &markers {
         let pat = format!(r"(^|[\s;&|]){}\b", escape_literal(marker));
