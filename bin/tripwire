@@ -439,6 +439,22 @@ def release(name, config=None, owner=False, kill=os.kill):
     return 0
 
 
+def agent_is_gone(pid, started):
+    """True only when it is certain: the pid does not exist, or it now belongs to a process with
+    another start time. Anything unknown (no pid or start recorded, `ps` failed) is not 'gone';
+    the ordinary timeout covers it."""
+    if not pid or not started:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    now_started = process_start(pid)
+    return now_started is not None and now_started != started
+
+
 def release_stale(config, now, kill=os.kill, spawn=subprocess.Popen, **hooks):
     """A hold whose agent never reported: after hold_timeout_min a stopped process or job goes on
     again (that hold costs work), a file that grants access or wires in a guard stays put back
@@ -452,7 +468,7 @@ def release_stale(config, now, kill=os.kill, spawn=subprocess.Popen, **hooks):
         age = now - record.get("raised_epoch", now)
         # An agent that has exited without a report (out of allowance, crashed) is not coming back:
         # try the fallback command once, and failing that do not wait out the hour.
-        died = bool(record.get("agent_pid")) and age > 60 and process_start(record["agent_pid"]) != record.get("agent_started")
+        died = age > 60 and agent_is_gone(record.get("agent_pid"), record.get("agent_started"))
         if died and config.get("summon_fallback") and not record.get("fallback_tried"):
             record["fallback_tried"] = True
             try:
@@ -462,8 +478,9 @@ def release_stale(config, now, kill=os.kill, spawn=subprocess.Popen, **hooks):
                 with open(path.parent / "agent.log", "ab") as log:
                     agent = spawn(command, cwd=str(path.parent), stdin=subprocess.DEVNULL, stdout=log, stderr=log,
                                   start_new_session=True)
-                record["agent_pid"] = getattr(agent, "pid", None)
-                record["agent_started"] = process_start(record["agent_pid"]) if record["agent_pid"] else None
+                pid = getattr(agent, "pid", None)
+                started = process_start(pid) if pid else None
+                record["agent_pid"], record["agent_started"] = (pid, started) if started else (None, None)
                 record["agent"] = "first agent exited without a report; fallback agent summoned"
                 write_json(path, record)
                 continue
@@ -526,8 +543,9 @@ def summon(config, incident, host, now, found=(), record=None, spawn=subprocess.
             agent = spawn(command, cwd=str(incident), stdin=subprocess.DEVNULL, stdout=log, stderr=log,
                           start_new_session=True)
         pid = getattr(agent, "pid", None)
-        if pid:
-            record["agent_pid"], record["agent_started"] = pid, process_start(pid)
+        started = process_start(pid) if pid else None
+        if started:  # without a start time the pid cannot be told from a later process: leave it to the timeout
+            record["agent_pid"], record["agent_started"] = pid, started
     except OSError as exc:
         if holds:  # nobody is coming to look, so do not leave it paused
             record["release_notes"] = undo_holds(holds, kill=kill)
