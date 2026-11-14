@@ -70,3 +70,5 @@ unread_mail_h = 12
 [projects]
 heavy_runtime_s = 60
 active_host = "primary"
+# A repo's check result file older than this is a warn (the repo's own max_age_h wins).
+check_max_age_h = 30

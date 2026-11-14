@@ -5,3 +5,9 @@
 command = "cargo test --quiet -p heavy-slot"
 max_runtime_s = 180
 where = "hub"
+
+# Optional: the file this repo's own scheduled check writes. `fleet morning` reads it into a
+# `check <repo>` row and never starts `command`. JSON: status (pass|warn|fail), value, datum,
+# detail, generated (epoch seconds). Older than max_age_h is a warn. See docs/morning.md.
+# result = "~/.local/state/heavy-slot/check.json"
+# max_age_h = 30
