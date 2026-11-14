@@ -22,7 +22,7 @@ Bash originals under `spec/` are the behavioural spec for heavy-slot and agent-m
 
 **Not in this tree (yet):** `remote-run`, `offload-target`, `ai-capacity`, Glancebar integration scripts, and fleet-morning digests. See [docs/architecture.md](docs/architecture.md) for the full layer map and gaps.
 
-**Tested where:** on the author's Macs, with `cargo test --workspace` and the Python tests in `tests/` (`scripts/check.sh` runs the light checks). There is no hosted CI yet. Multi-machine behaviour is integration-tested with fixture hosts and fake SSH; treat first install on your own fleet as production validation.
+**Tested where:** every push runs `cargo test --workspace` on a GitHub macOS runner ([![ci](https://github.com/todd866/fleet/actions/workflows/ci.yml/badge.svg)](https://github.com/todd866/fleet/actions/workflows/ci.yml)), and the author's Macs run the same tests plus the Python tests of the private tree. Multi-machine behaviour is integration-tested with fixture hosts and fake SSH; treat first install on your own fleet as production validation.
 
 ## Five-minute quick start (two Macs, two tools)
 
