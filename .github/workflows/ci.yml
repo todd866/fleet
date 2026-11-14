@@ -1,0 +1,26 @@
+# Published as .github/workflows/ci.yml in the public repository only.
+# The private tree has no hosted CI: its checks run on the author's Macs (scripts/check.sh).
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        run: rustup update stable && rustup default stable && cargo --version
+      - name: Rust tests
+        run: cargo test --workspace --locked
+      - name: Shell and Python tools parse
+        run: |
+          zsh -n bin/utc-daily
+          python3 -m py_compile bin/utc-schedule bin/git-stale-locks
