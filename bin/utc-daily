@@ -14,13 +14,17 @@
 # In the plist: ProgramArguments = /bin/zsh, this file, the options, "--", the command.
 # The command is run as a child and never exec'd, so macOS privacy checks keep seeing /bin/zsh.
 #
-# A run is due when the UTC clock has passed a slot today and that slot has not started today.
-# A Mac that was asleep at the slot runs at its next tick. A Mac that was off all day skips
-# that day. --weekday counts in UTC, 0 = Sunday.
+# A run is due when a slot has passed, has not started, and is no more than 18 hours old
+# ($UTC_DAILY_CATCHUP seconds). A Mac that was asleep at the slot runs at its next tick, also when
+# that tick falls after midnight UTC. A Mac that was off for longer skips that slot.
+# --weekday is the UTC weekday of the slot, 0 = Sunday.
+# A run cut short (restart, power loss, launchd's TERM at shutdown) is tried once more at the next
+# tick; a tick that finds the earlier run still going does nothing.
 # --retry: a run that fails leaves its slot open, so the next start tries again. For plists
 # with KeepAlive { SuccessfulExit = false }, where launchd restarts a failed job until it works.
 #
-# State: ~/.local/state/utc-daily/NAME/  done-HHMM (UTC date the slot last started) and
+# State: ~/.local/state/utc-daily/NAME/  done-HHMM (UTC date of the slot that last started),
+# running (slot, date, pid, boot time, attempt; empty when idle) and
 # last (one line: start epoch, end epoch, slot, exit code). A tick that is not due prints
 # nothing and exits 0; a tick that runs exits with the command's code.
 emulate -L zsh
@@ -30,6 +34,8 @@ root=${UTC_DAILY_STATE:-$HOME/.local/state/utc-daily}
 
 if [[ ${1:-} == status ]]; then
   for d in $root/${2:-*}(N/); do
+    marks=($d/done-*(N))
+    (( ${#marks} )) || [[ -f $d/last ]] || continue     # not a job's folder
     [[ -f $d/last ]] || { print -r -- "${d:t}  never run"; continue }
     read -r start end slot rc < $d/last
     print -r -- "${d:t}  $(date -u -r $start '+%Y-%m-%d %H:%MZ')  slot ${slot}Z  exit $rc  $(( end - start )) s"
@@ -38,7 +44,7 @@ if [[ ${1:-} == status ]]; then
 fi
 
 label='' weekday='' retry=0
-typeset -a slots
+typeset -a slots marks
 while (( $# )); do
   case $1 in
     --label) label=$2; shift 2 ;;
@@ -58,33 +64,74 @@ done
 [[ -z $weekday || $weekday == [0-6] ]] || { print -u2 "utc-daily: --weekday is 0-6, Sunday is 0"; exit 64 }
 
 now=${UTC_DAILY_NOW:-$(date -u +%s)}
-today=$(date -u -r $now +%Y-%m-%d)
-hhmm=$(date -u -r $now +%H%M)
-[[ -z $weekday || $(date -u -r $now +%w) == $weekday ]] || exit 0
+window=${UTC_DAILY_CATCHUP:-64800}
+day0=$(( now - now % 86400 ))
+boot=$(/usr/sbin/sysctl -n kern.boottime 2>/dev/null)
+boot=${${boot#*sec = }%%,*}
 
 dir=$root/$label
 mkdir -p $dir || exit 73
 
-# The latest slot that has passed and not started today. Earlier ones are marked too, so a Mac
-# that slept through two slots runs once, not twice in a row.
-due=''
+# An earlier run that never finished. Still going: leave it alone. Cut short (a restart, a power
+# loss, a kill): its slot opens again, once. A run that is cut twice stays done for the day.
+prevkey='' prevdate='' prevtry=0
+if [[ -s $dir/running ]]; then
+  read -r rkey rdate rpid rboot rtry < $dir/running
+  if [[ $rboot == $boot && $rpid == <-> ]] && kill -0 $rpid 2>/dev/null; then
+    exit 0
+  fi
+  prevkey=$rkey prevdate=$rdate prevtry=${rtry:-1}
+  if (( prevtry < 2 )) && [[ -f $dir/done-$rkey && $(<$dir/done-$rkey) == $rdate ]]; then
+    : > $dir/done-$rkey
+  fi
+  : > $dir/running
+fi
+
+# Each slot's most recent instant: today's if the clock has passed it, otherwise yesterday's. The
+# latest one that has not started and is no more than the catch-up window old is due. Earlier ones
+# are marked too, so a Mac that slept through two slots runs once, not twice in a row.
+# A slot seen for the first time after its day has ended is marked, not run: installing a job
+# does not fire last night's slot.
+due='' duet=0 duedate=''
+typeset -A slotdate slottime
 for s in ${(o)slots}; do
   key=${s/:/}
-  (( 10#$hhmm >= 10#$key )) || continue
-  [[ -f $dir/done-$key && $(<$dir/done-$key) == $today ]] && continue
-  due=$s
+  t=$(( day0 + 10#${s%%:*} * 3600 + 10#${s##*:} * 60 ))
+  (( t > now )) && (( t -= 86400 ))
+  d=$(date -u -r $t +%Y-%m-%d)
+  slotdate[$key]=$d slottime[$key]=$t
+  if [[ ! -f $dir/done-$key ]]; then
+    (( t < day0 )) && { print -r -- $d > $dir/done-$key; continue }
+  elif [[ $(<$dir/done-$key) == $d ]]; then
+    continue
+  fi
+  (( now - t <= window )) || continue
+  [[ -z $weekday || $(date -u -r $t +%w) == $weekday ]] || continue
+  (( t > duet )) && { due=$s duet=$t duedate=$d }
 done
 [[ -n $due ]] || exit 0
-for s in $slots; do
-  key=${s/:/}
-  (( 10#$key <= 10#${due/:/} )) && print -r -- $today > $dir/done-$key
+for key in ${(k)slottime}; do
+  (( slottime[$key] <= duet )) && print -r -- $slotdate[$key] > $dir/done-$key
 done
 
+duekey=${due/:/}
+try=1
+[[ $duekey == $prevkey && $duedate == $prevdate ]] && try=$(( prevtry + 1 ))
+print -r -- "$duekey $duedate $$ $boot $try" > $dir/running
+
+cut=0
 "$@" &
 child=$!
-trap 'kill -TERM $child 2>/dev/null' TERM INT HUP
+trap 'cut=1; kill -TERM $child 2>/dev/null' TERM INT HUP
 wait $child; rc=$?
 while kill -0 $child 2>/dev/null; do wait $child; rc=$?; done
 print -r -- "$now $(date -u +%s) $due $rc" > $dir/last.tmp && mv -f $dir/last.tmp $dir/last
-(( retry && rc != 0 )) && : > $dir/done-${due/:/}
+if (( cut && try < 2 )); then
+  # ended from outside (launchd at shutdown): the next tick tries once more
+  : > $dir/done-$duekey
+  print -r -- "$duekey $duedate - - $try" > $dir/running
+else
+  : > $dir/running
+  (( retry && rc != 0 )) && : > $dir/done-$duekey
+fi
 exit $rc

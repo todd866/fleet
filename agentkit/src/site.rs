@@ -26,7 +26,20 @@ pub struct GuardConfig {
     /// and the caller fills it. The library decision uses this string as the worker name.
     pub offload_worker: Option<String>,
     pub resolve_ssh: bool,
+    /// heavy-slot's state directory. `None` means `<home>/.local/state/heavy-slot`, the
+    /// directory heavy-slot itself uses when `HEAVY_SLOT_DIR` is not set.
+    pub slot_state_dir: Option<PathBuf>,
+    /// File names in that directory that only the fleet's own tools and the owner write.
+    pub slot_files: Vec<String>,
+    /// Names of owner-approval marker files. A trailing `*` matches any ending.
+    pub approval_file_patterns: Vec<String>,
+    /// Regular expressions that name the backup client's destructive cleanup.
+    pub idrive_cleanup_patterns: Vec<String>,
 }
+
+pub const DEFAULT_SLOT_FILES: &[&str] = &["limit", "cool"];
+pub const DEFAULT_APPROVAL_FILE_PATTERNS: &[&str] = &["APPROVE_*"];
+pub const DEFAULT_IDRIVE_CLEANUP_PATTERNS: &[&str] = &[r"(?i)archive[\s_.-]*clean[\s_-]*up"];
 
 impl Default for GuardConfig {
     fn default() -> Self {
@@ -46,6 +59,10 @@ impl Default for GuardConfig {
             push_gate_remotes: Vec::new(),
             offload_worker: None,
             resolve_ssh: env::var("AGENTKIT_SKIP_SSH_RESOLVE").ok().as_deref() != Some("1"),
+            slot_state_dir: None,
+            slot_files: DEFAULT_SLOT_FILES.iter().map(|s| (*s).to_string()).collect(),
+            approval_file_patterns: DEFAULT_APPROVAL_FILE_PATTERNS.iter().map(|s| (*s).to_string()).collect(),
+            idrive_cleanup_patterns: DEFAULT_IDRIVE_CLEANUP_PATTERNS.iter().map(|s| (*s).to_string()).collect(),
         }
     }
 }
@@ -63,6 +80,13 @@ pub fn default_cd_roots(home: &Path) -> Vec<PathBuf> {
 }
 
 impl GuardConfig {
+    /// Where heavy-slot keeps `limit`, `cool`, its slot locks and its queue.
+    pub fn slot_dir(&self) -> PathBuf {
+        self.slot_state_dir
+            .clone()
+            .unwrap_or_else(|| self.home.join(".local/state/heavy-slot"))
+    }
+
     pub fn is_air(&self, host: &str) -> bool {
         let name = host.rsplit('@').next().unwrap_or(host).to_ascii_lowercase();
         if self.air_aliases.iter().any(|a| a.eq_ignore_ascii_case(&name))
@@ -132,6 +156,18 @@ pub struct GuardFile {
     /// stays in the private config; nothing from it is written into the repo.
     #[serde(default)]
     pub email_substrings_file: Option<String>,
+    /// heavy-slot's state directory, when it is not `~/.local/state/heavy-slot`.
+    #[serde(default)]
+    pub slot_state_dir: Option<String>,
+    /// Files in it that are not edited by hand. Default: `limit`, `cool`.
+    #[serde(default)]
+    pub slot_files: Vec<String>,
+    /// Owner-approval marker file names. Default: `APPROVE_*`.
+    #[serde(default)]
+    pub approval_file_patterns: Vec<String>,
+    /// Regular expressions naming the backup client's cleanup that deletes from the backup.
+    #[serde(default)]
+    pub idrive_cleanup_patterns: Vec<String>,
     /// Guards omitted from generated hooks (e.g. `push` when sessions run without prompts).
     #[serde(default)]
     pub disabled: Vec<String>,
@@ -189,6 +225,10 @@ pub fn guard_config_from_env() -> GuardConfig {
     let config = env::var_os("AGENTKIT_CONFIG")
         .map(PathBuf::from)
         .unwrap_or_else(|| cfg.home.join(".config/agentkit"));
+    // heavy-slot's own override; a site value below takes precedence.
+    if let Some(dir) = env::var_os("HEAVY_SLOT_DIR").filter(|d| !d.is_empty()) {
+        cfg.slot_state_dir = Some(PathBuf::from(dir));
+    }
     if let Ok(site) = Site::load(&config) {
         apply_guards(&mut cfg, &config, &site.guards);
     } else if let Ok(text) = fs::read_to_string(config.join("guards.toml")) {
@@ -223,6 +263,18 @@ pub(crate) fn apply_guards(cfg: &mut GuardConfig, config: &Path, guards: &GuardF
     }
     if !guards.push_gate_remotes.is_empty() {
         cfg.push_gate_remotes = guards.push_gate_remotes.clone();
+    }
+    if let Some(dir) = guards.slot_state_dir.as_deref().filter(|d| !d.is_empty()) {
+        cfg.slot_state_dir = Some(expand_home(dir, &cfg.home));
+    }
+    if !guards.slot_files.is_empty() {
+        cfg.slot_files = guards.slot_files.clone();
+    }
+    if !guards.approval_file_patterns.is_empty() {
+        cfg.approval_file_patterns = guards.approval_file_patterns.clone();
+    }
+    if !guards.idrive_cleanup_patterns.is_empty() {
+        cfg.idrive_cleanup_patterns = guards.idrive_cleanup_patterns.clone();
     }
     if let Some(file) = &guards.email_substrings_file {
         let path = if Path::new(file).is_absolute() {

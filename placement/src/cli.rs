@@ -577,18 +577,18 @@ mod tests {
         let bin = dir.join("cowork");
         fs::write(
             &bin,
-            "#!/bin/sh\nif [ \"$1\" = check ] && [ \"$2\" = \"drive:m5:/Volumes/OTV Mirror\" ]; then\n  echo 'held by claude · glancebar-62 (claude, m5) — ask: cowork ask music-offload \"…\"'\n  exit 1\nfi\nexit 0\n",
+            "#!/bin/sh\nif [ \"$1\" = check ] && [ \"$2\" = \"drive:primary:/Volumes/media\" ]; then\n  echo 'held by claude · glancebar-62 (claude, primary) — ask: cowork ask music-offload \"…\"'\n  exit 1\nfi\nexit 0\n",
         )
         .unwrap();
         fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
         let _guard = ClearEnv("COWORK_BIN");
         unsafe { std::env::set_var("COWORK_BIN", &bin) }
-        let line = cowork_refuses("m5", "OTV Mirror").expect("holder");
+        let line = cowork_refuses("primary", "media").expect("holder");
         assert!(line.starts_with("held by claude"));
         assert!(line.contains("cowork ask music-offload"));
-        assert!(cowork_refuses("m5", "Other").is_none());
+        assert!(cowork_refuses("primary", "other").is_none());
         unsafe { std::env::set_var("COWORK_BIN", dir.join("missing")) }
-        assert!(cowork_refuses("m5", "OTV Mirror").is_none());
+        assert!(cowork_refuses("primary", "media").is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 }

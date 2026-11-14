@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""git-stale-locks: clear git lock files that no git process can still own.
+
+A restart or a killed agent leaves `.git/index.lock` behind, and every later git command in that
+checkout fails with "Unable to create ... index.lock: File exists" until someone removes it by
+hand (14 Nov 2026: a laptop restart left one in a research repository and the next session's
+first commit failed).
+
+A lock is stale when either holds:
+  - it is older than this boot: whatever wrote it died with the last boot;
+  - it is older than --idle-minutes (default 10) and no git process is running on this Mac: git
+    holds a lock only while it runs, so a lock with no git alive has no owner (a 50-minute-old one
+    with none was found the day this was written). The wait covers tools that take the lock
+    without a `git` process (IDEs with their own git library) for a moment.
+Stale locks go to the Trash (or are renamed `<name>.stale-<time>` where there is no `trash`),
+never deleted, and each is logged.
+
+  git-stale-locks                 clear stale locks under the roots, print what was done
+  git-stale-locks --dry-run       only report
+  git-stale-locks --roots A:B     roots to search (default: $GIT_STALE_LOCKS_ROOTS, else the lines
+                                  of ~/.config/fleet/git-lock-roots, else ~/Projects)
+"""
+import argparse, glob, json, os, shutil, subprocess, sys, time
+
+PATTERNS = ('index.lock', 'HEAD.lock', 'config.lock', 'worktrees/*/index.lock', 'worktrees/*/HEAD.lock',
+            'modules/*/index.lock', 'modules/*/*/index.lock', 'modules/*/*/*/index.lock',
+            'modules/*/HEAD.lock', 'modules/*/*/HEAD.lock', 'modules/*/*/*/HEAD.lock')
+SKIP = {'node_modules', 'target', '.venv', 'venv', '__pycache__', '.build', 'DerivedData', 'Library'}
+STATE = os.path.expanduser('~/.local/state/fleet/git-stale-locks')
+
+
+def boot_time():
+    """Unix time this Mac booted, or None."""
+    try:
+        out = subprocess.run(['/usr/sbin/sysctl', '-n', 'kern.boottime'], capture_output=True, text=True, timeout=5).stdout
+        return int(out.split('sec =')[1].split(',')[0])
+    except Exception:
+        return None
+
+
+def git_running():
+    try:
+        out = subprocess.run(['/bin/ps', '-Ao', 'comm='], capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return True                      # unknown: assume one is, so only the boot rule applies
+    return any(os.path.basename(line.strip()) in ('git', 'git-remote-https', 'git-lfs') for line in out.splitlines())
+
+
+def git_dirs(root, depth=4):
+    """Every `.git` directory under root, down to `depth` levels, without descending into checkouts' build trees."""
+    root = os.path.expanduser(root)
+    base = root.rstrip('/').count('/')
+    for dirpath, dirnames, _ in os.walk(root):
+        if '.git' in dirnames:
+            yield os.path.join(dirpath, '.git')
+        dirnames[:] = [d for d in dirnames if d not in SKIP and d != '.git'
+                       and dirpath.count('/') - base < depth and not os.path.islink(os.path.join(dirpath, d))]
+
+
+def locks(root):
+    for gd in git_dirs(root):
+        for pat in PATTERNS:
+            yield from glob.glob(os.path.join(gd, pat))
+
+
+def stale_reason(mtime, now, boot, git_is_running, idle_minutes):
+    """Why a lock with this mtime is stale, or None."""
+    if boot is not None and mtime < boot:
+        return 'older than this boot'
+    if not git_is_running and now - mtime > idle_minutes * 60:
+        return f'older than {idle_minutes:g} min and no git process is running'
+    return None
+
+
+def put_away(path, now):
+    """Trash the lock, or rename it aside. Returns what was done."""
+    trash = shutil.which('trash') or '/usr/bin/trash'
+    if os.path.exists(trash) and subprocess.run([trash, path], capture_output=True).returncode == 0:
+        return 'trashed'
+    os.rename(path, f'{path}.stale-{int(now)}')
+    return 'renamed aside'
+
+
+def default_roots():
+    env = os.environ.get('GIT_STALE_LOCKS_ROOTS')
+    if env:
+        return [r for r in env.split(':') if r]
+    try:
+        lines = [l.strip() for l in open(os.path.expanduser('~/.config/fleet/git-lock-roots')) if l.strip() and not l.startswith('#')]
+        if lines:
+            return lines
+    except OSError:
+        pass
+    return ['~/Projects']
+
+
+def sweep(roots, dry_run=False, idle_minutes=10.0, now=None, boot=None, git_is_running=None, log=True):
+    now = time.time() if now is None else now
+    boot = boot_time() if boot is None else boot
+    git_is_running = git_running() if git_is_running is None else git_is_running
+    done = []
+
+    def record(entry):
+        done.append(entry)
+        if not (log and not dry_run):
+            return
+        try:                                 # written as each lock is handled, so a later failure loses nothing
+            os.makedirs(STATE, exist_ok=True)
+            with open(os.path.join(STATE, 'log.jsonl'), 'a') as fh:
+                fh.write(json.dumps({'t': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now)), **entry}) + '\n')
+        except OSError:
+            pass
+
+    for root in roots:
+        for path in locks(root):
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            why = stale_reason(mtime, now, boot, git_is_running, idle_minutes)
+            if not why:
+                continue
+            try:
+                action = 'would clear' if dry_run else put_away(path, now)
+            except OSError as err:           # one lock that cannot be moved must not stop the sweep
+                action = f'failed: {err.strerror or err}'
+            record({'path': path, 'why': why, 'action': action, 'age_h': round((now - mtime) / 3600, 1)})
+    return done
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
+    ap.add_argument('--dry-run', action='store_true')
+    ap.add_argument('--roots')
+    ap.add_argument('--idle-minutes', type=float, default=10.0)
+    a = ap.parse_args()
+    roots = a.roots.split(':') if a.roots else default_roots()
+    for d in sweep(roots, dry_run=a.dry_run, idle_minutes=a.idle_minutes):
+        print(f"{d['action']}: {d['path']} ({d['why']}, {d['age_h']} h old)")
+
+
+if __name__ == '__main__':
+    main()

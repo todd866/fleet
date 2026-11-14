@@ -1,8 +1,7 @@
 # Copy to <repo>/.fleet/check
-# where: any | hub | primary | m2 | m5
-# m2 is the hub alias, m5 is the primary alias.
+# where: any | hub | primary, or one of your own host ids
 # max_runtime_s at or above projects.heavy_runtime_s runs on the hub via remote-run.
 
 command = "cargo test --quiet -p heavy-slot"
 max_runtime_s = 180
-where = "m2"
+where = "hub"

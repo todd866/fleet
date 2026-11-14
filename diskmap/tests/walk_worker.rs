@@ -300,12 +300,12 @@ fn queued_rescans_drain_in_worker_batches_after_the_baseline() {
 fn summary_without_a_map_field_still_loads() {
     let text = r#"{
         "generated": 1,
-        "host_id": "m5",
+        "host_id": "h1",
         "local_host_name": "MacBook-Air",
         "locations": [{
             "kind": "volume",
-            "id": "m5:internal",
-            "host": "m5",
+            "id": "h1:internal",
+            "host": "h1",
             "name": "internal",
             "volume_uuid": null,
             "physical_drive": "internal",

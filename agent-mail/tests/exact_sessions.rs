@@ -19,7 +19,7 @@ impl Fixture {
         for dir in ["state", "config", "home", "project"] {
             fs::create_dir_all(root.join(dir)).unwrap();
         }
-        fs::write(root.join("config/name"), "m5\n").unwrap();
+        fs::write(root.join("config/name"), "desk\n").unwrap();
         Self { root }
     }
     fn command(&self, args: &[&str]) -> Command {
@@ -99,7 +99,7 @@ fn targeted(id: &str, session: &str) -> Value {
 #[test]
 fn two_cursor_sessions_same_project_are_isolated() {
     let f = Fixture::new();
-    let a = f.send("m5:project", "session-a");
+    let a = f.send("desk:project", "session-a");
     let b = f.send("local:project", "session-b");
     let a_mail = f.unread("cursor", Some("session-a"), true);
     assert_eq!(a_mail["unread"].as_array().unwrap().len(), 1);
@@ -142,8 +142,8 @@ fn targeted_mail_survives_provider_and_legacy_receipts_but_not_exact_receipt() {
     f.write("read.txt", &format!("{id}\n"));
     f.write(
         "receipts.jsonl",
-        &(receipt(&id, "cursor:session-b@m5")
-            + &receipt(&id, "codex:session-a@m5")
+        &(receipt(&id, "cursor:session-b@desk")
+            + &receipt(&id, "codex:session-a@desk")
             + &receipt(&id, "cursor:session-a@other")),
     );
     assert_eq!(
@@ -154,13 +154,13 @@ fn targeted_mail_survives_provider_and_legacy_receipts_but_not_exact_receipt() {
         1
     );
     assert_eq!(
-        stdout(&f.run(&["status", "m5", &id])),
+        stdout(&f.run(&["status", "desk", &id])),
         format!("{id} unread\n")
     );
     f.unread("cursor", Some("session-a"), true);
     assert_eq!(
         stdout(&f.run(&["status", "local", &id])),
-        format!("{id} read cursor:session-a@m5\n")
+        format!("{id} read cursor:session-a@desk\n")
     );
     assert_eq!(
         f.unread("cursor", Some("session-a"), false)["unread"],
@@ -376,7 +376,7 @@ fn partial_or_invalid_target_json_fails_closed() {
     );
     assert!(f.read("receipts.jsonl").is_empty());
     assert_eq!(
-        stdout(&f.run(&["status", "m5", "invalid"])),
+        stdout(&f.run(&["status", "desk", "invalid"])),
         "invalid invalid recipient\n"
     );
 }
@@ -452,8 +452,8 @@ fn malformed_flags_never_send_or_consume_mail() {
 #[test]
 fn local_alias_status_and_sent_listing_do_not_use_ssh_or_claim_queue() {
     let f = Fixture::new();
-    let id = f.send("m5:project", "session-a");
-    for host in ["local", "m5"] {
+    let id = f.send("desk:project", "session-a");
+    for host in ["local", "desk"] {
         assert_eq!(
             stdout(&f.run(&["status", host, &id])),
             format!("{id} unread\n")
@@ -469,20 +469,20 @@ fn local_alias_status_and_sent_listing_do_not_use_ssh_or_claim_queue() {
 #[test]
 fn status_distinguishes_proven_queue_from_sent_and_unknown() {
     let f = Fixture::new();
-    let out = f.run(&["send", "m1", "queued"]);
+    let out = f.run(&["send", "bench", "queued"]);
     let id = stdout(&out).trim().to_string();
     assert!(out.status.success());
     assert_eq!(
-        stdout(&f.run(&["status", "m1", &id])),
+        stdout(&f.run(&["status", "bench", &id])),
         format!("{id} queued for the relay\n")
     );
     f.write("outbox.jsonl", "");
     assert_eq!(
-        stdout(&f.run(&["status", "m1", &id])),
+        stdout(&f.run(&["status", "bench", &id])),
         format!("{id} sent (read status unknown: no route)\n")
     );
     assert_eq!(
-        stdout(&f.run(&["status", "m1", "never-sent"])),
+        stdout(&f.run(&["status", "bench", "never-sent"])),
         "never-sent unknown\n"
     );
 }
@@ -492,7 +492,7 @@ fn inbox_and_outbox_write_failures_are_errors_without_sent_record() {
     for path in ["inbox.jsonl", "outbox.jsonl"] {
         let f = Fixture::new();
         fs::create_dir(f.root.join("state").join(path)).unwrap();
-        let host = if path == "inbox.jsonl" { "m5" } else { "m1" };
+        let host = if path == "inbox.jsonl" { "desk" } else { "bench" };
         let out = f.run(&["send", host, "text"]);
         assert_eq!(out.status.code(), Some(1));
         assert!(out.stdout.is_empty());
@@ -564,7 +564,7 @@ fn targeted_claude_mail_ignores_legacy_marks_and_writes_only_exact_receipts() {
     f.write("read-session-a.txt", "claude-exact\n");
     f.write(
         "receipts.jsonl",
-        &receipt("claude-exact", "claude:session-b@m5"),
+        &receipt("claude-exact", "claude:session-b@desk"),
     );
     let out = f.run(&["unread", "--session", "session-a", "--mark", "--json"]);
     assert!(out.status.success());
@@ -574,7 +574,7 @@ fn targeted_claude_mail_ignores_legacy_marks_and_writes_only_exact_receipts() {
     );
     assert_eq!(f.read("read.txt"), "claude-exact\n");
     assert_eq!(f.read("read-session-a.txt"), "claude-exact\n");
-    assert!(f.read("receipts.jsonl").contains("claude:session-a@m5"));
+    assert!(f.read("receipts.jsonl").contains("claude:session-a@desk"));
     let out = f.run(&["unread", "--session", "session-a", "--json"]);
     assert_eq!(
         serde_json::from_slice::<Value>(&out.stdout).unwrap()["unread"],
@@ -588,19 +588,19 @@ fn archived_exact_mail_retains_target_for_status_and_io_errors_are_not_unread() 
     let id = f.send("local:project", "session-a");
     f.write("inbox.jsonl", "");
     f.write("read.txt", &format!("{id}\n"));
-    f.write("receipts.jsonl", &receipt(&id, "cursor:session-b@m5"));
+    f.write("receipts.jsonl", &receipt(&id, "cursor:session-b@desk"));
     assert_eq!(
-        stdout(&f.run(&["status", "m5", &id])),
+        stdout(&f.run(&["status", "desk", &id])),
         format!("{id} sent (read status unknown)\n")
     );
-    f.write("receipts.jsonl", &receipt(&id, "cursor:session-a@m5"));
+    f.write("receipts.jsonl", &receipt(&id, "cursor:session-a@desk"));
     assert_eq!(
-        stdout(&f.run(&["status", "m5", &id])),
-        format!("{id} read cursor:session-a@m5\n")
+        stdout(&f.run(&["status", "desk", &id])),
+        format!("{id} read cursor:session-a@desk\n")
     );
     fs::remove_file(f.root.join("state/inbox.jsonl")).unwrap();
     fs::create_dir(f.root.join("state/inbox.jsonl")).unwrap();
-    let out = f.run(&["status", "m5", &id]);
+    let out = f.run(&["status", "desk", &id]);
     assert_eq!(out.status.code(), Some(1));
     assert!(out.stdout.is_empty());
     assert!(String::from_utf8_lossy(&out.stderr).contains("status unavailable"));
@@ -702,12 +702,12 @@ fn orphan_target_fields_never_become_shared_mail_or_read_status() {
         assert!(f.read("receipts.jsonl").is_empty(), "{m}");
         assert!(f.read("read.txt").is_empty(), "{m}");
         assert_eq!(
-            stdout(&f.run(&["status", "m5", "orphan"])),
+            stdout(&f.run(&["status", "desk", "orphan"])),
             "orphan invalid recipient\n"
         );
         // Existing unrelated receipts cannot turn an invalid envelope into read.
         f.write("read.txt", "orphan\n");
-        f.write("receipts.jsonl", &receipt("orphan", "codex:wrong@m5"));
+        f.write("receipts.jsonl", &receipt("orphan", "codex:wrong@desk"));
         assert_eq!(
             stdout(&f.run(&["status", "local", "orphan"])),
             "orphan invalid recipient\n"
@@ -719,7 +719,7 @@ fn orphan_target_fields_never_become_shared_mail_or_read_status() {
 #[test]
 fn partial_append_errors_report_id_and_uncertainty_for_inbox_and_outbox() {
     use std::os::unix::process::CommandExt;
-    for (host, filename) in [("m5", "inbox.jsonl"), ("m1", "outbox.jsonl")] {
+    for (host, filename) in [("desk", "inbox.jsonl"), ("bench", "outbox.jsonl")] {
         let f = Fixture::new();
         let mut cmd = f.command(&[
             "send",
@@ -750,7 +750,7 @@ fn partial_append_errors_report_id_and_uncertainty_for_inbox_and_outbox() {
         assert!(f.read("sent.tsv").is_empty());
         let err = String::from_utf8_lossy(&out.stderr);
         let id = err.split_whitespace().nth(1).unwrap();
-        assert!(id.contains("-m5-"), "generated message ID missing: {err}");
+        assert!(id.contains("-desk-"), "generated message ID missing: {err}");
         assert!(err.contains("outcome uncertain"), "{err}");
         assert!(err.contains("do not resend blindly"), "{err}");
         assert!(!err.contains("not queued"), "{err}");

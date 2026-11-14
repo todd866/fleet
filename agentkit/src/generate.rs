@@ -179,14 +179,18 @@ fn hook_file(path: PathBuf, contents: String, providers: Vec<&'static str>) -> P
 const GUARD_RULES: &str = "\
 <!-- agentkit:guards -->
 - hard-delete: deny `rm`, `find -delete`, `git clean -f`, and inline deletes outside temp. Use `trash`.
-- icloud: deny emptying the Trash, and deny wiping Desktop, Documents, or iCloud Drive as a whole.
+- icloud: deny emptying the Trash on any Mac (over ssh too), and deny wiping Desktop, Documents, or iCloud Drive as a whole.
 - offload-heavy: a heavy test or build yields to `remote-run` when a worker is named.
 - cd-outside: deny `cd` to an absolute path outside the allowed roots.
 - push: plain `git push` is allowed; listed projects ask without a marker; `--force` / `-f` denied; `--force-with-lease` asks.
-- disk-slot: deny shell work on `/Volumes/*` unless wrapped in `disk-slot PATH -- <command>`.
-- metered-link: deny large transfers while `~/.local/state/METERED_LINK` exists unless approved.
+- disk-slot: deny shell work on `/Volumes/*` unless that command is wrapped in `disk-slot PATH -- <command>` (ls, stat, df, du, test and diskutil list/info are exempt).
+- metered-link: deny large transfers, package restores, clones and model pulls while `~/.local/state/METERED_LINK` exists unless approved.
 - agent-yolo: deny raw `agent -p` with `--force` or `--yolo`; use `cursor-worker` / `cursor-opinion`.
 - test-audio: deny audible playback unless `AUDIBLE_APPROVED=1` (owner asked to hear it this session).
+- slot-holder: deny SIGKILL on heavy-slot or a pid in its queue; `heavy-slot release <pid>` frees the slot and keeps the job.
+- slot-files: deny writes to heavy-slot's `limit` and `cool` files; a full slot on a cool, idle Mac is a fault to report.
+- approval-files: deny creating an `APPROVE_*` marker file; only the owner creates one.
+- idrive-cleanup: deny starting IDrive's Archive Cleanup, which deletes offloaded files from the backup.
 ";
 
 fn render_mdc(
@@ -314,6 +318,10 @@ const GUARDS: &[(&str, u64, bool)] = &[
     ("metered-link", 10, true),
     ("agent-yolo", 10, true),
     ("test-audio", 10, true),
+    ("slot-holder", 10, true),
+    ("slot-files", 10, true),
+    ("approval-files", 10, true),
+    ("idrive-cleanup", 10, true),
 ];
 
 fn provider_rules(paths: &Paths, provider: &str, _core_src: &Path) -> Result<Planned, String> {
@@ -439,8 +447,10 @@ fn merge_claude(path: &Path, bin: &str, site: &Site) -> Result<String, String> {
         let guards = enabled_guards(site);
         if !guards.is_empty() {
             let max_timeout = guards.iter().map(|(_, t, _)| *t).max().unwrap_or(20);
+            // File-writing tools too: slot-files and approval-files protect paths, and a Write
+            // or Edit reaches those paths without a shell. Every other guard allows them at once.
             arr.push(json!({
-                "matcher": "Bash",
+                "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit",
                 "hooks": [{
                     "type": "command",
                     "command": format!("{bin} hook claude all"),

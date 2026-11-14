@@ -1799,8 +1799,8 @@ mod tests {
 
     #[test]
     fn host_validator_accepts_and_rejects() {
-        assert!(host_valid("m1"));
-        assert!(host_valid("m5"));
+        assert!(host_valid("bench"));
+        assert!(host_valid("desk"));
         assert!(host_valid("a.b_c-d"));
         assert!(!host_valid(""));
         assert!(!host_valid("-evil"));

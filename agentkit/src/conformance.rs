@@ -182,6 +182,13 @@ fn firing_guard(guard_name: &str, cfg: &GuardConfig, _session_home: &Path, site:
     cfg.cwd = cfg.home.join("Projects/example");
     cfg.allowed_cd = crate::site::default_cd_roots(&cfg.home);
     cfg.offload_worker = Some("worker".into());
+    // The fixture cases are written against the built-in names; a site's own are checked by
+    // its own use, not here.
+    let stock = GuardConfig::default();
+    cfg.slot_state_dir = None;
+    cfg.slot_files = stock.slot_files;
+    cfg.approval_file_patterns = stock.approval_file_patterns;
+    cfg.idrive_cleanup_patterns = stock.idrive_cleanup_patterns;
     let marker = cfg.home.join(".local/state/METERED_LINK");
     if guard_name == "metered-link" {
         let made = {
@@ -258,7 +265,7 @@ fn legacy_cases(name: &str) -> Vec<(String, String)> {
         "hard-delete" => vec![
             (r#"{"tool_name":"Bash","tool_input":{"command":"rm -rf ~/Documents/x"}}"#.into(), "deny".into()),
             (r#"{"tool_name":"Bash","tool_input":{"command":"rm -rf /tmp/agentkit-ok"}}"#.into(), "allow".into()),
-            (r#"{"tool_name":"Bash","tool_input":{"command":"ssh m1 'rm -rf ~/x'"}}"#.into(), "deny".into()),
+            (r#"{"tool_name":"Bash","tool_input":{"command":"ssh other.example 'rm -rf ~/x'"}}"#.into(), "deny".into()),
         ],
         "icloud" => vec![
             (r#"{"tool_name":"Bash","tool_input":{"command":"trash ~/Documents"}}"#.into(), "deny".into()),
@@ -283,6 +290,7 @@ fn legacy_cases(name: &str) -> Vec<(String, String)> {
         "disk-slot" => vec![
             (r#"{"tool_name":"Bash","tool_input":{"command":"rsync -a ~/x/ /Volumes/Archive/x/"}}"#.into(), "deny".into()),
             (r#"{"tool_name":"Bash","tool_input":{"command":"disk-slot /Volumes/Archive -- rsync -a ~/x/ /Volumes/Archive/x/"}}"#.into(), "allow".into()),
+            (r#"{"tool_name":"Bash","tool_input":{"command":"echo disk-slot; cp /Volumes/Archive/a /Volumes/Other/b"}}"#.into(), "deny".into()),
         ],
         "metered-link" => vec![
             (r#"{"tool_name":"Bash","tool_input":{"command":"rsync -avh big/ remote:/big/"}}"#.into(), "deny".into()),
@@ -296,6 +304,28 @@ fn legacy_cases(name: &str) -> Vec<(String, String)> {
             (r#"{"tool_name":"Bash","tool_input":{"command":"afplay /tmp/tone.wav"}}"#.into(), "deny".into()),
             (r#"{"tool_name":"Bash","tool_input":{"command":"AUDIBLE_APPROVED=1 afplay /tmp/tone.wav"}}"#.into(), "allow".into()),
             (r#"{"tool_name":"Bash","tool_input":{"command":"echo quiet"}}"#.into(), "allow".into()),
+        ],
+        "slot-holder" => vec![
+            (r#"{"tool_name":"Bash","tool_input":{"command":"pkill -9 heavy-slot"}}"#.into(), "deny".into()),
+            (r#"{"tool_name":"Bash","tool_input":{"command":"ssh worker.example 'killall -KILL heavy-slot'"}}"#.into(), "deny".into()),
+            (r#"{"tool_name":"Bash","tool_input":{"command":"kill -9 $(pgrep heavy-slot)"}}"#.into(), "deny".into()),
+            (r#"{"tool_name":"Bash","tool_input":{"command":"heavy-slot release 123"}}"#.into(), "allow".into()),
+            (r#"{"tool_name":"Bash","tool_input":{"command":"pkill -TERM heavy-slot"}}"#.into(), "allow".into()),
+        ],
+        "slot-files" => vec![
+            (r#"{"tool_name":"Bash","tool_input":{"command":"echo 3 > ~/.local/state/heavy-slot/limit"}}"#.into(), "deny".into()),
+            (r#"{"tool_name":"Bash","tool_input":{"command":"ssh worker.example 'echo 70 | tee ~/.local/state/heavy-slot/cool'"}}"#.into(), "deny".into()),
+            (r#"{"tool_name":"Bash","tool_input":{"command":"cat ~/.local/state/heavy-slot/limit"}}"#.into(), "allow".into()),
+        ],
+        "approval-files" => vec![
+            (r#"{"tool_name":"Bash","tool_input":{"command":"touch ~/work/APPROVE_EXAMPLE"}}"#.into(), "deny".into()),
+            (r#"{"tool_name":"Bash","tool_input":{"command":"ssh worker.example touch APPROVE_EXAMPLE"}}"#.into(), "deny".into()),
+            (r#"{"tool_name":"Bash","tool_input":{"command":"test -e ~/work/APPROVE_EXAMPLE"}}"#.into(), "allow".into()),
+        ],
+        "idrive-cleanup" => vec![
+            (r#"{"tool_name":"Bash","tool_input":{"command":"perl archive_cleanup.pl"}}"#.into(), "deny".into()),
+            (r#"{"tool_name":"Bash","tool_input":{"command":"osascript -e 'tell application \"System Events\" to click menu item \"Archive Cleanup\" of menu 1 of menu bar item 1 of menu bar 1 of process \"IDrive\"'"}}"#.into(), "deny".into()),
+            (r#"{"tool_name":"Bash","tool_input":{"command":"grep -rn 'Archive Cleanup' docs/"}}"#.into(), "allow".into()),
         ],
         _ => Vec::new(),
     }

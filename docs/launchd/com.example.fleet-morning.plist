@@ -2,20 +2,24 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<!-- Daily at 22:30Z (UTC) through utc-daily; launchd only ticks every five minutes.
+	     A calendar schedule with an hour is local time, in the zone the Mac booted in; do not use one. -->
 	<key>Label</key>
 	<string>com.example.fleet-morning</string>
 	<key>ProgramArguments</key>
 	<array>
+		<string>/bin/zsh</string>
+		<string>REPLACE_HOME/.local/bin/utc-daily</string>
+		<string>--label</string>
+		<string>com.example.fleet-morning</string>
+		<string>--at</string>
+		<string>22:30</string>
+		<string>--</string>
 		<string>REPLACE_HOME/.local/bin/fleet</string>
 		<string>morning</string>
 	</array>
-	<key>StartCalendarInterval</key>
-	<dict>
-		<key>Hour</key>
-		<integer>6</integer>
-		<key>Minute</key>
-		<integer>30</integer>
-	</dict>
+	<key>StartInterval</key>
+	<integer>300</integer>
 	<key>RunAtLoad</key>
 	<false/>
 	<key>ProcessType</key>

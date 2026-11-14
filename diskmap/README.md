@@ -24,10 +24,10 @@ An unplugged drive stays in the map. Its row is `o` and `seen` is the age of the
 
 ```
   host  where      total          free         1h      24h       7d  grower             seen   map
-! m5    internal   494 GB    149 GB free   -16 GB  -20 GB   -40 GB  Movies +30 GB        4s   37%
-* m5    iCloud     40 GB local  80 GB cloud       —       —        —  —                   4s     —
-* m5    IDrive     ok 2d           6 paths        —       —        —  Desktop             2d     —
-o m2    wd-2tb     2.0 TB     400 GB free        —       —        —  —                   3d  done
+! desk  internal   494 GB    149 GB free   -16 GB  -20 GB   -40 GB  Movies +30 GB        4s   37%
+* desk  iCloud     40 GB local  80 GB cloud       —       —        —  —                   4s     —
+* desk  IDrive     ok 2d           6 paths        —       —        —  Desktop             2d     —
+o lab   usb-2tb    2.0 TB     400 GB free        —       —        —  —                   3d  done
 ```
 
 Column heads are the only labels. `1h`/`24h`/`7d` are the change in free space (negative means the disk got fuller). `map` is the initial walk: `37%` while it is running (mapped bytes against space used on the volume) and `done` after. `iCloud` uses `local` and `cloud` because those are not free space. `IDrive` uses the age of the last successful local backup, not a capacity.
@@ -113,7 +113,7 @@ The archive path is refused unless `drives.json` marks that `/Volumes/<name>` en
   "locations": [
     {
       "kind": "volume",
-      "host": "m5",
+      "host": "desk",
       "name": "internal",
       "physical_drive": "internal",
       "mounted": true,
@@ -139,7 +139,7 @@ The archive path is refused unless `drives.json` marks that `/Volumes/<name>` en
   "min_bytes": 104857600,
   "matches": [
     {
-      "host": "m5",
+      "host": "desk",
       "location": "internal",
       "path": "Users/me/Documents",
       "home_path": "Documents",
@@ -160,7 +160,7 @@ The archive path is refused unless `drives.json` marks that `/Volumes/<name>` en
 | `rate:<host>:internal:<grower>` | Free space fell more than 15 GB/h and the samples span at least 30 minutes, the newest sample is under 5 minutes old. |
 | `floor:<host>:internal` | Free space is under that host's `floor_gb`. |
 
-Notification title `diskmap m5`, body like `Movies +18 GB/h, 149 GB free`. Same cause is silent for an hour. `DISKMAP_NO_NOTIFY=1` records the alert and skips the notification (launchd should not set this).
+Notification title `diskmap desk`, body like `Movies +18 GB/h, 149 GB free`. Same cause is silent for an hour. `DISKMAP_NO_NOTIFY=1` records the alert and skips the notification (launchd should not set this).
 
 ## Environment
 

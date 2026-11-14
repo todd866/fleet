@@ -14,6 +14,13 @@ fail_ratio = 0.5          # free under floor * ratio is a fail
 trend_warn_gb = -20       # 24 h change in free space, at or below this is a warn
 trend_fail_gb = -80
 
+# Per-Mac lines for the internal disk come from a targets file when it has a row for the Mac:
+# host<TAB>target_empty<TAB>target_with_purgeable<TAB>floor_empty<TAB>note   (GB)
+# Below the target is a warning, below the floor a failure. Default path:
+# ~/.local/state/mac-sync/storage-audit/free-targets.tsv
+# targets_file = "~/.config/fleet/free-targets.tsv"
+
+# A floor written here wins over the targets file.
 [disk.floors.primary]
 internal = 80
 
@@ -39,9 +46,13 @@ syncthing_hosts = ["primary", "hub", "shared"]
 
 [jobs]
 overdue_h = 2
+# Launchd label prefixes to strip from job names. Empty reads ~/.config/fleet/utc-prefixes.
+# label_prefixes = ["com.example."]
 
 [thermal]
-hot_c = 60
+# Hot is judged against each Mac's own heavy-slot `cool` target (~/.local/state/heavy-slot/cool),
+# which its snapshot carries. hot_c is only the line for a Mac that sends none.
+# hot_c = 95
 hot_hours_warn = 2
 hot_hours_fail = 6
 wait_warn_s = 600

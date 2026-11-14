@@ -52,7 +52,7 @@ whose steward call fails behaves as today (FIFO), so a steward bug can never blo
 ## Later (not in this crate)
 cursor-bridge's helper pool (python, ~/Projects/.cursor-bridge) consults `queue-steward pick` the
 same way, with `label` = the worker name and `project` = the repo. agent-mail and remote-run
-register their remote jobs on the worker, so an M2 queue is visible from the M5's fleet row.
+register their remote jobs on the worker, so the hub's queue is visible from the primary Mac's fleet row.
 
 ## Slot semantics (owner, 5 Nov 2026)
 "A slot isn't full unless it's actively processing; if it's doing data transfer ahead of processing

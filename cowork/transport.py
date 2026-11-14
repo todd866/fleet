@@ -12,7 +12,9 @@ from pathlib import Path
 
 from cowork.store import default_state_dir, load_config
 
-FLEET_HUB = {"hub": "m2", "hub_aliases": ["m2", "m2-lan"]}
+# With no config file the hub is the ssh alias `hub` (and `hub-lan`): example names. A site
+# names its own in ~/.config/cowork/config.json: {"hub": "...", "hub_aliases": ["...", "..."]}.
+FLEET_HUB = {"hub": "hub", "hub_aliases": ["hub", "hub-lan"]}
 MUTATIONS = {
     "claim", "heartbeat", "note", "release", "handoff", "done",
     "join", "leave", "child", "update", "item",

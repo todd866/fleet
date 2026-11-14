@@ -261,16 +261,16 @@ mod tests {
     #[test]
     fn cooldown_expires_and_clock_rollback_retries() {
         let records = vec![
-            serde_json::json!({"state":"hook_output_emitted", "host":"m5", "conversation_id":"conv", "emitted_at":100, "ids":["mail"]}),
+            serde_json::json!({"state":"hook_output_emitted", "host":"desk", "conversation_id":"conv", "emitted_at":100, "ids":["mail"]}),
         ];
-        assert!(recent_ids(&records, "conv", "m5", 100).contains("mail"));
-        assert!(recent_ids(&records, "conv", "m5", 159).contains("mail"));
+        assert!(recent_ids(&records, "conv", "desk", 100).contains("mail"));
+        assert!(recent_ids(&records, "conv", "desk", 159).contains("mail"));
         for now in [0, 99, 160, u64::MAX] {
-            assert!(recent_ids(&records, "conv", "m5", now).is_empty());
+            assert!(recent_ids(&records, "conv", "desk", now).is_empty());
         }
-        assert!(recent_ids(&records, "other", "m5", 101).is_empty());
-        assert!(recent_ids(&records, "conv", "m1", 101).is_empty());
-        assert!(recent_ids(&[serde_json::json!({})], "conv", "m5", 101).is_empty());
+        assert!(recent_ids(&records, "other", "desk", 101).is_empty());
+        assert!(recent_ids(&records, "conv", "bench", 101).is_empty());
+        assert!(recent_ids(&[serde_json::json!({})], "conv", "desk", 101).is_empty());
     }
     #[test]
     fn reads_are_bounded_without_truncating() {

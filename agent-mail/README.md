@@ -33,7 +33,7 @@ Unknown commands or no arguments print a short usage block on stdout and exit `2
 ### Exact-session delivery
 
 ```sh
-agent-mail send m5:fleet "review this change" --to-provider cursor --to-session SESSION_ID
+agent-mail send desk:fleet "review this change" --to-provider cursor --to-session SESSION_ID
 agent-mail unread --provider cursor --session SESSION_ID --json
 agent-mail unread --provider cursor --session SESSION_ID --mark
 ```

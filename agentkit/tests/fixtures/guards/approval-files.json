@@ -1,0 +1,51 @@
+{
+  "cases": [
+    {
+      "input": {
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "touch ~/work/APPROVE_EXAMPLE"
+        }
+      },
+      "expect": "deny"
+    },
+    {
+      "input": {
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "ssh worker.example touch APPROVE_EXAMPLE"
+        }
+      },
+      "expect": "deny"
+    },
+    {
+      "input": {
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "test -e ~/work/APPROVE_EXAMPLE"
+        }
+      },
+      "expect": "allow"
+    },
+    {
+      "input": {
+        "tool_name": "Write",
+        "tool_input": {
+          "file_path": "/Users/agentkit-conformance/work/APPROVE_EXAMPLE",
+          "content": "1"
+        }
+      },
+      "expect": "deny"
+    },
+    {
+      "input": {
+        "tool_name": "Write",
+        "tool_input": {
+          "file_path": "/Users/agentkit-conformance/work/notes.md",
+          "content": "1"
+        }
+      },
+      "expect": "allow"
+    }
+  ]
+}

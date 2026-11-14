@@ -11,9 +11,47 @@ Install from this repo: `cargo install --path heavy-slot` (binary name `heavy-sl
 | `heavy-slot status` | Print each slot: `free`, `off (limit N)`, or a busy line from `slotN.info`. |
 | `heavy-slot -- COMMAND …` | Wait for a slot, run `COMMAND` with its arguments, exit with the command’s status. |
 | `heavy-slot COMMAND …` | Same as above; the `--` separator is optional. |
+| `heavy-slot --now -- COMMAND …` | The owner asked for this job to run here, now, at full speed (see below). |
+| `heavy-slot workers` | Print how many parallel workers suit this Mac now (reason on stderr). |
+| `heavy-slot help` | Print usage. An unknown option is a usage error (exit 2), not a command to run. |
 | `heavy-slot release PID` | Ask holder `PID` (as shown by `status`) to give its slot back now; its job keeps running. Exit 0 once the slot is free, 1 if `PID` holds no slot or is not this binary. |
 
-There are no command-line flags.
+### `--now`: the owner's job
+
+`heavy-slot --now -- COMMAND` (or `HEAVY_SLOT_NOW=1`) is for the one case where the owner says "run it here, now, as
+fast as it goes". It skips the offload check and the cool gate, ignores `limit` and `mode`, takes any free slot up to
+`HEAVY_SLOTS`, and if none is free runs the job unslotted (logged as `"slot":0`) instead of queueing. It then calls
+`focus-guard exempt <pid> 8 "heavy-slot --now (<label>)"` so the job's whole tree stays at normal priority while the
+owner is at the keyboard, until it exits; stderr says whether focus-guard took the exemption. Owner's say-so only, one
+named job at a time. `HEAVY_SLOT_LOCAL=1` is different: it only skips the offload check, and the job still waits its
+turn and yields to the owner.
+
+### Lost jobs leave a record
+
+A job's `jobs.jsonl` line is written when it ends, so a job whose Mac restarted, or whose heavy-slot was killed
+outright, used to leave nothing (14 Nov 2026: a worker restarted under a grid and the only sign was an empty output
+file). Every `heavy-slot status` and every new job now looks for `processing` queue entries whose job is gone: the pid
+is dead, or the entry predates this boot (pids start again after a restart). Each is printed once as
+`lost: <label> · started HH:MM · this Mac restarted at HH:MM before it finished · <command>`, written to
+`jobs.jsonl` with `"rc":-1` and `"lost":"restart"` or `"lost":"killed"`, and removed from the queue.
+
+### How many workers
+
+`heavy-slot workers` prints a number, and every job gets the same number as `$HEAVY_SLOT_WORKERS` (left alone if the
+caller set it): the performance-core count, halved when memory is short (kernel memory pressure above normal, or swap over
+half of RAM) and halved again when another account has a desktop session on this Mac (its own Dock or Finder). Use it to size a pool
+(`Pool(int(os.environ["HEAVY_SLOT_WORKERS"]))`, `make -j "$HEAVY_SLOT_WORKERS"`). On 14 Nov 2026 an 8 GB worker that
+already held 7.5 GB of swap from another user's session was given eight workers, reached load 200 and 110 °C, and
+restarted; this rule gives that Mac one.
+
+### Background priority is set from outside
+
+A gentle job (`mode` = `gentle`, or `offload-target` exit 2: this Mac is in use or hot and no worker can start the job)
+runs at background priority. heavy-slot demotes itself with `taskpolicy -b -p` for the instant of the spawn, so the job
+inherits the flag at birth, then restores itself. Until 14 Nov 2026 the job was launched as `taskpolicy -b COMMAND`,
+which sets the flag from inside the process; nothing outside can clear that, so `focus-guard exempt` reported success
+while the job stayed on the efficiency cores. The flag set this way can be lifted: `focus-guard exempt PID`, or
+`taskpolicy -B -p` on each process. The bash reference in `spec/heavy-slot.sh` still uses the launch-time form.
 
 ### Idle jobs give their slot back
 
@@ -32,6 +70,9 @@ free its slot: under launchd, the job's process group dies with it (5 Nov 2026, 
 | `HEAVY_SLOT_DIR` | `~/.local/state/heavy-slot` | State directory (locks, info files, log). |
 | `HEAVY_SLOT_LABEL` | Basename of current working directory | Shown in `status` and `jobs.jsonl`. |
 | `HEAVY_SLOT_LOCAL` | unset | If `1`, skip the offload check (run here even when `offload-target` would send work away). |
+| `HEAVY_SLOT_NOW` | unset | If `1`, same as `--now`. |
+| `HEAVY_SLOT_WORKERS` | set for the job | Parallel workers that suit this Mac now; a value set by the caller is kept. |
+| `FOCUS_GUARD` | `~/.local/bin/focus-guard` | The program `--now` asks for an exemption (tests point it at a stand-in). |
 | `HEAVY_SLOT_IDLE_SECS` | `600` | A running job under 1% CPU for this long gives its slot back (`0` disables). |
 | `HEAVY_SLOT_COOL_MAX` | `1200` | Max seconds to wait for thermal/chip readings before starting anyway (see `cool` file). |
 | `REMOTE_RUN` | unset | If `1`, skip the offload check (job is already running on a worker via `remote-run`). |
@@ -47,7 +88,7 @@ All paths are under `HEAVY_SLOT_DIR` unless overridden.
 |---|---|---|
 | `limit` | absent → use `HEAVY_SLOTS` | One line, digits only: max slots to use. Slots above `limit` show as `off (limit N)` and are not acquired. |
 | `cool` | absent → no cool gate | First line: target chip temperature in °C (integer). New jobs wait until [Glancebar](#glancebar-optional) reports `thermal` = `nominal` and `chipC` ≤ target, polling every 15 s, up to `HEAVY_SLOT_COOL_MAX`. Missing or bad readings do not block. |
-| `mode` | absent → normal priority | If contents trim to `gentle`, the job runs under `/usr/sbin/taskpolicy -b` (background QoS). |
+| `mode` | absent → normal priority | If contents trim to `gentle`, the job runs at background QoS, set from outside so it can be lifted (see above). |
 | `slot{i}.lock` | created on use | Advisory lock file; holder keeps the file open until the job finishes. |
 | `slot{i}.info` | one line while busy | `{label} · pid {pid} · {HH:MM:SS} · {command…}` truncated to 200 bytes UTF-8. |
 | `jobs.jsonl` | append-only JSON lines | One object per completed job (see below). |

@@ -15,13 +15,14 @@ Rust tools and docs for running several AI coding agents across several Macs wit
 | [placement](placement/README.md) | Data-set placement planner (`plan` / `apply` / `status`). |
 | [agentkit](agentkit/README.md) | Canonical rules, guards, and provider sync (`sync`, `doctor`). |
 | [utc-daily](bin/utc-daily), [utc-schedule](bin/utc-schedule) | Daily launchd jobs on a UTC schedule: launchd's calendar is local time in the zone the Mac booted in, so a laptop that travels fires jobs hours off. `utc-schedule` converts existing plists. |
+| [git-stale-locks](bin/git-stale-locks) | Moves git lock files that no git process can still own (left by a restart or a killed agent) to the Trash, so the next agent is not blocked by `index.lock`. |
 | [cowork](docs/cowork.md) | Work claims, leases, and board JSON for multi-agent coordination. |
 
 Bash originals under `spec/` are the behavioural spec for heavy-slot and agent-mail while you validate Rust drop-ins.
 
 **Not in this tree (yet):** `remote-run`, `offload-target`, `ai-capacity`, Glancebar integration scripts, and fleet-morning digests. See [docs/architecture.md](docs/architecture.md) for the full layer map and gaps.
 
-**Tested where:** Continuous integration and the author's Macs. Multi-machine behaviour is integration-tested with fixture hosts and fake SSH; treat first install on your own fleet as production validation.
+**Tested where:** on the author's Macs, with `cargo test --workspace` and the Python tests in `tests/` (`scripts/check.sh` runs the light checks). There is no hosted CI yet. Multi-machine behaviour is integration-tested with fixture hosts and fake SSH; treat first install on your own fleet as production validation.
 
 ## Five-minute quick start (two Macs, two tools)
 
@@ -30,7 +31,7 @@ Assumptions: macOS, Rust toolchain (`rustup`), SSH between a **coordinator** and
 ### 1. Build
 
 ```bash
-git clone <your-fork-url> fleet
+git clone https://github.com/todd866/fleet.git
 cd fleet
 cargo install --path heavy-slot
 cargo install --path agent-mail
@@ -111,4 +112,4 @@ More of the stack (offload to a worker Mac, capacity-aware engine picking, the m
 
 ## Contributing
 
-This repository is intended as a public face of a larger private fleet tree. Export tooling in the private repo runs `tools/public-export/export.py` and `leakcheck.py` before a candidate publish; do not commit site-specific host tables or absolute home paths.
+This repository is exported from a larger private tree: an allowlist chooses the files, and a leak check plus gitleaks must pass before each sync. Issues and pull requests are welcome; a change accepted here is applied to the private tree and comes back with the next sync. Keep site values (host names, volume names, home paths) in config, with generic examples in code.

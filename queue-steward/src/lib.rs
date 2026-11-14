@@ -444,6 +444,27 @@ mod tests {
     }
 
     #[test]
+    fn a_dead_processing_entry_is_left_for_heavy_slot_to_record() {
+        // heavy-slot's reap_lost writes the "lost" line to jobs.jsonl from this file. If the
+        // steward removed it first, the lost job left no trace.
+        let dir = temp_dir();
+        let dead = 999_999_998_i32;
+        let path = Waiter::queue_path(&dir, dead);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{"pid":999999998,"label":"x","project":"p","origin":"agent","cmd":"c","expected_s":null,"since":1,"host":"h","state":"processing"}"#,
+        )
+        .unwrap();
+        // Not a live entry: it is not counted and cannot be picked.
+        assert!(load_waiters(&dir).is_empty());
+        assert!(counts_line(&dir).is_none());
+        assert!(pick_winner(&dir, 100).is_none());
+        assert!(path.exists(), "the steward removed a dead processing entry");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn ties_by_since_ordering() {
         let bd = ScoreBreakdown {
             origin: 2.0,

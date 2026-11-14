@@ -74,7 +74,7 @@ PY
     fi
     for i in $ids; do grep -qx "$i" <<<"$read" && echo "$i read" || echo "$i unread"; done ;;
   log) tail -n "${2:-10}" "$D/inbox.jsonl" 2>/dev/null ;;
-  relay)   # on the M5 (launchd, every minute): collect each worker's outbox and deliver it
+  relay)   # on the primary Mac (launchd, every minute): collect each worker's outbox and deliver it
     while read -r h _; do
       [[ -z "$h" || "$h" == \#* ]] && continue
       out=$(ssh -o BatchMode=yes -o ConnectTimeout=8 "$h" 'f=~/.local/state/agent-mail/outbox.jsonl; [ -s $f ] && mv $f $f.relaying && cat $f.relaying' </dev/null 2>/dev/null) || continue

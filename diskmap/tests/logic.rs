@@ -172,8 +172,8 @@ fn alerts_are_throttled_per_cause() {
     assert!(!floor_breach(10.0, None));
     let first = Alert {
         t: 1_000,
-        cause: "floor:m5:internal".into(),
-        host: "m5".into(),
+        cause: "floor:h1:internal".into(),
+        host: "h1".into(),
         location: "internal".into(),
         free_gb: 100.0,
         rate_gb_h: None,
@@ -190,9 +190,9 @@ fn alerts_are_throttled_per_cause() {
 fn shared_container_is_one_drive_and_bundles_are_not_added() {
     let defs = parse_drives(
         r#"{"drives":[
-            {"name":"m2-ssd-2tb","volumes":{
-                "OTV Mirror":{"uuid":"AAA","encrypted":false,"shared_container":true,"size_gb":2000},
-                "Vault-T":{"uuid":"BBB","encrypted":true,"shared_container":true,"size_gb":2000}
+            {"name":"h2-ssd-2tb","volumes":{
+                "Old Mirror":{"uuid":"AAA","encrypted":false,"shared_container":true,"size_gb":2000},
+                "Vault-B":{"uuid":"BBB","encrypted":true,"shared_container":true,"size_gb":2000}
             }},
             {"name":"t9-1","volumes":{
                 "Research":{"uuid":"CCC","encrypted":false,"size_gb":700},
@@ -202,13 +202,13 @@ fn shared_container_is_one_drive_and_bundles_are_not_added() {
     )
     .unwrap();
     let obs = vec![
-        VolumeObs { uuid: "AAA".into(), name: "OTV Mirror".into(), total_bytes: 2_000, free_bytes: 500, mounted: true, last_seen: 10, encrypted: false },
-        VolumeObs { uuid: "BBB".into(), name: "Vault-T".into(), total_bytes: 2_000, free_bytes: 500, mounted: true, last_seen: 10, encrypted: true },
+        VolumeObs { uuid: "AAA".into(), name: "Old Mirror".into(), total_bytes: 2_000, free_bytes: 500, mounted: true, last_seen: 10, encrypted: false },
+        VolumeObs { uuid: "BBB".into(), name: "Vault-B".into(), total_bytes: 2_000, free_bytes: 500, mounted: true, last_seen: 10, encrypted: true },
         VolumeObs { uuid: "CCC".into(), name: "Research".into(), total_bytes: 700, free_bytes: 100, mounted: true, last_seen: 10, encrypted: false },
         VolumeObs { uuid: "DDD".into(), name: "Archive_Encrypted".into(), total_bytes: 400, free_bytes: 50, mounted: true, last_seen: 10, encrypted: true },
     ];
     let rows = group_drives(&defs, &obs);
-    let ssd = rows.iter().find(|r| r.name == "m2-ssd-2tb").unwrap();
+    let ssd = rows.iter().find(|r| r.name == "h2-ssd-2tb").unwrap();
     assert_eq!(ssd.total_bytes, 2_000);
     assert_eq!(ssd.free_bytes, 500);
     assert!(ssd.encrypted_mounted);
@@ -220,16 +220,16 @@ fn shared_container_is_one_drive_and_bundles_are_not_added() {
 #[test]
 fn archive_refuses_anything_but_an_encrypted_volume() {
     let defs = parse_drives(
-        r#"{"drives":[{"name":"m2-ssd-2tb","volumes":{
-            "Vault-T":{"uuid":"BBB","encrypted":true},
-            "OTV Mirror":{"uuid":"AAA","encrypted":false}
+        r#"{"drives":[{"name":"h2-ssd-2tb","volumes":{
+            "Vault-B":{"uuid":"BBB","encrypted":true},
+            "Old Mirror":{"uuid":"AAA","encrypted":false}
         }}]}"#,
     )
     .unwrap();
-    assert!(archive_allowed("/Volumes/Vault-T/diskmap", &defs).is_ok());
-    assert!(archive_allowed("/Volumes/OTV Mirror/diskmap", &defs).is_err());
+    assert!(archive_allowed("/Volumes/Vault-B/diskmap", &defs).is_ok());
+    assert!(archive_allowed("/Volumes/Old Mirror/diskmap", &defs).is_err());
     assert!(archive_allowed("/tmp/diskmap", &defs).is_err());
-    assert!(archive_allowed("/Volumes/Stash/diskmap", &defs).is_err());
+    assert!(archive_allowed("/Volumes/Spare/diskmap", &defs).is_err());
 }
 
 #[test]
@@ -258,8 +258,8 @@ fn where_matches_basename_or_glob() {
 fn fleet_rows_share_one_width() {
     let disk = Location {
         kind: "volume".into(),
-        id: "m5:internal".into(),
-        host: "m5".into(),
+        id: "h1:internal".into(),
+        host: "h1".into(),
         name: "internal".into(),
         volume_uuid: None,
         physical_drive: Some("internal".into()),
@@ -279,8 +279,8 @@ fn fleet_rows_share_one_width() {
     };
     let cloud = Location {
         kind: "icloud".into(),
-        id: "m5:icloud".into(),
-        host: "m5".into(),
+        id: "h1:icloud".into(),
+        host: "h1".into(),
         name: "iCloud".into(),
         volume_uuid: None,
         physical_drive: None,
@@ -300,14 +300,14 @@ fn fleet_rows_share_one_width() {
     };
     let summary = Summary {
         generated: 1_000,
-        host_id: "m5".into(),
+        host_id: "h1".into(),
         local_host_name: "MacBook-Air".into(),
         locations: vec![disk, cloud],
         drives: Vec::new(),
         alerts: vec![Alert {
             t: 1_000,
-            cause: "floor:m5:internal".into(),
-            host: "m5".into(),
+            cause: "floor:h1:internal".into(),
+            host: "h1".into(),
             location: "internal".into(),
             free_gb: 149.0,
             rate_gb_h: None,

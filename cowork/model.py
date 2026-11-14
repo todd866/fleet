@@ -128,7 +128,7 @@ def format_scope(scope):
 
 
 def volume_name(value):
-    """The volume, not the last path component. `/Volumes/OTV Mirror/Music` is `OTV Mirror`."""
+    """The volume, not the last path component. `/Volumes/Media Mirror/Music` is `Media Mirror`."""
     text = (value or "").strip()
     if text.startswith("/"):
         parts = [part for part in text.split("/") if part]

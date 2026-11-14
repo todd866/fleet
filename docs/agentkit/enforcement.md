@@ -1,6 +1,6 @@
 # Agent enforcement inventory
 
-Measured on the M5 (10 Nov 2026). **Today** is what is on disk before `agentkit sync --apply`.
+Measured on the primary Mac (10 Nov 2026). **Today** is what is on disk before `agentkit sync --apply`.
 **After agentkit** is what this branch generates (hooks merged, never replacing battery, patient-data,
 lifecycle, peer, or capacity hooks).
 
@@ -41,7 +41,7 @@ worktree. It does **not** install PreToolUse guards in the worker process.
 
 ```bash
 agentkit doctor --conformance   # table: installed / trusted / firing per provider×guard
-agentkit doctor --json          # includes `"conformance"` for fleet morning (`m5:fleet` section `other`)
+agentkit doctor --json          # includes `"conformance"` for fleet morning (`<host>:fleet` section `other`)
 ```
 
 Fixtures: `agentkit/tests/fixtures/guards/<guard>.json` (tool-call JSON per provider shape).
@@ -61,5 +61,5 @@ Overlapping Cursor rules named in `retired_cursor_rules` (site config) are retir
 1. Install `agentkit` + `agent-context` to `~/.local/bin`.
 2. `agentkit sync` (dry run), then `agentkit sync --apply` with backups.
 3. **Codex:** run `/hooks` and trust each new `agentkit hook codex …` line.
-4. Confirm `agentkit doctor --conformance` is all `*` on the M5, then repeat on M2/M1.
+4. Confirm `agentkit doctor --conformance` is all `*` on the primary Mac, then repeat on the other Macs.
 5. Remove legacy Claude Python guard commands only after a week of clean doctor reports.

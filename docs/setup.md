@@ -105,7 +105,7 @@ Other launchd jobs from a full fleet (focus-guard, link-meter, ai-budget refresh
 
 ### Home hub: morning check
 
-`fleet morning` reads snapshots each Mac writes for itself. `fleet morning collect --local` runs hourly on every Mac; the 06:30 digest stays on the home hub. Templates, the Python 3.11 requirement, and the threshold file are in `docs/morning.md` (not yet published). Put `design/bin/fleet` on `PATH` as `~/.local/bin/fleet` on each Mac first. The script uses `/opt/homebrew/bin/python3` when it is present.
+`fleet morning` reads snapshots each Mac writes for itself. `fleet morning collect --local` runs hourly on every Mac; the daily digest (22:30Z in the example plist) stays on the home hub. Templates, the Python 3.11 requirement, and the threshold file are in `docs/morning.md` (not yet published). Put `design/bin/fleet` on `PATH` as `~/.local/bin/fleet` on each Mac first. The script uses `/opt/homebrew/bin/python3` when it is present.
 
 ## 6. Claude Code hooks (agent-mail)
 

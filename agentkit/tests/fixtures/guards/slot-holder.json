@@ -1,0 +1,49 @@
+{
+  "cases": [
+    {
+      "input": {
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "pkill -9 heavy-slot"
+        }
+      },
+      "expect": "deny"
+    },
+    {
+      "input": {
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "ssh worker.example 'killall -KILL heavy-slot'"
+        }
+      },
+      "expect": "deny"
+    },
+    {
+      "input": {
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "kill -9 $(pgrep heavy-slot)"
+        }
+      },
+      "expect": "deny"
+    },
+    {
+      "input": {
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "heavy-slot release 123"
+        }
+      },
+      "expect": "allow"
+    },
+    {
+      "input": {
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "pkill -TERM heavy-slot"
+        }
+      },
+      "expect": "allow"
+    }
+  ]
+}

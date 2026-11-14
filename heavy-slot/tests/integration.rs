@@ -14,7 +14,11 @@ fn temp_state_dir() -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!("heavy-slot-test-{n}"));
+    // The clock ticks in microseconds here, so two tests starting together could share a directory
+    // (and one would delete the other's jobs.jsonl): add a counter.
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let k = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("heavy-slot-test-{n}-{k}"));
     fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -81,7 +85,7 @@ fn usage_exit_2() {
     let dir = temp_state_dir();
     let (code, _, stderr) = run_hs(&dir, &[], &[]);
     assert_eq!(code, 2);
-    assert!(stderr.contains("usage: heavy-slot -- <command...> | heavy-slot status"));
+    assert!(stderr.contains("usage: heavy-slot [--now] -- <command...>"));
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -420,4 +424,192 @@ fn idle_job_gives_its_slot_back_busy_job_keeps_it() {
     let out = busy.wait_with_output().unwrap();
     assert!(!String::from_utf8_lossy(&out.stderr).contains("gave slot"));
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn help_prints_usage_and_an_unknown_option_is_not_run_as_a_command() {
+    let dir = temp_state_dir();
+    for flag in ["--help", "-h", "help"] {
+        let (code, out, _) = run_hs(&dir, &[], &[flag]);
+        assert_eq!(code, 0, "{flag}");
+        assert!(out.contains("--now") && out.contains("HEAVY_SLOT_LOCAL=1"), "{flag}: {out}");
+    }
+    let (code, _, err) = run_hs(&dir, &[], &["--fast", "/usr/bin/true"]);
+    assert_eq!(code, 2);
+    assert!(err.contains("unknown option --fast"));
+    assert!(!dir.join("jobs.jsonl").exists(), "nothing should have run");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A stand-in for focus-guard that records how it was called.
+fn fake_focus_guard(dir: &PathBuf) -> PathBuf {
+    let path = dir.join("fake-focus-guard");
+    fs::write(&path, format!("#!/bin/sh\necho \"$@\" >> {}\n", dir.join("focus-guard.calls").display())).unwrap();
+    let mut perm = fs::metadata(&path).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
+    fs::set_permissions(&path, perm).unwrap();
+    path
+}
+
+#[test]
+fn now_ignores_the_limit_and_asks_focus_guard_for_an_exemption() {
+    let dir = temp_state_dir();
+    let fg = fake_focus_guard(&dir);
+    fs::write(dir.join("limit"), "1").unwrap();
+    fs::write(dir.join("mode"), "gentle").unwrap();
+    let release = Arc::new(Barrier::new(2));
+    hold_lock_until_released(dir.join("slot1.lock"), Arc::clone(&release));
+    thread::sleep(Duration::from_millis(100));
+
+    // Limit 1 and slot 1 held: an ordinary job would wait. The owner's job takes slot 2.
+    let (code, _, err) = run_hs(
+        &dir,
+        &[("FOCUS_GUARD", fg.to_str().unwrap()), ("HEAVY_SLOT_LABEL", "ownerjob")],
+        &["--now", "--", "/usr/bin/true"],
+    );
+    release.wait();
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("--now (owner's say-so): running here at normal priority (slot 2)"), "{err}");
+    assert!(err.contains("focus-guard leaves it alone"), "{err}");
+    let calls = fs::read_to_string(dir.join("focus-guard.calls")).unwrap();
+    assert!(calls.starts_with("exempt ") && calls.contains(" 8 heavy-slot --now (ownerjob)"), "{calls}");
+    assert!(fs::read_to_string(dir.join("jobs.jsonl")).unwrap().contains("\"slot\":2"));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn now_runs_unslotted_when_every_slot_is_held() {
+    let dir = temp_state_dir();
+    let fg = fake_focus_guard(&dir);
+    let release = Arc::new(Barrier::new(2));
+    hold_lock_until_released(dir.join("slot1.lock"), Arc::clone(&release));
+    thread::sleep(Duration::from_millis(100));
+    let (code, _, err) = run_hs(
+        &dir,
+        &[("FOCUS_GUARD", fg.to_str().unwrap()), ("HEAVY_SLOTS", "1"), ("HEAVY_SLOT_NOW", "1")],
+        &["--", "/usr/bin/true"],
+    );
+    release.wait();
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("no slot free, so unslotted"), "{err}");
+    assert!(fs::read_to_string(dir.join("jobs.jsonl")).unwrap().contains("\"slot\":0"));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+fn priority_of(pid: &str) -> Option<i32> {
+    let out = Command::new("/bin/ps").args(["-o", "pri=", "-p", pid]).output().ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+fn taskpolicy(flag: &str, pid: &str) {
+    Command::new("/usr/sbin/taskpolicy").args([flag, "-p", pid]).status().unwrap();
+}
+
+/// 14 Nov 2026: a gentle job was launched as `taskpolicy -b <command>`, which pins it to
+/// background priority from the inside; `focus-guard exempt` (taskpolicy -B -p) then did nothing.
+/// A gentle job must be at background priority AND be liftable from outside.
+#[test]
+fn a_gentle_job_starts_in_the_background_and_can_be_raised_from_outside() {
+    let dir = temp_state_dir();
+    fs::write(dir.join("mode"), "gentle").unwrap();
+    let pidfile = dir.join("job.pid");
+    let script = format!("echo $$ > {}; exec /bin/sleep 20", pidfile.display());
+    let mut child = spawn_hs(&dir, &[("HEAVY_SLOT_IDLE_SECS", "0")], &["--", "/bin/sh", "-c", &script]);
+    assert!(wait_until(|| pidfile.exists() && !fs::read_to_string(&pidfile).unwrap().trim().is_empty(), 5));
+    let job = fs::read_to_string(&pidfile).unwrap().trim().to_string();
+
+    assert!(wait_until(|| priority_of(&job).is_some_and(|p| p <= 4), 5), "gentle job is not at background priority: {:?}", priority_of(&job));
+    // heavy-slot itself was only demoted for the instant of the spawn.
+    let hs = child.id().to_string();
+    taskpolicy("-B", &job);
+    let raised = wait_until(|| priority_of(&job).is_some_and(|p| p > 4), 5);
+    let job_pri = priority_of(&job);
+    unsafe {
+        libc::kill(job.parse().unwrap(), libc::SIGTERM);
+    }
+    let _ = child.wait();
+    assert!(raised, "gentle job could not be raised from outside (priority {job_pri:?}); heavy-slot {hs}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_job_whose_holder_vanished_is_recorded_as_lost() {
+    let dir = temp_state_dir();
+    fs::create_dir_all(dir.join("queue")).unwrap();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    // A dead pid, started after boot: its heavy-slot was killed.
+    fs::write(
+        dir.join("queue/999999999.json"),
+        format!("{{\"pid\":999999999,\"label\":\"sim\",\"project\":\"p\",\"origin\":\"agent\",\"cmd\":\"python grid.py \",\"expected_s\":null,\"since\":{now},\"host\":\"h\",\"state\":\"processing\"}}\n"),
+    )
+    .unwrap();
+    // A live pid (ours) whose entry predates the boot: the Mac restarted under it.
+    let me = std::process::id();
+    fs::write(
+        dir.join(format!("queue/{me}.json")),
+        format!("{{\"pid\":{me},\"label\":\"old\",\"project\":\"p\",\"origin\":\"agent\",\"cmd\":\"make all \",\"expected_s\":null,\"since\":1000,\"host\":\"h\",\"state\":\"processing\"}}\n"),
+    )
+    .unwrap();
+    let (code, out, _) = run_hs(&dir, &[], &["status"]);
+    assert_eq!(code, 0);
+    assert!(out.contains("lost: sim") && out.contains("its heavy-slot was killed or crashed") && out.contains("python grid.py"), "{out}");
+    assert!(out.contains("lost: old") && out.contains("this Mac restarted at"), "{out}");
+    let log = fs::read_to_string(dir.join("jobs.jsonl")).unwrap();
+    assert!(log.contains("\"lost\":\"killed\"") && log.contains("\"lost\":\"restart\"") && log.contains("\"rc\":-1"), "{log}");
+    assert!(!dir.join("queue/999999999.json").exists());
+    // Reported once.
+    let (_, out, _) = run_hs(&dir, &[], &["status"]);
+    assert!(!out.contains("lost:"), "{out}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_job_is_told_how_many_workers_to_start() {
+    let dir = temp_state_dir();
+    let out_file = dir.join("workers");
+    let script = format!("echo $HEAVY_SLOT_WORKERS > {}", out_file.display());
+    let (code, _, _) = run_hs(&dir, &[], &["--", "/bin/sh", "-c", &script]);
+    assert_eq!(code, 0);
+    let n: u32 = fs::read_to_string(&out_file).unwrap().trim().parse().expect("a number");
+    assert!((1..=64).contains(&n));
+    let (code, out, err) = run_hs(&dir, &[], &["workers"]);
+    assert_eq!(code, 0);
+    // Two readings a moment apart can differ (memory pressure moves): both must be sane.
+    assert!((1..=64).contains(&out.trim().parse::<u32>().unwrap()), "{err}");
+    assert!(err.contains("performance cores"), "{err}");
+    // A caller's own choice is left alone.
+    let (_, _, _) = run_hs(&dir, &[("HEAVY_SLOT_WORKERS", "3")], &["--", "/bin/sh", "-c", &script]);
+    assert_eq!(fs::read_to_string(&out_file).unwrap().trim(), "3");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_waiter_that_is_signalled_leaves_the_queue() {
+    // Until 14 Nov 2026 the handler was installed only once a slot was won, so a queued
+    // heavy-slot died by the default action and left queue/<pid>.json in state "waiting".
+    for sig in [libc::SIGTERM, libc::SIGINT] {
+        let dir = temp_state_dir();
+        let release = Arc::new(Barrier::new(2));
+        hold_lock_until_released(dir.join("slot1.lock"), Arc::clone(&release));
+        thread::sleep(Duration::from_millis(100));
+        let marker = dir.join("ran");
+        let script = format!("touch {}", marker.display());
+        let child = spawn_hs(
+            &dir,
+            &[("QUEUE_STEWARD", "/nonexistent/queue-steward"), ("HEAVY_SLOTS", "1")],
+            &["--", "/bin/sh", "-c", &script],
+        );
+        let entry = dir.join(format!("queue/{}.json", child.id()));
+        assert!(wait_until(|| entry.exists(), 5), "the waiter never joined the queue");
+        assert!(fs::read_to_string(&entry).unwrap().contains("\"state\":\"waiting\""));
+        unsafe {
+            libc::kill(child.id() as i32, sig);
+        }
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(out.status.code(), Some(128 + sig), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(!entry.exists(), "the signalled waiter left its queue entry behind");
+        assert!(!marker.exists(), "the job ran");
+        release.wait();
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

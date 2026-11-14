@@ -13,7 +13,7 @@ A **claim** is one piece of work. The owner is a provider session on a host. Sco
 | `repo` | `repo:fleet` | Same repo name, or a path whose components include that name |
 | `path` | `path:/work/fleet` | One path is a prefix of the other, on a boundary (`/work/fleet` overlaps `/work/fleet/cowork`, not `/work/fleet-board`) |
 | `worktree` | `worktree:cowork` | Same worktree name |
-| `drive` | `drive:m2:/Volumes/OTV Mirror/Music` | Same volume on that host. A legacy `drive:Media` is the volume name on this host. The path is one value and may contain spaces. |
+| `drive` | `drive:hub:/Volumes/Media Mirror/Music` | Same volume on that host. A legacy `drive:Media` is the volume name on this host. The path is one value and may contain spaces. |
 | `output`, `publish` | `publish:public-mirror` | Same target. These two kinds share one namespace: who may push the public mirror |
 | `machine`, `service` | `machine:hub` | Recorded, not a conflict by themselves |
 
@@ -108,7 +108,7 @@ Every command rewrites `$COWORK_STATE/board.json`. fleet-health and Glancebar re
 
 ## Leases and `.writer`
 
-A drive claim writes `<volume>/.writer` only on the host that owns the volume. `drive:m2:/Volumes/OTV Mirror/Music` is volume `OTV Mirror` on `m2`; the Mac that is not `m2` does not create a local path from the last component. The owning host writes the file when that volume directory is already mounted, and does not create the volume. A repo, worktree, or publish claim writes the same line under `$COWORK_STATE/leases/<kind>/<name>`. The line is the one placement already understands:
+A drive claim writes `<volume>/.writer` only on the host that owns the volume. `drive:hub:/Volumes/Media Mirror/Music` is volume `Media Mirror` on `hub`; the Mac that is not `hub` does not create a local path from the last component. The owning host writes the file when that volume directory is already mounted, and does not create the volume. A repo, worktree, or publish claim writes the same line under `$COWORK_STATE/leases/<kind>/<name>`. The line is the one placement already understands:
 
 ```text
 <job>@<host> <hostname> <pid> <epoch>
@@ -119,7 +119,7 @@ A drive claim writes `<volume>/.writer` only on the host that owns the volume. `
 A `.writer` that cowork did not create is held when it is younger than 12 hours. If its hostname is this machine, the pid must still be alive. Cowork will not replace a live foreign file. `cowork check` is how a job asks before it starts. A live holder prints one line and exits 1:
 
 ```text
-held by claude · glancebar-62 (claude, m5) — ask: cowork ask music-offload "…"
+held by claude · glancebar-62 (claude, desk) — ask: cowork ask music-offload "…"
 ```
 
 ## Presence
@@ -179,9 +179,9 @@ An event has `id`, `event_id`, `engine`, `host`, `project`, `event` (`start`, `a
 | `COWORK_NOW` | Clock override, for tests. |
 | `COWORK_PLAIN`, `NO_COLOR` | No ANSI colour. |
 
-With no config file, the hub is `m2` and the aliases are `m2`, `m2-lan` (taskhub's transport). A config file that names a hub uses that hub; a config file with no hub stays local. `cowork claim` and `cowork check` try the aliases in order (`BatchMode`, 2 second connect). The remote command is `env COWORK_LOCAL=1 cowork …`, so the hub does not ssh to itself. If every alias is away (ssh status 255 or no route), the command is appended to `$COWORK_STATE/queue.jsonl`, applied on this Mac, and `cowork flush` retries in the background.
+With no config file, the hub is the ssh alias `hub` and the aliases are `hub`, `hub-lan`: example names. Name your own in `~/.config/cowork/config.json`: `{"hub": "<alias>", "hub_aliases": ["<alias>", "<alias>-lan"]}`. A config file that names a hub uses that hub; a config file with no hub stays local. `cowork claim` and `cowork check` try the aliases in order (`BatchMode`, 2 second connect). The remote command is `env COWORK_LOCAL=1 cowork …`, so the hub does not ssh to itself. If every alias is away (ssh status 255 or no route), the command is appended to `$COWORK_STATE/queue.jsonl`, applied on this Mac, and `cowork flush` retries in the background.
 
-`cowork observe` and `cowork hook` never wait on that ssh. They write locally and queue the same claim; flush delivers it. `cowork --host m2 board` is the explicit form (`ConnectTimeout` 8 seconds) and still refuses a name that is not the hub or an alias. `--host` after the subcommand is the machine that owns the claim, not an SSH target.
+`cowork observe` and `cowork hook` never wait on that ssh. They write locally and queue the same claim; flush delivers it. `cowork --host hub board` is the explicit form (`ConnectTimeout` 8 seconds) and still refuses a name that is not the hub or an alias. `--host` after the subcommand is the machine that owns the claim, not an SSH target.
 
 `--ttl` accepts seconds or `30m`, `8h`, `2d`, `90s`.
 
@@ -219,7 +219,7 @@ The recording itself stays under 20 ms and does not open a socket. A second sess
 `cowork context` prints one line for the project: other holders, this session's claims, and `!` when they overlap. The prompt hooks run it. `cowork doctor` prints one row per provider and host (`seen` in the last hour, `registered`), one row per provider whose hook file does not mention cowork, and one row per claim with no live heartbeat. `cowork doctor --json` is the document fleet morning and Glancebar read:
 
 ```json
-{"version": 1, "generated": 1700000000, "sessions": [{"provider": "claude", "host": "m5", "seen": 1, "registered": 1}], "hooks_missing": ["codex"], "no_heartbeat": []}
+{"version": 1, "generated": 1700000000, "sessions": [{"provider": "claude", "host": "desk", "seen": 1, "registered": 1}], "hooks_missing": ["codex"], "no_heartbeat": []}
 ```
 
 ## Enforcement
@@ -247,9 +247,9 @@ cowork check "drive:${host}:/Volumes/${volume}" || exit $?
 
 Do this by hand, one provider at a time. Do not point a live hook at this tree until a throwaway `COWORK_STATE` on that Mac has shown a row. Nothing here installs itself.
 
-1. On the M2, keep the state directory out of git. On the other Macs, leave the hub unset in config so they use `m2` / `m2-lan`, or set that hub explicitly. `COWORK_LOCAL=1` belongs only on the command the ssh hop runs.
+1. On the hub, keep the state directory out of git. On every Mac, name the hub and its aliases in `~/.config/cowork/config.json`; with no config file the example names `hub` / `hub-lan` are used. `COWORK_LOCAL=1` belongs only on the command the ssh hop runs.
 2. `cowork update` a copy of the old session dump. `cowork board` should show the stale rows with full scopes and `claude · <name>`, not a hash. `cowork doctor --json` is the file fleet morning and Glancebar can start reading.
-3. Claim a scratch item with `--ttl 30m`, a `publish:public-mirror` scope, and `drive:m2:/Volumes/<a mounted volume>` from the M5. The M5 must not grow a local `.writer` for that volume. On the M2, the same claim writes `<volume>/.writer` only when the volume is mounted.
+3. Claim a scratch item with `--ttl 30m`, a `publish:public-mirror` scope, and `drive:<hub>:/Volumes/<a mounted volume>` from another Mac. That Mac must not grow a local `.writer` for that volume. On the hub, the same claim writes `<volume>/.writer` only when the volume is mounted.
 
 **Claude.** Paste `cowork hooks claude` into `~/.claude/settings.json`. That adds `PreToolUse` → `cowork observe` and `UserPromptSubmit` → `cowork context`, beside the lifecycle events. Leave the old `lifecycle_hook.py` line until a new row appears, then remove it.
 

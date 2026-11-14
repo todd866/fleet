@@ -33,3 +33,8 @@ push_gate_projects = []
 # push_gate_projects = ["~/Projects/example"]   # by folder
 # push_gate_remotes = ["owner/name"]            # by remote: every clone and worktree of that repository
 # email_substrings_file = "private/email-substrings.txt"
+# The four below have built-in defaults; set one only to change it.
+# slot_state_dir = "~/.local/state/heavy-slot"       # slot-holder, slot-files: heavy-slot's state directory
+# slot_files = ["limit", "cool"]                     # slot-files: files in it that are not edited by hand
+# approval_file_patterns = ["APPROVE_*"]             # approval-files: marker files only the owner creates
+# idrive_cleanup_patterns = ['(?i)archive[\s_.-]*clean[\s_-]*up']   # idrive-cleanup: regular expressions

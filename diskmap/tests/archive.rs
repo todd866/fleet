@@ -40,21 +40,21 @@ fn archive_ship_is_idempotent_and_prune_waits_for_confirm() {
     upsert_history(&db, "2026-11-07", "keep/media/films", 400).unwrap();
     let ev = events_after_id(&db, 0).unwrap();
     let hist = history_all(&db).unwrap();
-    let first = ship(&archive, "m5", "VOL", &ev, &hist).unwrap();
-    let bytes = fs::read(archive.join("m5/VOL/events.jsonl")).unwrap();
-    let second = ship(&archive, "m5", "VOL", &ev, &hist).unwrap();
+    let first = ship(&archive, "h1", "VOL", &ev, &hist).unwrap();
+    let bytes = fs::read(archive.join("h1/VOL/events.jsonl")).unwrap();
+    let second = ship(&archive, "h1", "VOL", &ev, &hist).unwrap();
     assert_eq!(first, second);
-    assert_eq!(bytes, fs::read(archive.join("m5/VOL/events.jsonl")).unwrap());
+    assert_eq!(bytes, fs::read(archive.join("h1/VOL/events.jsonl")).unwrap());
     assert_eq!(String::from_utf8(bytes.clone()).unwrap().lines().count(), 2);
 
     let spool = dir.join("spool");
-    spool_merge(&spool, "m5", "VOL", &ev, &hist).unwrap();
-    spool_merge(&spool, "m5", "VOL", &ev, &hist).unwrap();
-    let (spooled, _) = spool_take(&spool, "m5", "VOL").unwrap();
+    spool_merge(&spool, "h1", "VOL", &ev, &hist).unwrap();
+    spool_merge(&spool, "h1", "VOL", &ev, &hist).unwrap();
+    let (spooled, _) = spool_take(&spool, "h1", "VOL").unwrap();
     assert_eq!(spooled.len(), 2);
-    ship(&archive, "m5", "VOL", &spooled, &[]).unwrap();
+    ship(&archive, "h1", "VOL", &spooled, &[]).unwrap();
     assert_eq!(
-        fs::read_to_string(archive.join("m5/VOL/events.jsonl")).unwrap().lines().count(),
+        fs::read_to_string(archive.join("h1/VOL/events.jsonl")).unwrap().lines().count(),
         2
     );
 

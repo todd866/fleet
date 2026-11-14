@@ -168,7 +168,7 @@ fn unread_hook_marks_and_dedups_read_txt() {
 #[test]
 fn relay_delivers_valid_to_and_secures_bad() {
     let (state, config) = temp_dirs();
-    fs::write(config.join("hosts"), "worker1 m2\n").unwrap();
+    fs::write(config.join("hosts"), "worker1 lab\n").unwrap();
 
     let fake = state.join("relay-ssh.sh");
     let log = state.join("relay-ssh-log.txt");

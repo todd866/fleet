@@ -135,9 +135,9 @@ child processes. Its input/output bounds are part of the guarantee: this is not
 containment for an arbitrary same-UID replacement binary or descendants created
 by one. Output capture is validated after the reviewed adapter returns.
 
-The M2 canonical `~/Projects/fleet-board/lifecycle_hook.py` must be reconciled by
+The hub's canonical `~/Projects/fleet-board/lifecycle_hook.py` must be reconciled by
 an explicitly approved, atomic replacement with a fresh baseline hash check and
-backup. The installer copies that source; an unreconciled M5-only installation
+backup. The installer copies that source; an unreconciled primary-only installation
 could be reverted later. Never overwrite concurrent owner changes.
 
 Deployment observation (sanitized example): fresh headless sessions can produce
@@ -147,19 +147,19 @@ reload, or installation of an optional lifecycle bridge.
 
 A coordinated rollout may record bridge SHA256
 `54b9aafac5a27e2e58fde561bccfd84b3a4183216dfc49c3610e44327d4f1620`
-on M5 at 10:36:22 UTC, 2026-11-09. Only the two newly added standalone entries
+on the primary Mac at 10:36:22 UTC, 2026-11-09. Only the two newly added standalone entries
 were removed; the hook configuration is byte-identical to the original pre-pickup
-configuration, preserving all existing handlers. M2 canonical source was
+configuration, preserving all existing handlers. The hub's canonical source was
 hash-checked, backed up, and atomically replaced at 10:36:44 UTC with the same
-bridge candidate; M2's installed runtime was not changed. Deployment evidence:
-`~/.local/state/cursor-lifecycle-bridge-20261109/deployment.json` on M5.
+bridge candidate; the hub's installed runtime was not changed. Deployment evidence:
+`~/.local/state/cursor-lifecycle-bridge-20261109/deployment.json` on the primary Mac.
 Subsequent natural `postToolUse` invocations were verified in all three existing
 main conversations by 10:40:38 UTC, without restarting them or sending test mail.
 All returned empty output. This proves the bridge ran at their tool boundaries,
 not nonempty message delivery, model receipt, or acknowledgement.
 
-The later reviewed spool-recovery version is now installed on M5 and reconciled
-to the M2 canonical source, SHA256
+The later reviewed spool-recovery version is now installed on the primary Mac and reconciled
+to the hub's canonical source, SHA256
 `b9287ad5b60800c40aa363ba1db2bafdb7d34a826760af974bd75d49c37f43ce`.
 It leaves exact-mail pickup unchanged. See
 `../integration/cursor-lifecycle/SPOOL-RECOVERY.md` for live recovery evidence.

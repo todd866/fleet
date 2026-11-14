@@ -1,0 +1,51 @@
+{
+  "cases": [
+    {
+      "input": {
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "echo 3 > ~/.local/state/heavy-slot/limit"
+        }
+      },
+      "expect": "deny"
+    },
+    {
+      "input": {
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "ssh worker.example 'echo 70 | tee ~/.local/state/heavy-slot/cool'"
+        }
+      },
+      "expect": "deny"
+    },
+    {
+      "input": {
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "cat ~/.local/state/heavy-slot/limit"
+        }
+      },
+      "expect": "allow"
+    },
+    {
+      "input": {
+        "tool_name": "Write",
+        "tool_input": {
+          "file_path": "~/.local/state/heavy-slot/limit",
+          "content": "1"
+        }
+      },
+      "expect": "deny"
+    },
+    {
+      "input": {
+        "tool_name": "Write",
+        "tool_input": {
+          "file_path": "/Users/agentkit-conformance/work/notes.md",
+          "content": "1"
+        }
+      },
+      "expect": "allow"
+    }
+  ]
+}

@@ -19,7 +19,7 @@ path outside `$HOME` is refused.
 | `agentkit doctor --provider cursor` | The same check for one provider. |
 | `agent-context` | Posture (per provider), capacity, mail, fleet alerts. `AGENTKIT_PROVIDER` set by hooks. Also `agentkit context`. |
 | `agentkit posture write` | Refresh `~/.local/state/ai-budget/posture.json` from `ai-capacity --json`. |
-| `agentkit hook <claude\|codex\|cursor> <guard>` | Provider adapter. Tool-call JSON on stdin. |
+| `agentkit hook <claude\|codex\|cursor> <guard\|all>` | Provider adapter. Tool-call JSON on stdin. `all` runs every enabled guard. |
 | `agentkit memory import --from DIR` | Copy Claude `*/memory/*.md` into the notebook. Skips secret-shaped files. |
 | `agentkit memory path` | Print the notebook directory. |
 
@@ -70,6 +70,42 @@ denies `git push --force`.
 | `guard-offload-heavy` | deny a heavy command when `offload-target` names a worker; fail open if it does not |
 | `guard-cd-outside` | deny `cd` to an absolute path outside `guards.allowed_cd` |
 | `guard-push` | ask on `git push`, deny `--force` and `-f`, allow `AGENTKIT_PUSH_APPROVED=1` |
+
+The generated hooks run `agentkit hook <provider> all`, which runs these and the guards that
+have no binary of their own:
+
+| Guard | Answer |
+|---|---|
+| `disk-slot` | deny a command that touches `/Volumes/*` unless that command runs under `disk-slot PATH -- ...`; `ls`, `stat`, `df`, `du`, `test`, `[` and `diskutil list\|info\|activity\|apfs list` are exempt |
+| `metered-link` | while `~/.local/state/METERED_LINK` exists, deny transfers (`rsync`, `scp`, `curl` to a file, `docker pull`), package restores (`npm ci\|install`, `pnpm`/`yarn install`, `brew install\|upgrade\|fetch`, `pip install`, `uv sync`, `cargo fetch\|install`), `git clone`, `git lfs pull\|fetch` and model pulls (`ollama pull`, `hf download`); `git pull`, `fetch` and `push` are allowed |
+| `agent-yolo` | deny raw `agent -p` with `--force` or `--yolo` |
+| `test-audio` | deny audible playback unless `AUDIBLE_APPROVED=1` |
+| `slot-holder` | deny SIGKILL on heavy-slot by name (`pkill -9 heavy-slot`, `kill -9 $(pgrep heavy-slot)`), here or over ssh, and on a pid that has an entry in this Mac's heavy-slot queue; use `heavy-slot release <pid>` |
+| `slot-files` | deny writes to heavy-slot's `limit` and `cool` files: redirect, `tee`, `sed -i`, `cp`/`mv`, an inline script, and Claude's `Write`/`Edit` |
+| `approval-files` | deny creating an `APPROVE_*` marker file from a shell (`touch`, redirect, `tee`, `cp`, `mv`, `install`, over ssh too) or with `Write`/`Edit`; the owner creates those |
+| `idrive-cleanup` | deny starting IDrive's Archive Cleanup (AppleScript, the client's program, a cleanup script); the patterns are `guards.idrive_cleanup_patterns` |
+
+The `icloud` guard denies emptying the Trash on every host, an exempt worker included.
+`slot-holder`, `slot-files`, `approval-files` and `idrive-cleanup` work with no site
+configuration; `guards.slot_state_dir`, `guards.slot_files`, `guards.approval_file_patterns`
+and `guards.idrive_cleanup_patterns` change their defaults. Claude's hook also receives
+`Write`, `Edit`, `MultiEdit` and `NotebookEdit` calls, which only `slot-files` and
+`approval-files` judge. Codex and Cursor hooks see shell commands only.
+
+How the guards read a command line:
+
+- `slot-holder`, `slot-files`, `approval-files`, `idrive-cleanup` and the Trash check also read
+  text that another program on the line may run: a quoted word handed to `watch`, `su -c`,
+  `find -exec`, a string in a `python -c` or here-document script, what `echo` prints unless
+  the `echo` is the whole line. Mail (`agent-mail send`) and a search pattern or commit
+  message are text, for that command only: the rest of the line is still judged.
+- A command none of them can read (more than six layers of `sh -c` / `ssh`, a quote that
+  never closes) is denied when the line is about that guard's subject, and allowed otherwise.
+- `hard-delete` treats a search pattern or a commit message as text only when the whole line
+  is one `grep`, `rg` or `git commit|tag|log|grep` command with known options. `echo` and
+  `printf` are never text to it.
+- A `Write`, `Edit`, `MultiEdit` or `NotebookEdit` call is judged by its path alone, by
+  `slot-files` and `approval-files`; its content is not read, and a missing path allows.
 
 A headless worker where Trash is not a recovery path is `guards.air_aliases` /
 `guards.air_hosts` in the site. The binary has no built-in hostname. One whole

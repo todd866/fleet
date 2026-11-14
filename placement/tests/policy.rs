@@ -809,8 +809,11 @@ fn verify_trees_rejects_a_different_checksum() {
 }
 
 #[test]
-fn init_encodes_the_fleet_preset_and_drops_an_unencrypted_personal_volume() {
-    let drives = r#"{"drives":[{"name":"m2-ssd","volumes":{"Vault-T":{"encrypted":false},"OTV Mirror":{"encrypted":false}}}]}"#;
+fn init_takes_volumes_from_the_registry_and_keeps_personal_data_off_an_unencrypted_one() {
+    let drives = r#"{"drives":[
+        {"name":"desk-ssd","volumes":{"Films":{"encrypted":false},"Safe One":{"encrypted":true}}},
+        {"name":"shelf-disk","volumes":{"Safe Two":{"encrypted":false,"accepts":["personal"]},"Spare":{"encrypted":false,"subpath":"Media"}}}
+    ]}"#;
     let datasets = r#"{"datasets":[
         {"name":"Photos library","paths":["Pictures/Photos Library.photoslibrary"],"class":"personal"},
         {"name":"Projects","paths":["Projects"],"class":"work"},
@@ -818,17 +821,18 @@ fn init_encodes_the_fleet_preset_and_drops_an_unencrypted_personal_volume() {
         {"name":"Films","paths":["Movies/films"],"class":"re-obtainable"}
     ]}"#;
     let policy = fleet_policy(drives, datasets).unwrap();
-    let m5 = policy.hosts.iter().find(|h| h.id == "m5").unwrap();
-    assert_eq!(m5.floor_gb, 150.0);
-    assert_eq!(m5.band_low_gb, Some(200.0));
-    assert_eq!(m5.band_high_gb, Some(400.0));
-    assert_eq!(m5.bulk, Bulk::WorkingSet);
-    let m2 = policy.hosts.iter().find(|h| h.id == "m2").unwrap();
-    assert_eq!(m2.floor_gb, 40.0);
-    assert_eq!(m2.bulk, Bulk::MastersOnExternal);
-    let m1 = policy.hosts.iter().find(|h| h.id == "m1").unwrap();
-    assert_eq!(m1.floor_gb, 30.0);
-    assert_eq!(m1.bulk, Bulk::NoBulk);
+    let primary = policy.hosts.iter().find(|h| h.id == "primary").unwrap();
+    assert_eq!(primary.role, Role::TravellingPrimary);
+    assert_eq!(primary.floor_gb, 150.0);
+    assert_eq!(primary.band_low_gb, Some(200.0));
+    assert_eq!(primary.band_high_gb, Some(400.0));
+    assert_eq!(primary.bulk, Bulk::WorkingSet);
+    let hub = policy.hosts.iter().find(|h| h.id == "hub").unwrap();
+    assert_eq!(hub.floor_gb, 40.0);
+    assert_eq!(hub.bulk, Bulk::MastersOnExternal);
+    let shared = policy.hosts.iter().find(|h| h.id == "shared").unwrap();
+    assert_eq!(shared.floor_gb, 30.0);
+    assert_eq!(shared.bulk, Bulk::NoBulk);
     let games = policy
         .sync_folders
         .iter()
@@ -838,24 +842,25 @@ fn init_encodes_the_fleet_preset_and_drops_an_unencrypted_personal_volume() {
     let saves = games.parts.iter().find(|p| p.path == "Saves").unwrap();
     assert_eq!(saves.class, Class::SyncedSmall);
     assert!(saves.keep.iter().any(|k| k == "*"));
-    let roms = games.parts.iter().find(|p| p.path == "ROMs").unwrap();
-    assert!(roms.archive);
-    assert_eq!(roms.master_volume, "OTV Mirror");
+    let archives = games.parts.iter().find(|p| p.path == "Archives").unwrap();
+    assert!(archives.archive);
+    assert_eq!(archives.master_volume, "Films");
+    assert_eq!(archives.master_host, "hub");
     let star = games.parts.iter().find(|p| p.path == "*").unwrap();
-    assert_eq!(star.keep, vec!["m5".to_string()]);
+    assert_eq!(star.keep, vec!["primary".to_string()]);
     let photos = policy
         .datasets
         .iter()
         .find(|d| d.name == "Photos library")
         .unwrap();
     assert_eq!(photos.class, Class::PersonalUnique);
-    assert!(
-        photos
-            .replica_volumes
-            .iter()
-            .any(|v| v == "Archive_Encrypted2")
-    );
-    assert!(!photos.replica_volumes.iter().any(|v| v == "Vault-T"));
+    assert_eq!(photos.master_volume, "Safe One");
+    assert_eq!(photos.replica_volumes, vec!["Safe One".to_string()]);
+    assert_eq!(photos.offsite, "offsite-backup");
+    assert_eq!(photos.keep, vec!["primary".to_string()]);
+    // The registry asked for personal data on a volume it does not call encrypted: refused.
+    let two = policy.volumes.iter().find(|v| v.name == "Safe Two").unwrap();
+    assert!(!two.accepts.contains(&Class::PersonalUnique));
     let projects = policy
         .datasets
         .iter()
@@ -870,16 +875,41 @@ fn init_encodes_the_fleet_preset_and_drops_an_unencrypted_personal_volume() {
     assert!(documents.icloud);
     let films = policy.datasets.iter().find(|d| d.name == "Films").unwrap();
     assert_eq!(films.class, Class::Reobtainable);
-    assert_eq!(films.master_volume, "OTV Mirror");
+    assert_eq!(films.master_volume, "Films");
+    assert_eq!(films.master_host, "hub");
     assert!(
         policy
             .volumes
             .iter()
-            .any(|v| v.name == "Stash" && v.subpath == "Media")
+            .any(|v| v.name == "Spare" && v.subpath == "Media" && v.host == "hub")
     );
     let text = render_policy(&policy).unwrap();
     let again = load_policy(&text).unwrap();
     assert_eq!(again.hosts[0].floor_gb, 150.0);
+}
+
+#[test]
+fn init_uses_the_registry_s_host_ids_and_the_example_volumes_when_it_lists_none() {
+    // No volumes and no names: the neutral names of docs/examples/placement.toml.
+    let policy = fleet_policy(r#"{"drives":[]}"#, r#"{"datasets":[{"name":"Photos","paths":["Pictures"],"class":"personal"}]}"#).unwrap();
+    let ids: Vec<&str> = policy.hosts.iter().map(|h| h.id.as_str()).collect();
+    assert_eq!(ids, ["primary", "hub", "shared"]);
+    let volumes: Vec<&str> = policy.volumes.iter().map(|v| v.name.as_str()).collect();
+    assert_eq!(volumes, ["media", "vault-a", "vault-b"]);
+    assert_eq!(policy.datasets[0].replica_volumes, vec!["vault-a".to_string(), "vault-b".to_string()]);
+    load_policy(&render_policy(&policy).unwrap()).unwrap();
+    // A site's own ids come from the registry file, not from this program.
+    let drives = r#"{"placement":{"primary":"laptop","hub":"server","shared":"family","offsite":"cloud"},
+        "drives":[{"volumes":{"Bulk":{"encrypted":false},"Safe":{"encrypted":true,"host":"laptop"}}}]}"#;
+    let policy = fleet_policy(drives, r#"{"datasets":[{"name":"Photos","paths":["Pictures"],"class":"personal"},{"name":"Films","paths":["Movies"],"class":"re-obtainable"}]}"#).unwrap();
+    let ids: Vec<&str> = policy.hosts.iter().map(|h| h.id.as_str()).collect();
+    assert_eq!(ids, ["laptop", "server", "family"]);
+    let photos = &policy.datasets[0];
+    assert_eq!((photos.master_host.as_str(), photos.master_volume.as_str(), photos.offsite.as_str()), ("laptop", "Safe", "cloud"));
+    assert_eq!(photos.keep, vec!["laptop".to_string()]);
+    let films = &policy.datasets[1];
+    assert_eq!((films.master_host.as_str(), films.master_volume.as_str()), ("server", "Bulk"));
+    load_policy(&render_policy(&policy).unwrap()).unwrap();
 }
 
 #[test]
@@ -904,7 +934,7 @@ fn example_config_parses_and_uses_role_ids() {
         !policy
             .hosts
             .iter()
-            .any(|h| h.id == "m5" || h.id == "m1" || h.id == "m2")
+            .any(|h| !["primary", "hub", "shared"].contains(&h.id.as_str()))
     );
     assert!(
         policy

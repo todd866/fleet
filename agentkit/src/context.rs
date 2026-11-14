@@ -276,14 +276,53 @@ fn fleet_line() -> String {
     let Ok(v) = serde_json::from_str::<Value>(&text) else {
         return "no report".into();
     };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    fleet_summary(&v, now)
+}
+
+/// The fleet line: counts, where the failures are, and how old the report is.
+///
+/// A bare "28 fail 21 warn" on every prompt told an agent nothing it could act on, and nothing
+/// about whether the report was this morning's or last week's (14 Nov 2026). Failures are grouped
+/// by the board's `area` (job, backup, disk, ...), largest first, at most four named.
+fn fleet_summary(v: &Value, now: u64) -> String {
     let fail = v.pointer("/counts/fail").and_then(|n| n.as_u64()).unwrap_or(0);
     let warn = v.pointer("/counts/warn").and_then(|n| n.as_u64()).unwrap_or(0);
-    if fail == 0 && warn == 0 {
-        if v.get("ok").and_then(|b| b.as_bool()) == Some(true) {
-            return "0 fail 0 warn".into();
+    let mut areas: Vec<(String, u64)> = Vec::new();
+    if let Some(rows) = v.get("rows").and_then(|r| r.as_array()) {
+        for row in rows {
+            if row.get("status").and_then(|s| s.as_str()) != Some("fail") {
+                continue;
+            }
+            let area = row.get("area").and_then(|a| a.as_str()).unwrap_or("other").to_string();
+            match areas.iter_mut().find(|(a, _)| *a == area) {
+                Some((_, n)) => *n += 1,
+                None => areas.push((area, 1)),
+            }
         }
     }
-    format!("{fail} fail {warn} warn")
+    areas.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let mut out = format!("{fail} fail");
+    if !areas.is_empty() {
+        let named: Vec<String> = areas.iter().take(4).map(|(a, n)| format!("{a} {n}")).collect();
+        let rest: u64 = areas.iter().skip(4).map(|(_, n)| n).sum();
+        out.push_str(&format!(" ({}{})", named.join(", "), if rest > 0 { format!(", +{rest}") } else { String::new() }));
+    }
+    out.push_str(&format!(" {warn} warn"));
+    if let Some(generated) = v.get("generated").and_then(|g| g.as_u64())
+        && now > generated
+    {
+        let hours = (now - generated) / 3600;
+        if hours >= 48 {
+            out.push_str(&format!(" · report {} d old", hours / 24));
+        } else if hours >= 3 {
+            out.push_str(&format!(" · report {hours} h old"));
+        }
+    }
+    out
 }
 
 fn fleet_health_fallback() -> String {
@@ -389,5 +428,18 @@ mod tests {
         let v: Value = serde_json::from_str(r#"{"counts":{"fail":3,"warn":2}}"#).unwrap();
         let fail = v.pointer("/counts/fail").and_then(|n| n.as_u64()).unwrap();
         assert_eq!(fail, 3);
+        assert_eq!(fleet_summary(&v, 0), "3 fail 2 warn");
+    }
+
+    #[test]
+    fn fleet_line_says_where_the_failures_are_and_how_old_the_report_is() {
+        let v = json!({"counts": {"fail": 7, "warn": 1}, "generated": 1000, "rows": [
+            {"status": "fail", "area": "job"}, {"status": "fail", "area": "job"}, {"status": "fail", "area": "job"},
+            {"status": "fail", "area": "backup"}, {"status": "fail", "area": "disk"}, {"status": "fail", "area": "thermal"},
+            {"status": "fail", "area": "project"}, {"status": "warn", "area": "job"}, {"status": "pass", "area": "disk"}]});
+        assert_eq!(fleet_summary(&v, 1000 + 600), "7 fail (job 3, backup 1, disk 1, project 1, +1) 1 warn");
+        assert_eq!(fleet_summary(&v, 1000 + 9 * 3600), "7 fail (job 3, backup 1, disk 1, project 1, +1) 1 warn · report 9 h old");
+        assert_eq!(fleet_summary(&v, 1000 + 72 * 3600), "7 fail (job 3, backup 1, disk 1, project 1, +1) 1 warn · report 3 d old");
+        assert_eq!(fleet_summary(&json!({"ok": true, "counts": {"fail": 0, "warn": 0}}), 5), "0 fail 0 warn");
     }
 }

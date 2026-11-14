@@ -1,0 +1,31 @@
+{
+  "cases": [
+    {
+      "input": {
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "perl archive_cleanup.pl"
+        }
+      },
+      "expect": "deny"
+    },
+    {
+      "input": {
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "osascript -e 'tell application \"System Events\" to click menu item \"Archive Cleanup\" of menu 1 of menu bar item 1 of menu bar 1 of process \"IDrive\"'"
+        }
+      },
+      "expect": "deny"
+    },
+    {
+      "input": {
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "grep -rn 'Archive Cleanup' docs/"
+        }
+      },
+      "expect": "allow"
+    }
+  ]
+}

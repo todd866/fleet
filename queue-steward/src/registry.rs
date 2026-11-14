@@ -31,7 +31,13 @@ pub fn load_waiters(state_dir: &Path) -> Vec<Waiter> {
             continue;
         };
         if !pid_alive(w.pid) {
-            let _ = fs::remove_file(&path);
+            // A dead `processing` entry is a job that was lost (its heavy-slot was killed, or
+            // the Mac restarted). heavy-slot's `reap_lost` writes that to jobs.jsonl from this
+            // file and then removes it; removing it here first would lose the record. It is not
+            // a live entry either way, so it is neither counted nor picked.
+            if w.state != "processing" {
+                let _ = fs::remove_file(&path);
+            }
             continue;
         }
         w.pid = name.parse().unwrap_or(w.pid);

@@ -39,19 +39,20 @@ placement init --from-drive-registry [--drives FILE] [--datasets FILE] [--out FI
 
 ## Bundled init preset
 
-`placement init --from-drive-registry` writes a starting policy from your registry files. The evaluator never mentions preset ids; they exist only in the generated site config.
+`placement init --from-drive-registry` writes a starting policy from your registry files. The evaluator never mentions preset ids; they exist only in the generated site config. The program names no real machine or disk: host ids and volumes come from the registry, and where it says nothing the names of `docs/examples/placement.toml` are used.
 
-| Host | Role | Floor | Band | Bulk |
+| Host id | Role | Floor | Band | Bulk |
 |---|---|---|---|---|
-| m5 | travelling primary | 150 GB free | 200–400 GB free | working set |
-| m2 | home hub | 40 GB free on the internal disk | — | masters on externals |
-| m1 | shared laptop | 30 GB free | — | no bulk unless pinned or opened in 30 days |
+| `primary` | travelling primary | 150 GB free | 200–400 GB free | working set |
+| `hub` | home hub | 40 GB free on the internal disk | — | masters on externals |
+| `shared` | shared laptop | 30 GB free | — | no bulk unless pinned or opened in 30 days |
 
-- Re-obtainable masters go to **OTV Mirror**, the volume that stays on the hub. **Stash/Media** is the alternate, not the master: that disk does not enumerate on the hub's port.
-- Personal data targets **Archive_Encrypted2** and **Vault-T**, and only while the drive file says the volume is encrypted. A volume marked unencrypted is dropped from the replica list. Naming a volume does not mark it verified.
+- Your own ids: add `"placement": {"primary": "...", "hub": "...", "shared": "...", "offsite": "..."}` to the drive registry. Any key left out keeps the name above; `offsite` (default `offsite-backup`) is the label recorded for the off-site copy of personal data.
+- Volumes are every volume the registry lists, in its order, on the hub unless the entry has `"host"`. An entry may also carry `"subpath"` and `"accepts"`. A registry with no volumes gets the example ones: `media`, `vault-a`, `vault-b`.
+- An encrypted volume accepts personal data and the first one is the personal master; all of them are the replica targets. A volume the registry does not mark `"encrypted": true` accepts re-obtainable data only, even if its `accepts` asks for more, and the first such volume is the master for re-obtainable data. Naming a volume does not mark it verified.
 - `personal` and `work` data sets become `personal-unique`. An unknown class does too, so a typo cannot make unique files eligible to leave.
 - Desktop and Documents are marked `icloud`. Apply will not read them while a metered link is set.
-- Games: `Saves` syncs to every host. Any other child is an install, kept on m5 until use is known, and on m1 only if it was opened there in 30 days. The m2 copy is the external master, not an internal mirror. `ROMs` is an archive: master on OTV Mirror only.
+- Games: `Saves` syncs to every host. Any other child is an install, kept on the primary until use is known, and on the shared laptop only if it was opened there in 30 days. The hub copy is the external master, not an internal mirror. `Archives` is an archive: master on the hub volume only.
 
 ## Rollout
 
@@ -65,7 +66,7 @@ Copy `~/.cargo/bin/placement` to `~/.local/bin/placement` on each Mac. Do not sc
 
 1. On one Mac, with `~/.config/fleet/drives.json` and a data-set file present: `placement init --from-drive-registry --out ~/.config/fleet/placement.toml`. Read it. Copy that file to the other Macs (it is site config, not a secret, and it does not belong in git).
 2. diskmap should already be writing `summary.json`. Last access is `access.json` in the same directory, or `newest_mtime` on a `where.json` row.
-3. `placement plan` on each Mac (`--host m5`, `m2`, or `m1`). The rows are the change. Nothing moves.
+3. `placement plan` on each Mac (`--host primary`, `hub`, or `shared`, or your own ids). The rows are the change. Nothing moves.
 4. `placement status` writes the JSON fleet-health and mac-registry read. Optional: the launchd template, which runs `status` only.
 5. When the plan is acceptable and the machine is idle: `placement apply --host <id>`. Personal rows stay put until two encrypted copies are verified. Syncthing then honours the `.stignore` apply wrote into each sync folder. Do not add `(?d)` by hand.
 6. Confirmed replicas land in `replicas.json`. The next status stops calling an empty directory a copy.
