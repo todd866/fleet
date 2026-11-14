@@ -162,10 +162,14 @@ fn trusted_guards(
     map
 }
 
-fn firing_guard(guard_name: &str, cfg: &GuardConfig, session_home: &Path, site: &Site) -> bool {
+fn firing_guard(guard_name: &str, cfg: &GuardConfig, _session_home: &Path, site: &Site) -> bool {
     let mut cfg = cfg.clone();
+    // The metered-link case needs a marker file to exist. It is made in a throwaway home, never
+    // in the session's: writing and then removing the real ~/.local/state/METERED_LINK would
+    // clear a marker that was there for a reason, and every agent would start big transfers.
+    let scratch = std::env::temp_dir().join(format!("agentkit-conformance-{}", std::process::id()));
     if guard_name == "metered-link" {
-        cfg.home = session_home.to_path_buf();
+        cfg.home = scratch.clone();
     } else {
         cfg.home = PathBuf::from("/Users/agentkit-conformance");
     }
@@ -173,7 +177,6 @@ fn firing_guard(guard_name: &str, cfg: &GuardConfig, session_home: &Path, site: 
     cfg.allowed_cd = crate::site::default_cd_roots(&cfg.home);
     cfg.offload_worker = Some("worker".into());
     let marker = cfg.home.join(".local/state/METERED_LINK");
-    let _metered_backup = marker.exists();
     if guard_name == "metered-link" {
         if let Some(parent) = marker.parent() {
             let _ = fs::create_dir_all(parent);
@@ -197,8 +200,8 @@ fn firing_guard(guard_name: &str, cfg: &GuardConfig, session_home: &Path, site: 
             let decision = guard::decide_json(guard_name, raw, &cfg).unwrap_or_else(|_| guard::Decision::allow());
             matches_expect(&decision, expect.as_str())
         });
-    if guard_name == "metered-link" && marker.exists() {
-        let _ = fs::remove_file(&marker);
+    if guard_name == "metered-link" {
+        let _ = fs::remove_dir_all(&scratch);
     }
     ok
 }

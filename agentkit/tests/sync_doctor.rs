@@ -472,3 +472,21 @@ fn example_site_syncs_under_a_temp_home() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{err}{doc}");
 }
+
+#[test]
+fn conformance_never_touches_the_real_metered_link_marker() {
+    let home = Home::new();
+    home.site();
+    home.run(&["sync", "--apply"]);
+    let marker = home.root.join(".local/state/METERED_LINK");
+    // not metered: the check must not leave a marker behind
+    let (code, doc, err) = home.run(&["doctor", "--conformance"]);
+    assert_eq!(code, 0, "{err}{doc}");
+    assert!(!marker.exists(), "conformance created a metered marker in the session home");
+    // metered: the marker and its contents survive the check
+    fs::create_dir_all(marker.parent().unwrap()).unwrap();
+    fs::write(&marker, "set by link-meter\n").unwrap();
+    let (code, doc, err) = home.run(&["doctor", "--conformance"]);
+    assert_eq!(code, 0, "{err}{doc}");
+    assert_eq!(fs::read_to_string(&marker).unwrap(), "set by link-meter\n");
+}
