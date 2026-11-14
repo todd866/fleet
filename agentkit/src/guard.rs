@@ -518,6 +518,13 @@ fn pieces(cmd: &str) -> Vec<Piece<'_>> {
     out
 }
 
+/// The line as the shell would join it: quote marks and backslashes removed. `APPR""OVE_X` and
+/// `lim\it` name the same files as `APPROVE_X` and `limit`, so a guard that first asks "is my
+/// subject named on this line at all?" asks it of this form too.
+fn without_quoting(cmd: &str) -> String {
+    cmd.chars().filter(|c| !matches!(c, '\'' | '"' | '\\')).collect()
+}
+
 /// Whether the line uses bash's `$'...'` (ANSI-C) or `$"..."` (locale) quoting.
 fn has_dollar_quote(cmd: &str) -> bool {
     cmd.contains("$'") || cmd.contains("$\"")
@@ -1081,10 +1088,11 @@ fn quoted_substitutions(text: &str) -> Vec<String> {
 
 /// Targets of `>` and `>>` in a piece of a command line (not `2>&1`).
 fn redirect_targets(text: &str) -> Vec<String> {
-    compiled(r#">{1,2}\|?\s*("[^"]*"|'[^']*'|[^\s;&|()<>]+)"#)
+    // One word may be built from quoted and bare parts (`/tmp/a"b c"d`); the shell joins them.
+    compiled(r#">{1,2}\|?\s*((?:"[^"]*"|'[^']*'|\\.|[^\s;&|()<>'"\\]+)+)"#)
         .captures_iter(text)
         .iter()
-        .filter_map(|c| c.get(1).map(|m| m.as_str().to_string()))
+        .filter_map(|c| c.get(1).map(|m| without_quoting(m.as_str())))
         .collect()
 }
 
@@ -2028,7 +2036,7 @@ fn slot_files(cmd: &str, cfg: &GuardConfig) -> Decision {
     let dir_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or(SLOT_TOOL).to_string();
     let here = PathBuf::from(resolve_path(&cfg.cwd.to_string_lossy(), cfg));
     let dir_real = PathBuf::from(resolve_path(&dir.to_string_lossy(), cfg));
-    if !cmd.contains(&dir_name) && !here.starts_with(&dir_real) {
+    if !cmd.contains(&dir_name) && !without_quoting(cmd).contains(&dir_name) && !here.starts_with(&dir_real) {
         return Decision::allow();
     }
     let names = slot_file_names(cfg);
@@ -2119,7 +2127,8 @@ fn approval_files(cmd: &str, cfg: &GuardConfig) -> Decision {
         .map(|p| p.trim_end_matches('*'))
         .filter(|p| !p.is_empty())
         .collect();
-    if !literals.iter().any(|l| cmd.contains(l)) {
+    let bare = without_quoting(cmd);
+    if !literals.iter().any(|l| cmd.contains(l) || bare.contains(l)) {
         return Decision::allow();
     }
     let named_in_text = cfg.approval_file_patterns.iter().any(|pat| {
@@ -2159,7 +2168,7 @@ fn approval_files(cmd: &str, cfg: &GuardConfig) -> Decision {
 fn idrive_cleanup(cmd: &str, cfg: &GuardConfig) -> Decision {
     let patterns: Vec<Rex> = cfg.idrive_cleanup_patterns.iter().filter_map(|p| try_compiled(p)).collect();
     let named = |text: &str| patterns.iter().any(|p| p.is_match(text));
-    if !named(cmd) {
+    if !named(cmd) && !named(&without_quoting(cmd)) {
         return Decision::allow();
     }
     let deny = || {

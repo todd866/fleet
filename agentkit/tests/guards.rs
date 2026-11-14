@@ -1041,6 +1041,34 @@ fn nested_sh(cmd: &str, layers: usize) -> String {
     out
 }
 
+/// The shell joins `APPR""OVE_X` into `APPROVE_X`. A guard that first looks for its subject in
+/// the raw text must look in the joined text too, or a name split by quotes walks past it.
+#[test]
+fn a_name_split_by_quotes_or_a_backslash_is_still_the_name() {
+    let c = cfg();
+    each(
+        "approval-files",
+        &c,
+        &[
+            r#"touch APPR""OVE_EXAMPLE"#,
+            r#"touch 'APPR'OVE_EXAMPLE"#,
+            r#"touch APPR\OVE_EXAMPLE"#,
+            r#"echo yes > /tmp/APP"ROVE"_EXAMPLE"#,
+        ],
+        &[r#"ls "some dir"/notes.txt"#],
+    );
+    each(
+        "slot-files",
+        &c,
+        &[
+            r#"echo 3 > ~/.local/state/heavy-sl""ot/limit"#,
+            r#"echo 3 > ~/.local/state/heavy-'slot'/lim\it"#,
+        ],
+        &[r#"cat ~/.local/state/heavy-sl""ot/limit"#],
+    );
+    each("idrive-cleanup", &c, &[r#"perl archive_clean""up.pl"#, r#"perl arch\ive_cleanup.pl"#], &[r#"perl report.pl"#]);
+}
+
 /// bash's `$'...'` quoting lets `\'` stand for a quote inside the string, so `$'\''` is one
 /// complete word. A reader that does not know that sees a quote opening after it and takes the
 /// rest of the line for text. Such a line is unreadable here, and unreadable is refused when the
