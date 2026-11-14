@@ -1,7 +1,9 @@
 //! Canonical agent operating layer. Provider files are generated; guards decide
 //! allow / ask / deny from a command, not from which CLI invoked them.
 
+pub mod conformance;
 pub mod context;
+pub mod posture;
 pub mod doctor;
 pub mod generate;
 pub mod guard;
@@ -38,6 +40,7 @@ pub fn run(args: &[String]) -> i32 {
         }
         Some("hook") => cmd_hook(&args[2..]),
         Some("memory") => cmd_memory(&args[2..]),
+        Some("posture") => cmd_posture(&args[2..]),
         Some(other) => {
             eprintln!("agentkit: unknown command {other}");
             print_usage();
@@ -52,13 +55,14 @@ fn print_usage() {
 agentkit inventory [--out FILE]     print the mechanism inventory
 agentkit sync [--apply] [--config DIR]
                                     dry-run (default); --apply writes provider files
-agentkit doctor [--provider NAME] [--config DIR]
+agentkit doctor [--provider NAME] [--config DIR] [--conformance] [--json]
                                     exit non-zero when a provider has drifted
 agentkit context                    time, capacity, unread mail, fleet alerts
-agentkit hook <claude|codex|cursor> <guard>
-                                    provider adapter: tool-call JSON on stdin
+agentkit hook <claude|codex|cursor> <guard|all>
+                                    provider adapter: tool-call JSON on stdin; `all` runs every enabled guard
 agentkit memory import --from DIR   import Claude memory files into the notebook
-agentkit memory path                print the notebook directory"
+agentkit memory path                print the notebook directory
+agentkit posture write [--out PATH] refresh ~/.local/state/ai-budget/posture.json from ai-capacity"
     );
 }
 
@@ -96,10 +100,16 @@ fn cmd_sync(args: &[&str]) -> i32 {
 
 fn cmd_doctor(args: &[&str]) -> i32 {
     let provider = flag(args, "--provider");
+    let conformance_only = args.contains(&"--conformance");
+    let json = args.contains(&"--json");
     let paths = paths_from(args);
-    match doctor::run(&paths, provider) {
+    match doctor::run(&paths, provider, conformance_only, json) {
         Ok((code, text)) => {
-            print!("{text}");
+            if json {
+                print!("{text}");
+            } else {
+                print!("{text}");
+            }
             code
         }
         Err(e) => {
@@ -111,17 +121,58 @@ fn cmd_doctor(args: &[&str]) -> i32 {
 
 fn cmd_hook(args: &[&str]) -> i32 {
     let (Some(provider), Some(guard_name)) = (args.first().copied(), args.get(1).copied()) else {
-        eprintln!("usage: agentkit hook <claude|codex|cursor> <guard>");
+        eprintln!("usage: agentkit hook <claude|codex|cursor> <guard|all>");
         return 2;
     };
+    if !matches!(provider, "claude" | "codex" | "cursor") {
+        eprintln!("agentkit hook: unknown provider {provider}");
+        return 2;
+    }
+    if guard_name != "all" && !guard::ALL_GUARD_NAMES.contains(&guard_name) {
+        eprintln!("agentkit hook: unknown guard {guard_name}");
+        return 2;
+    }
     let mut raw = String::new();
     if io::stdin().read_to_string(&mut raw).is_err() {
         return 0;
     }
+    let paths = paths_from(args);
+    let site = match site::Site::load(&paths.config) {
+        Ok(s) => s,
+        Err(_) => site::Site {
+            schema: 1,
+            manage_model: false,
+            projects: vec![],
+            retired_cursor_rules: vec![],
+            guards: site::GuardFile::default(),
+            models: site::Models::default(),
+        },
+    };
+    if guard_name != "all" && !site::guard_enabled(guard_name, &site.guards.disabled) {
+        let _ = writeln!(io::stderr(), "agentkit: {guard_name} disabled (site)");
+        return 0;
+    }
     let cfg = site::guard_config_from_env();
-    let decision = match guard::decide_json(guard_name, &raw, &cfg) {
-        Ok(d) => d,
-        Err(_) => return 0,
+    let enabled: Vec<&str> = guard::ALL_GUARD_NAMES
+        .iter()
+        .copied()
+        .filter(|n| site::guard_enabled(n, &site.guards.disabled))
+        .collect();
+    let decision = if guard_name == "all" {
+        let value: serde_json::Value = if raw.trim().is_empty() {
+            serde_json::Value::Null
+        } else {
+            match serde_json::from_str(&raw) {
+                Ok(v) => v,
+                Err(_) => return 0,
+            }
+        };
+        guard::decide_all(&value, &cfg, &enabled)
+    } else {
+        match guard::decide_json(guard_name, &raw, &cfg) {
+            Ok(d) => d,
+            Err(_) => return 0,
+        }
     };
     let rendered = match provider {
         "claude" | "codex" => guard::format_claude(&decision),
@@ -134,6 +185,39 @@ fn cmd_hook(args: &[&str]) -> i32 {
     let mut out = io::stdout().lock();
     let _ = out.write_all(rendered.as_bytes());
     0
+}
+
+fn cmd_posture(args: &[&str]) -> i32 {
+    match args.first().copied() {
+        Some("write") => {
+            let paths = paths_from(args);
+            let out = flag(args, "--out")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| posture::default_posture_path(&paths.home));
+            let cap = env::var_os("AGENTKIT_AI_CAPACITY")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| paths.home.join(".local/bin/ai-capacity"));
+            match posture::refresh_from_ai_capacity(&paths.home, &cap, &out) {
+                Ok(doc) => {
+                    println!(
+                        "agentkit posture: wrote {} (asOf {}, route build {})",
+                        out.display(),
+                        doc.as_of,
+                        doc.route.build
+                    );
+                    0
+                }
+                Err(e) => {
+                    eprintln!("agentkit posture write: {e}");
+                    1
+                }
+            }
+        }
+        _ => {
+            eprintln!("usage: agentkit posture write [--out PATH]");
+            2
+        }
+    }
 }
 
 fn cmd_memory(args: &[&str]) -> i32 {

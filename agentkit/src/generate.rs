@@ -75,36 +75,13 @@ pub fn sync(paths: &Paths, apply: bool) -> Result<String, String> {
 }
 
 pub fn plan(paths: &Paths, site: &Site) -> Result<Vec<Planned>, String> {
-    let global = site::rules_global(&paths.config)?;
-    let source = paths.config.join("rules/global.md");
-    let body = render_global(&source, &global, &paths.notebook());
+    let source = paths.config.join("rules/core-always.md");
     let mut files = vec![
-        Planned {
-            path: paths.home.join(".claude/CLAUDE.md"),
-            contents: body.clone(),
-            providers: vec!["claude"],
-            kind: "rules",
-        },
-        Planned {
-            path: paths.home.join(".codex/AGENTS.md"),
-            contents: body.clone(),
-            providers: vec!["codex"],
-            kind: "rules",
-        },
-        Planned {
-            path: paths.home.join(".cursor/rules/agentkit-global.mdc"),
-            contents: render_mdc(
-                "Global agent rules",
-                true,
-                &source.display().to_string(),
-                &global,
-                &paths.notebook(),
-                true,
-            ),
-            providers: vec!["cursor"],
-            kind: "rules",
-        },
+        provider_rules(paths, "claude", &source)?,
+        provider_rules(paths, "codex", &source)?,
+        provider_rules(paths, "cursor", &source)?,
     ];
+    files.extend(retired_cursor_rules(paths, site, &source)?);
     for project in &site.projects {
         let proj_src = paths.config.join("rules/projects").join(format!("{}.md", project.name));
         let text = site::rules_project(&paths.config, &project.name)?;
@@ -181,12 +158,12 @@ pub fn plan(paths: &Paths, site: &Site) -> Result<Vec<Planned>, String> {
     ));
     files.push(hook_file(
         paths.home.join(".codex/hooks.json"),
-        merge_codex(&paths.home.join(".codex/hooks.json"), &bin)?,
+        merge_codex(&paths.home.join(".codex/hooks.json"), &bin, site)?,
         vec!["codex"],
     ));
     files.push(hook_file(
         paths.home.join(".cursor/hooks.json"),
-        merge_cursor(&paths.home.join(".cursor/hooks.json"), &bin)?,
+        merge_cursor(&paths.home.join(".cursor/hooks.json"), &bin, site)?,
         vec!["cursor"],
     ));
     if site.manage_model {
@@ -205,18 +182,12 @@ const GUARD_RULES: &str = "\
 - icloud: deny emptying the Trash, and deny wiping Desktop, Documents, or iCloud Drive as a whole.
 - offload-heavy: a heavy test or build yields to `remote-run` when a worker is named.
 - cd-outside: deny `cd` to an absolute path outside the allowed roots.
-- push: a plain `git push` asks; `--force` and `-f` stay denied.
+- push: plain `git push` is allowed; listed projects ask without a marker; `--force` / `-f` denied; `--force-with-lease` asks.
+- disk-slot: deny shell work on `/Volumes/*` unless wrapped in `disk-slot PATH -- <command>`.
+- metered-link: deny large transfers while `~/.local/state/METERED_LINK` exists unless approved.
+- agent-yolo: deny raw `agent -p` with `--force` or `--yolo`; use `cursor-worker` / `cursor-opinion`.
+- test-audio: deny audible playback unless `AUDIBLE_APPROVED=1` (owner asked to hear it this session).
 ";
-
-fn render_global(source: &Path, body: &str, notebook: &Path) -> String {
-    format!(
-        "{}\n\n{}\n\n{}\n{}\n",
-        generated_banner(&source.display().to_string()),
-        body.trim_end(),
-        GUARD_RULES.trim_end(),
-        trailer(notebook)
-    )
-}
 
 fn render_mdc(
     description: &str,
@@ -339,7 +310,81 @@ const GUARDS: &[(&str, u64, bool)] = &[
     ("offload-heavy", 20, false),
     ("cd-outside", 10, true),
     ("push", 10, true),
+    ("disk-slot", 10, true),
+    ("metered-link", 10, true),
+    ("agent-yolo", 10, true),
+    ("test-audio", 10, true),
 ];
+
+fn provider_rules(paths: &Paths, provider: &str, _core_src: &Path) -> Result<Planned, String> {
+    let body = site::rules_for_provider(&paths.config, provider)?;
+    let ondemand = paths.config.join("rules/core-ondemand.md");
+    let trailer_note = if ondemand.is_file() {
+        format!("On-demand reference: {}\n", ondemand.display())
+    } else {
+        String::new()
+    };
+    let source_label = format!("{provider} ← rules/core-always.md + rules/appendix-{provider}.md");
+    match provider {
+        "claude" => Ok(Planned {
+            path: paths.home.join(".claude/CLAUDE.md"),
+            contents: format!(
+                "{}\n\n{}\n\n{}\n{}\n",
+                generated_banner(&source_label),
+                body.trim_end(),
+                GUARD_RULES.trim_end(),
+                format!("{}\n{}", trailer(&paths.notebook()), trailer_note).trim_end()
+            ),
+            providers: vec!["claude"],
+            kind: "rules",
+        }),
+        "codex" => Ok(Planned {
+            path: paths.home.join(".codex/AGENTS.md"),
+            contents: format!(
+                "{}\n\n{}\n\n{}\n{}\n",
+                generated_banner(&source_label),
+                body.trim_end(),
+                GUARD_RULES.trim_end(),
+                format!("{}\n{}", trailer(&paths.notebook()), trailer_note).trim_end()
+            ),
+            providers: vec!["codex"],
+            kind: "rules",
+        }),
+        "cursor" => Ok(Planned {
+            path: paths.home.join(".cursor/rules/agentkit-global.mdc"),
+            contents: render_mdc(
+                "Global agent rules",
+                true,
+                &source_label,
+                &body,
+                &paths.notebook(),
+                true,
+            ) + &format!("\n{trailer_note}"),
+            providers: vec!["cursor"],
+            kind: "rules",
+        }),
+        other => Err(format!("unknown provider {other}")),
+    }
+}
+
+fn retired_cursor_rules(paths: &Paths, site: &Site, core_src: &Path) -> Result<Vec<Planned>, String> {
+    let stamp = format!(
+        "---\ndescription: Retired — folded into agentkit-global.mdc\nalwaysApply: false\n---\n\n{}\n",
+        generated_banner(&format!("retired; source {}", core_src.display()))
+    );
+    Ok(site
+        .retired_cursor_rules
+        .iter()
+        // a bare file name only: this list must not be able to write outside the rules folder
+        .filter(|name| !name.is_empty() && !name.contains('/') && !name.starts_with('.'))
+        .map(|name| Planned {
+            path: paths.home.join(".cursor/rules").join(name),
+            contents: stamp.clone(),
+            providers: vec!["cursor"],
+            kind: "rules",
+        })
+        .collect())
+}
 
 fn load_json(path: &Path) -> Value {
     fs::read_to_string(path)
@@ -358,11 +403,24 @@ fn command_of(v: &Value) -> String {
     v.get("command").and_then(|c| c.as_str()).unwrap_or("").to_string()
 }
 
+fn enabled_guards(site: &Site) -> Vec<(&'static str, u64, bool)> {
+    GUARDS
+        .iter()
+        .copied()
+        .filter(|(name, _, _)| site::guard_enabled(name, &site.guards.disabled))
+        .collect()
+}
+
 fn is_managed(command: &str) -> bool {
     command.contains("agentkit hook ")
         || command == "agent-context"
         || command.starts_with("agent-context ")
+        || command.contains("AGENTKIT_PROVIDER=") && command.contains("agent-context")
         || command.contains("agentkit context")
+}
+
+fn context_hook_command(provider: &str) -> String {
+    format!("env AGENTKIT_PROVIDER={provider} agent-context")
 }
 
 fn merge_claude(path: &Path, bin: &str, site: &Site) -> Result<String, String> {
@@ -378,21 +436,24 @@ fn merge_claude(path: &Path, bin: &str, site: &Site) -> Result<String, String> {
     let pre = hooks_obj.entry("PreToolUse").or_insert_with(|| json!([]));
     scrub_claude_array(pre);
     if let Some(arr) = pre.as_array_mut() {
-        let mut block = vec![];
-        for (name, timeout, _) in GUARDS {
-            block.push(json!({
-                "type": "command",
-                "command": format!("{bin} hook claude {name}"),
-                "timeout": timeout,
+        let guards = enabled_guards(site);
+        if !guards.is_empty() {
+            let max_timeout = guards.iter().map(|(_, t, _)| *t).max().unwrap_or(20);
+            arr.push(json!({
+                "matcher": "Bash",
+                "hooks": [{
+                    "type": "command",
+                    "command": format!("{bin} hook claude all"),
+                    "timeout": max_timeout,
+                }]
             }));
         }
-        arr.push(json!({"matcher": "Bash", "hooks": block}));
     }
     for event in ["SessionStart", "UserPromptSubmit"] {
         let slot = hooks_obj.entry(event).or_insert_with(|| json!([]));
         scrub_claude_array(slot);
         if let Some(arr) = slot.as_array_mut() {
-            arr.push(json!({"hooks": [{"type": "command", "command": "agent-context", "timeout": 8}]}));
+            arr.push(json!({"hooks": [{"type": "command", "command": context_hook_command("claude"), "timeout": 8}]}));
         }
     }
     if site.manage_model {
@@ -434,7 +495,7 @@ fn scrub_claude_array(slot: &mut Value) {
     *slot = Value::Array(next);
 }
 
-fn merge_codex(path: &Path, bin: &str) -> Result<String, String> {
+fn merge_codex(path: &Path, bin: &str, site: &Site) -> Result<String, String> {
     let mut root = load_json(path);
     if !root.is_object() {
         root = json!({});
@@ -447,15 +508,18 @@ fn merge_codex(path: &Path, bin: &str) -> Result<String, String> {
     let pre = hooks_obj.entry("PreToolUse").or_insert_with(|| json!([]));
     scrub_claude_array(pre);
     if let Some(arr) = pre.as_array_mut() {
-        let mut block = vec![];
-        for (name, timeout, _) in GUARDS {
-            block.push(json!({
-                "type": "command",
-                "command": format!("{bin} hook codex {name}"),
-                "timeout": timeout,
+        let guards = enabled_guards(site);
+        if !guards.is_empty() {
+            let max_timeout = guards.iter().map(|(_, t, _)| *t).max().unwrap_or(20);
+            arr.push(json!({
+                "matcher": ".*",
+                "hooks": [{
+                    "type": "command",
+                    "command": format!("{bin} hook codex all"),
+                    "timeout": max_timeout,
+                }]
             }));
         }
-        arr.push(json!({"matcher": ".*", "hooks": block}));
     }
     for event in ["SessionStart", "UserPromptSubmit"] {
         let slot = hooks_obj.entry(event).or_insert_with(|| json!([]));
@@ -464,7 +528,7 @@ fn merge_codex(path: &Path, bin: &str) -> Result<String, String> {
             arr.push(json!({
                 "hooks": [{
                     "type": "command",
-                    "command": "agent-context",
+                    "command": context_hook_command("codex"),
                     "timeout": 8
                 }]
             }));
@@ -473,7 +537,7 @@ fn merge_codex(path: &Path, bin: &str) -> Result<String, String> {
     Ok(pretty(&root))
 }
 
-fn merge_cursor(path: &Path, bin: &str) -> Result<String, String> {
+fn merge_cursor(path: &Path, bin: &str, site: &Site) -> Result<String, String> {
     let mut root = load_json(path);
     if !root.is_object() {
         root = json!({});
@@ -489,10 +553,12 @@ fn merge_cursor(path: &Path, bin: &str) -> Result<String, String> {
     let shell = obj.entry("beforeShellExecution").or_insert_with(|| json!([]));
     scrub_cursor_array(shell);
     if let Some(arr) = shell.as_array_mut() {
-        for (name, _, closed) in GUARDS {
+        let guards = enabled_guards(site);
+        if !guards.is_empty() {
+            let fail_closed = guards.iter().any(|(_, _, closed)| *closed);
             arr.push(json!({
-                "command": format!("{bin} hook cursor {name}"),
-                "failClosed": closed,
+                "command": format!("{bin} hook cursor all"),
+                "failClosed": fail_closed,
             }));
         }
     }
@@ -500,7 +566,7 @@ fn merge_cursor(path: &Path, bin: &str) -> Result<String, String> {
         let slot = obj.entry(event).or_insert_with(|| json!([]));
         scrub_cursor_array(slot);
         if let Some(arr) = slot.as_array_mut() {
-            arr.push(json!({"command": "agent-context"}));
+            arr.push(json!({"command": context_hook_command("cursor")}));
         }
     }
     Ok(pretty(&root))

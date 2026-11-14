@@ -1,0 +1,12 @@
+{
+  "cases": [
+    {
+      "input": {"tool_name": "Bash", "tool_input": {"command": "rm -rf ~/Documents/x"}},
+      "expect": "deny"
+    },
+    {
+      "input": {"tool_name": "Bash", "tool_input": {"command": "rm -rf /tmp/agentkit-ok"}},
+      "expect": "allow"
+    }
+  ]
+}

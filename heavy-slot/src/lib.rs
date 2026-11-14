@@ -660,6 +660,11 @@ pub fn parse_cputime(s: &str) -> Option<f64> {
 
 /// CPU seconds used so far by `root` and all its descendants, from `ps -axo pid=,ppid=,time=`.
 pub fn tree_cpu_secs(root: i32, ps_out: &str) -> f64 {
+    tree_cpu_rows(root, ps_out).iter().map(|(_, t)| t).sum()
+}
+
+/// (pid, CPU seconds) for `root` and all its living descendants.
+pub fn tree_cpu_rows(root: i32, ps_out: &str) -> Vec<(i32, f64)> {
     let rows: Vec<(i32, i32, f64)> = ps_out
         .lines()
         .filter_map(|l| {
@@ -678,7 +683,35 @@ pub fn tree_cpu_secs(root: i32, ps_out: &str) -> f64 {
         }
         i += 1;
     }
-    rows.iter().filter(|(pid, _, _)| tree.contains(pid)).map(|(_, _, t)| t).sum()
+    rows.iter().filter(|(pid, _, _)| tree.contains(pid)).map(|(pid, _, t)| (*pid, *t)).collect()
+}
+
+/// Running total of a job tree's CPU that keeps what exited processes used.
+///
+/// `tree_cpu_secs` only sums processes alive at the sample, so a build or test run made of
+/// short-lived children (compilers, test binaries, node workers) showed a flat total and lost
+/// its slot as "idle" while it saturated the Mac (14 Nov 2026: the M2 sat at load 2.6 per core
+/// with a slot showing free, and every session's work landed there). Each sample adds the last
+/// reading of any process that has since left the tree, or whose pid was reused.
+#[derive(Default)]
+pub struct TreeCpu {
+    last: std::collections::HashMap<i32, f64>,
+    gone: f64,
+}
+
+impl TreeCpu {
+    /// Total CPU seconds so far for `root`'s tree, from `ps -axo pid=,ppid=,time=`. Never decreases.
+    pub fn sample(&mut self, root: i32, ps_out: &str) -> f64 {
+        let now: std::collections::HashMap<i32, f64> = tree_cpu_rows(root, ps_out).into_iter().collect();
+        for (pid, was) in &self.last {
+            match now.get(pid) {
+                Some(t) if *t >= *was => {}
+                _ => self.gone += *was,
+            }
+        }
+        self.last = now;
+        self.gone + self.last.values().sum::<f64>()
+    }
 }
 
 /// True when the job used under `max_fraction` of one core across the trailing `window` seconds.
@@ -689,9 +722,9 @@ pub fn idle_over_window(samples: &[(i64, f64)], now: i64, window: i64, max_fract
     (cpu_now - cpu0) < (now - t0) as f64 * max_fraction
 }
 
-fn sample_tree_cpu(root: i32) -> Option<f64> {
+fn sample_tree_cpu(root: i32, total: &mut TreeCpu) -> Option<f64> {
     let out = Command::new("/bin/ps").args(["-axo", "pid=,ppid=,time="]).stderr(Stdio::null()).output().ok()?;
-    Some(tree_cpu_secs(root, &String::from_utf8_lossy(&out.stdout)))
+    Some(total.sample(root, &String::from_utf8_lossy(&out.stdout)))
 }
 
 /// Gives the slot back without touching the job. Returns true if this call released it.
@@ -712,9 +745,11 @@ fn release_slot(dir: &Path, slot: u32, why: &str) -> bool {
 /// (waiting on I/O, a hung read) for the idle window, so compute jobs are not queued behind it.
 fn spawn_idle_watch(dir: PathBuf, slot: u32) -> std::thread::JoinHandle<()> {
     let window = idle_secs() as i64;
-    let every = (window / 10).clamp(1, 30) as u32;
+    // Every 5 s at most, so children that live a few seconds are read before they exit.
+    let every = (window / 10).clamp(1, 5) as u32;
     std::thread::spawn(move || {
         let mut samples: Vec<(i64, f64)> = Vec::new();
+        let mut total = TreeCpu::default();
         let mut tick = 0u32;
         while JOB_DONE.load(Ordering::SeqCst) == 0 {
             std::thread::sleep(std::time::Duration::from_secs(1));
@@ -730,7 +765,7 @@ fn spawn_idle_watch(dir: PathBuf, slot: u32) -> std::thread::JoinHandle<()> {
             if child <= 0 {
                 continue;
             }
-            let Some(cpu) = sample_tree_cpu(child) else { continue };
+            let Some(cpu) = sample_tree_cpu(child, &mut total) else { continue };
             let now = unix_now();
             samples.push((now, cpu));
             samples.retain(|(t, _)| now - t <= window + 120);
@@ -1011,6 +1046,19 @@ mod tests {
     fn tree_cpu_counts_descendants_only() {
         let ps = "  1     0 9:00.00\n 10     1 0:01.00\n 11    10 0:02.00\n 12    11 0:03.00\n 20     1 5:00.00\n";
         assert_eq!(tree_cpu_secs(10, ps), 6.0);
+    }
+
+    #[test]
+    fn tree_cpu_total_keeps_what_exited_children_used() {
+        let mut total = TreeCpu::default();
+        // A build: the shell is idle while short-lived compilers come and go.
+        assert!((total.sample(10, " 10 1 0:00.10\n 11 10 0:04.00\n") - 4.1).abs() < 1e-9);
+        assert!((total.sample(10, " 10 1 0:00.10\n 12 10 0:03.00\n") - 7.1).abs() < 1e-9);
+        // A reused pid starts again from a lower reading: the old one still counts.
+        assert!((total.sample(10, " 10 1 0:00.10\n 12 10 0:01.00\n") - 8.1).abs() < 1e-9);
+        assert!((total.sample(10, " 10 1 0:00.10\n") - 8.1).abs() < 1e-9);
+        // Flat when nothing runs, so a hung job still goes idle.
+        assert!((total.sample(10, " 10 1 0:00.10\n") - 8.1).abs() < 1e-9);
     }
 
     #[test]

@@ -29,4 +29,7 @@ allowed_cd = [
   "/var/folders",
 ]
 push_markers = ["AGENTKIT_PUSH_APPROVED=1"]
+push_gate_projects = []
+# push_gate_projects = ["~/Projects/example"]   # by folder
+# push_gate_remotes = ["owner/name"]            # by remote: every clone and worktree of that repository
 # email_substrings_file = "private/email-substrings.txt"

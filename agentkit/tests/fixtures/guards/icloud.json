@@ -1,0 +1,16 @@
+{
+  "cases": [
+    {
+      "input": {"tool_name": "Bash", "tool_input": {"command": "trash ~/Documents"}},
+      "expect": "deny"
+    },
+    {
+      "input": {"tool_name": "Bash", "tool_input": {"command": "ICLOUD_WIPE_APPROVED=1 trash ~/Documents"}},
+      "expect": "allow"
+    },
+    {
+      "input": {"tool_name": "Bash", "tool_input": {"command": "trash ~/Desktop/one.png"}},
+      "expect": "allow"
+    }
+  ]
+}

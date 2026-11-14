@@ -5,8 +5,22 @@
 //! The deny rules themselves are not relaxed.
 
 use crate::site::GuardConfig;
+
+/// Every guard name agentkit knows. Site `guards.disabled` must be a subset of this list.
+pub const ALL_GUARD_NAMES: &[&str] = &[
+    "hard-delete",
+    "icloud",
+    "offload-heavy",
+    "cd-outside",
+    "push",
+    "disk-slot",
+    "metered-link",
+    "agent-yolo",
+    "test-audio",
+];
 use fancy_regex::Regex;
 use serde_json::Value;
+use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -41,6 +55,46 @@ pub fn decide_json(name: &str, raw: &str, cfg: &GuardConfig) -> Result<Decision,
     Ok(decide_value(name, &value, cfg))
 }
 
+/// Strictest of several guard decisions (`deny` > `ask` > `allow`), with every reason attached.
+pub fn combine_decisions(decisions: impl IntoIterator<Item = Decision>) -> Decision {
+    let mut denies = Vec::new();
+    let mut asks = Vec::new();
+    for d in decisions {
+        if d.is_deny() {
+            denies.push(d);
+        } else if d.is_ask() {
+            asks.push(d);
+        }
+    }
+    if !denies.is_empty() {
+        let reason = denies
+            .iter()
+            .map(|d| format!("[agentkit:{}] {}", d.rule, d.reason))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let rule = denies[0].rule.clone();
+        return Decision::deny(&rule, reason);
+    }
+    if !asks.is_empty() {
+        let reason = asks
+            .iter()
+            .map(|d| format!("[agentkit:{}] {}", d.rule, d.reason))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let rule = asks[0].rule.clone();
+        return Decision::ask(&rule, reason);
+    }
+    Decision::allow()
+}
+
+pub fn decide_all(value: &Value, cfg: &GuardConfig, enabled: &[&str]) -> Decision {
+    if !is_shell(value) {
+        return Decision::allow();
+    }
+    let decisions = enabled.iter().map(|name| decide_value(name, value, cfg));
+    combine_decisions(decisions)
+}
+
 pub fn decide_value(name: &str, value: &Value, cfg: &GuardConfig) -> Decision {
     let adjusted = call_dir(value, cfg);
     let cfg = adjusted.as_ref().unwrap_or(cfg);
@@ -54,6 +108,10 @@ pub fn decide_value(name: &str, value: &Value, cfg: &GuardConfig) -> Decision {
         "offload-heavy" => offload(&command, cfg),
         "cd-outside" => cd_outside(&command, cfg),
         "push" => push(&command, cfg),
+        "disk-slot" => disk_slot(&command, cfg),
+        "metered-link" => metered_link(&command, cfg),
+        "agent-yolo" => agent_yolo(&command),
+        "test-audio" => test_audio(&command),
         _ => Decision::allow(),
     }
 }
@@ -164,8 +222,27 @@ fn compiled(pattern: &str) -> Rex {
 const TEMP_ROOTS: &[&str] = &["/tmp/", "/private/tmp/", "/var/folders/", "/private/var/folders/"];
 const DELETERS: &[&str] = &["rm", "rmdir", "unlink", "shred", "srm"];
 const WRAPPERS: &[&str] = &[
-    "sudo", "command", "builtin", "nohup", "time", "env", "xargs", "exec", "nice",
+    "sudo", "command", "builtin", "nohup", "time", "env", "xargs", "exec", "nice", "timeout",
+    "caffeinate", "heavy-slot", "disk-slot", "power-pause", "ionice", "taskpolicy", "stdbuf",
 ];
+/// Flags of a wrapper that take a separate value. Dropping the flag without its value leaves
+/// the value where the program name should be, and the deleter behind it is never examined.
+const WRAPPER_VALUE_FLAGS: &[(&str, &[&str])] = &[
+    ("sudo", &["-u", "-g", "-C", "-h", "-p", "-U", "-D", "-R", "-T", "-r", "-t"]),
+    ("env", &["-u", "-C", "-S", "-P"]),
+    ("nice", &["-n"]),
+    ("xargs", &["-n", "-I", "-L", "-P", "-s", "-E", "-d", "-a", "-J", "-R"]),
+    ("timeout", &["-s", "-k"]),
+    ("caffeinate", &["-t", "-w"]),
+    ("ionice", &["-c", "-n", "-p"]),
+    ("taskpolicy", &["-c", "-t", "-l", "-p"]),
+    ("stdbuf", &["-i", "-o", "-e"]),
+    ("disk-slot", &["--wait", "--label"]),
+    ("heavy-slot", &["--label"]),
+];
+/// Wrappers whose first plain argument is their own (a duration, a path), not the command.
+const WRAPPER_POSITIONAL: &[&str] = &["timeout", "disk-slot"];
+const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "fish"];
 const KEYWORDS: &[&str] = &[
     "then", "do", "else", "elif", "if", "while", "until", "!", "{", "}", "case", "in",
 ];
@@ -176,8 +253,10 @@ fn hard_delete(cmd: &str, cfg: &GuardConfig) -> Decision {
         if cfg.is_air(&host) && rest.len() == 1 {
             return Decision::allow();
         }
-        if !cfg.is_air(&host) && rest.len() == 1 {
-            if let Decision { decision: "deny", reason, .. } = hard_delete(&rest[0], cfg) {
+        // ssh joins its trailing arguments with spaces before the remote shell sees them, so
+        // `ssh host rm -rf dir` is the same command as `ssh host 'rm -rf dir'`.
+        if !cfg.is_air(&host) && !rest.is_empty() {
+            if let Decision { decision: "deny", reason, .. } = hard_delete(&rest.join(" "), cfg) {
                 return Decision::deny(
                     "hard-delete",
                     format!("{reason} (over ssh to {host})"),
@@ -197,10 +276,28 @@ fn hard_delete(cmd: &str, cfg: &GuardConfig) -> Decision {
     for seg in segments(&cmd) {
         let mut argv = shlex::split(seg).unwrap_or_else(|| seg.split_whitespace().map(str::to_string).collect());
         while !argv.is_empty()
-            && (is_assignment(&argv[0]) || WRAPPERS.contains(&argv[0].as_str()) || KEYWORDS.contains(&argv[0].as_str()))
+            && (is_assignment(&argv[0]) || WRAPPERS.contains(&base_name(&argv[0])) || KEYWORDS.contains(&argv[0].as_str()))
         {
+            let wrapper = base_name(&argv[0]).to_string();
             argv.remove(0);
+            let value_flags = WRAPPER_VALUE_FLAGS
+                .iter()
+                .find(|(name, _)| *name == wrapper)
+                .map(|(_, flags)| *flags)
+                .unwrap_or(&[]);
             while !argv.is_empty() && argv[0].starts_with('-') && argv[0] != "--" {
+                let flag = argv.remove(0);
+                if value_flags.contains(&flag.as_str()) && !argv.is_empty() {
+                    argv.remove(0);
+                }
+            }
+            if WRAPPER_POSITIONAL.contains(&wrapper.as_str())
+                && !argv.is_empty()
+                && argv[0] != "--"
+            {
+                argv.remove(0);
+            }
+            if !argv.is_empty() && argv[0] == "--" {
                 argv.remove(0);
             }
         }
@@ -212,6 +309,33 @@ fn hard_delete(cmd: &str, cfg: &GuardConfig) -> Decision {
             .and_then(|s| s.to_str())
             .unwrap_or(&argv[0])
             .to_string();
+        // `sh -c '...'` and `eval '...'` carry a whole command in one argument.
+        if SHELLS.contains(&prog.as_str()) {
+            let mut inner = None;
+            let mut i = 1;
+            while i < argv.len() {
+                let a = &argv[i];
+                if a.starts_with('-') && !a.starts_with("--") && a.contains('c') {
+                    inner = argv.get(i + 1).cloned();
+                    break;
+                }
+                if !a.starts_with('-') {
+                    break;
+                }
+                i += 1;
+            }
+            if let Some(inner) = inner {
+                let d = hard_delete(&inner, cfg);
+                if d.is_deny() {
+                    return d;
+                }
+            }
+        } else if prog == "eval" && argv.len() > 1 {
+            let d = hard_delete(&argv[1..].join(" "), cfg);
+            if d.is_deny() {
+                return d;
+            }
+        }
         if DELETERS.contains(&prog.as_str()) {
             let targets: Vec<&str> = argv[1..].iter().filter(|a| !a.starts_with('-')).map(String::as_str).collect();
             if targets.is_empty() || !targets.iter().all(|t| is_temp(t, cfg)) {
@@ -246,6 +370,10 @@ fn hard_delete(cmd: &str, cfg: &GuardConfig) -> Decision {
         }
     }
     Decision::allow()
+}
+
+fn base_name(token: &str) -> &str {
+    Path::new(token).file_name().and_then(|s| s.to_str()).unwrap_or(token)
 }
 
 fn is_assignment(token: &str) -> bool {
@@ -475,7 +603,12 @@ fn offload(cmd: &str, cfg: &GuardConfig) -> Decision {
     if !heavy(cmd) || compiled(r"\bremote-run\b|\bssh\b|\bheavy-slot\b|HEAVY_SLOT_LOCAL=1").is_match(cmd) {
         return Decision::allow();
     }
-    let worker = cfg.offload_worker.clone().unwrap_or_default();
+    // Probe only now, for a heavy command: before 12 Nov 2026 the probe ran while loading the
+    // configuration, so every shell command paid for it and stalled when the worker was slow.
+    let worker = match &cfg.offload_worker {
+        Some(worker) => worker.clone(),
+        None => crate::site::probe_offload(&cfg.home).unwrap_or_default(),
+    };
     if worker.is_empty() {
         return Decision::allow();
     }
@@ -567,6 +700,20 @@ fn push(cmd: &str, cfg: &GuardConfig) -> Decision {
             "Force-push rewrites shared remote history. Use `--force-with-lease` only with the owner's approval; a plain -f or --force stays denied.",
         );
     }
+    // `+ref`, `+src:dst` and --mirror overwrite the remote exactly as --force does.
+    if compiled(r"\bgit\s+push\b[^|;&]*\s(?:\+[^\s|;&]+|--mirror\b)").is_match(&c) {
+        return Decision::deny(
+            "force-push",
+            "A `+refspec` or `--mirror` push overwrites remote history, the same as --force. Use `--force-with-lease` only with the owner's approval.",
+        );
+    }
+    // Deleting a remote branch is routine but not undoable from here: confirm it.
+    if compiled(r"\bgit\s+push\b[^|;&]*\s(?:--delete\b|-d\b|:[^\s|;&]+)").is_match(&c) {
+        return Decision::ask(
+            "push-delete",
+            "This push deletes a branch or tag on the remote. Confirm it is merged or backed up.",
+        );
+    }
     if compiled(r"--force-with-lease\b").is_match(&c) {
         return Decision::ask(
             "force-with-lease",
@@ -583,10 +730,266 @@ fn push(cmd: &str, cfg: &GuardConfig) -> Decision {
             return Decision::allow();
         }
     }
+    if !push_targets_gated_project(cmd, cfg) {
+        return Decision::allow();
+    }
     Decision::ask(
         "push",
         "A push can publish or spend a build. Confirm the project's gate is green and the owner approved this push, then prefix AGENTKIT_PUSH_APPROVED=1.",
     )
+}
+
+fn push_targets_gated_project(cmd: &str, cfg: &GuardConfig) -> bool {
+    if cfg.push_gate_projects.is_empty() && cfg.push_gate_remotes.is_empty() {
+        return false;
+    }
+    let mut dirs = vec![cfg.cwd.clone()];
+    dirs.extend(git_option_paths(cmd, cfg));
+    let mut check = Vec::new();
+    for d in dirs {
+        check.extend(repository_locations(&d));
+    }
+    check.iter().any(|p| {
+        path_under_any_gate(p, &cfg.push_gate_projects) || remote_is_gated(p, &cfg.push_gate_remotes)
+    })
+}
+
+/// True when the repository at `location` (a working dir, a `.git` dir or a common dir) has a
+/// remote whose URL names one of the gated `owner/name` repositories. Read from the config
+/// file; no subprocess. `owner/app` does not match `owner/app-open`.
+fn remote_is_gated(location: &Path, remotes: &[String]) -> bool {
+    if remotes.is_empty() {
+        return false;
+    }
+    let config = if location.join("config").is_file() && location.join("objects").is_dir() {
+        location.join("config")
+    } else {
+        location.join(".git").join("config")
+    };
+    let Ok(text) = fs::read_to_string(&config) else {
+        return false;
+    };
+    text.lines().any(|line| {
+        let Some(url) = line.trim().strip_prefix("url") else {
+            return false;
+        };
+        let url = url.trim_start().trim_start_matches('=').trim();
+        let url = url.strip_suffix(".git").unwrap_or(url).trim_end_matches('/');
+        remotes.iter().any(|gate| {
+            let gate = gate.trim().trim_end_matches(".git").trim_matches('/');
+            !gate.is_empty()
+                && url.ends_with(gate)
+                && url[..url.len() - gate.len()].ends_with(|c| c == '/' || c == ':')
+        })
+    })
+}
+
+fn path_under_any_gate(path: &Path, gates: &[PathBuf]) -> bool {
+    let here = logical_normalize(path);
+    let here_s = here.to_string_lossy();
+    gates.iter().any(|gate| {
+        let root = logical_normalize(gate);
+        let root_s = root.to_string_lossy();
+        here_s == root_s || here_s.starts_with(&format!("{root_s}/"))
+    })
+}
+
+fn git_option_paths(cmd: &str, cfg: &GuardConfig) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let grab = |caps: fancy_regex::Captures| -> Option<String> {
+        caps.get(1)
+            .or_else(|| caps.get(2))
+            .or_else(|| caps.get(3))
+            .map(|m| m.as_str().to_string())
+    };
+    for pattern in [
+        r#"\bgit(?:\s+\S+)*\s+-[Cc]\s+(?:"([^"]+)"|'([^']+)'|(\S+))"#,
+        r#"\bgit(?:\s+\S+)*\s+--git-dir(?:=|\s+)(?:"([^"]+)"|'([^']+)'|(\S+))"#,
+        r#"\bgit(?:\s+\S+)*\s+--work-tree(?:=|\s+)(?:"([^"]+)"|'([^']+)'|(\S+))"#,
+        // `cd <project> && git push`: the push runs where the cd went, not in the session's cwd.
+        r#"(?:^|[;&|(]\s*)cd\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|)]+))"#,
+    ] {
+        let re = compiled(pattern);
+        for caps in re.captures_iter(cmd) {
+            if let Some(raw) = grab(caps) {
+                let resolved = resolve_to_pathbuf(&raw, cfg);
+                paths.push(resolved);
+            }
+        }
+    }
+    paths
+}
+
+fn resolve_to_pathbuf(raw: &str, cfg: &GuardConfig) -> PathBuf {
+    PathBuf::from(resolve_path(&expand_path(raw, cfg), cfg))
+}
+
+/// Working dirs and main-repo roots reachable from a path (linked worktrees included).
+fn repository_locations(start: &Path) -> Vec<PathBuf> {
+    let start = if start.is_file() {
+        start.parent().map(Path::to_path_buf).unwrap_or_else(|| start.to_path_buf())
+    } else {
+        start.to_path_buf()
+    };
+    let mut locs = vec![start.clone()];
+    let Some(git_meta) = locate_git_meta(&start) else {
+        return locs;
+    };
+    let repo_root = git_meta.parent().unwrap_or(&start);
+    if let Some(common) = read_git_common_dir(repo_root, &git_meta) {
+        locs.push(common.clone());
+        if common.file_name().and_then(|s| s.to_str()) == Some(".git") {
+            if let Some(parent) = common.parent() {
+                locs.push(parent.to_path_buf());
+            }
+        }
+    }
+    locs
+}
+
+fn locate_git_meta(start: &Path) -> Option<PathBuf> {
+    let mut cur = start.to_path_buf();
+    loop {
+        let git = cur.join(".git");
+        if git.is_dir() || git.is_file() {
+            return Some(git);
+        }
+        if !cur.pop() {
+            break;
+        }
+    }
+    None
+}
+
+fn read_git_common_dir(repo_root: &Path, git_meta: &Path) -> Option<PathBuf> {
+    if git_meta.is_dir() {
+        return Some(git_meta.to_path_buf());
+    }
+    let text = fs::read_to_string(git_meta).ok()?;
+    let gitdir = text.lines().find_map(|l| l.strip_prefix("gitdir: ").map(str::trim))?;
+    let gitdir = PathBuf::from(gitdir);
+    let gitdir = if gitdir.is_absolute() {
+        gitdir
+    } else {
+        repo_root.join(gitdir)
+    };
+    let commondir = gitdir.join("commondir");
+    if commondir.is_file() {
+        let rel = fs::read_to_string(&commondir).ok()?.trim().to_string();
+        let common = gitdir.join(rel);
+        return Some(logical_normalize(&common));
+    }
+    Some(gitdir)
+}
+
+fn disk_slot(cmd: &str, cfg: &GuardConfig) -> Decision {
+    if compiled(r"\bdisk-slot\b").is_match(cmd) {
+        return Decision::allow();
+    }
+    let hits_volume = compiled(r#"(?i)(?:^|[\s"'=(])/(?:Volumes|private/Volumes)/"#).is_match(cmd)
+        || compiled(r#"\s~?/?Volumes/"#).is_match(cmd);
+    if !hits_volume {
+        return Decision::allow();
+    }
+    let exempt = compiled(
+        r"\b(ls|stat|df|du|diskutil|test|disk-slot\s+(status|which))\b",
+    );
+    for seg in compiled(r"&&|\|\||;|\n|\|").split(cmd) {
+        let seg = seg.trim();
+        if !compiled(r#"/Volumes/"#).is_match(seg) {
+            continue;
+        }
+        if exempt.is_match(seg) {
+            continue;
+        }
+        return Decision::deny(
+            "disk-slot",
+            "Disk work on /Volumes/* must run as `disk-slot PATH [PATH ...] -- <command>` so one physical disk is not thrashed.",
+        );
+    }
+    let _ = cfg;
+    Decision::allow()
+}
+
+fn metered_link(cmd: &str, cfg: &GuardConfig) -> Decision {
+    let marker = cfg.home.join(".local/state/METERED_LINK");
+    if !marker.is_file() {
+        return Decision::allow();
+    }
+    if compiled(r"(?i)(REMOTE_RUN_ALLOW_METERED=1|METERED_TRANSFER_APPROVED=1)").is_match(cmd) {
+        return Decision::allow();
+    }
+    // A transfer tool only counts where this machine's shell would run it. Here-document
+    // bodies and quoted arguments are text (a search pattern, a note, a script body, the
+    // remote half of an ssh command), except the quoted script of `sh -c`.
+    let heredoc = compiled(r#"(?s)<<-?\s*["']?(\w+)["']?[^\n]*\n.*?\n\s*\1\b"#);
+    // A here-document fed to a shell is a script this machine runs: keep its body.
+    let shell_heredoc = compiled(r"(?m)(?:^|[;&|(]\s*)(?:\S*/)?(?:ba|z|da)?sh\b[^\n;&|]*<<");
+    let text = if shell_heredoc.is_match(cmd) { cmd.to_string() } else { heredoc.replace_all(cmd, "<<HEREDOC") };
+    let text = compiled(r#"(\bssh\s[^;&|\n"']*)"[^"]*""#).replace_all(&text, "$1\"\"");
+    let text = compiled(r#"(?<!c\s)(?<!eval\s)'[^']*'"#).replace_all(&text, "''");
+    let text = compiled(r#"(?<!c\s)(?<!eval\s)"[^"`$]*""#).replace_all(&text, "\"\"");
+    const POSITION: &str = r#"(?m)(?:^|[;&|(`]|\$\(|\s--\s|\beval\s+["']?|\b(?:ba|z|da)?sh\s+(?:-\w+\s+)*-\w*c\s+["'])\s*(?:(?:sudo|nohup|exec|command|time|caffeinate(?:\s+-\w+)*|timeout\s+\S+|xargs(?:\s+-\S+)*)\s+|env\s+(?:-\S+\s+)*(?:\w+=\S*\s+)*)*(?:\w+=\S*\s+)*(?:\S*/)?"#;
+    let transfer = compiled(&format!(
+        r"{POSITION}(rsync|scp|sftp|wget|aws\s+s3\s+(?:cp|sync|mv)|gcloud\s+storage\s+cp|azcopy|tar\s+-c[f]?|docker\s+(?:pull|push)|npm\s+ci|pnpm\s+install|yarn\s+install)\b"
+    ));
+    // curl to standard output is a small request (a status check, an API call). It is a
+    // transfer when it saves, resumes or uploads a file, or feeds an unpacker.
+    let curl = compiled(&format!(r"{POSITION}curl\b((?:>&|[^;&|\n])*)((?:\|(?:>&|[^;&|\n])*)*)"));
+    let curl_file = compiled(
+        r#"(?:^|\s)(?:-[A-Za-z]*[OCTF]\b|--remote-name\S*|--continue-at|--upload-file|--form\b|(?:-d|--data\S*|--json)\s*["']?@|(?:-[A-Za-z]*o|--output)[=\s]\s*(?!/dev/null)\S)|(?<![0-9&>])>>?\s*(?!/dev/null|&)\S"#,
+    );
+    // A consumer that passes the bytes on or unpacks them; a filter such as head or python does not count.
+    let unpacker = compiled(r"\|\s*(?:(?:sudo|env|xargs|nohup|command)\s+(?:-\S+\s+)*)*(?:\S*/)?(?:tar|bsdtar|unzip|gunzip|zstd|tee|cat|dd|pv|sh|bash|zsh)\b");
+    let curl_transfer = curl.captures_iter(&text).iter().any(|c| {
+        c.get(1).is_some_and(|args| curl_file.is_match(args.as_str()))
+            || c.get(2).is_some_and(|next| unpacker.is_match(next.as_str()))
+    });
+    if transfer.is_match(&text) || curl_transfer {
+        return Decision::deny(
+            "metered-link",
+            "A metered link is active (~/.local/state/METERED_LINK). Do not start a large transfer; use a fibre worker or prefix METERED_TRANSFER_APPROVED=1 after the owner approves.",
+        );
+    }
+    Decision::allow()
+}
+
+fn agent_yolo(cmd: &str) -> Decision {
+    let flat = cmd.trim();
+    if compiled(r#"(^|[\s/])(agent)(\s+|$)"#).is_match(flat)
+        && compiled(r"(?:^|\s)(--force|--yolo)\b").is_match(flat)
+        && !compiled(r"\bcursor-(worker|opinion)\b").is_match(flat)
+    {
+        return Decision::deny(
+            "agent-yolo",
+            "Do not run raw `agent -p` with --force or --yolo in a live checkout. Use `cursor-worker` or `cursor-opinion`.",
+        );
+    }
+    Decision::allow()
+}
+
+fn test_audio(cmd: &str) -> Decision {
+    if compiled(r"(?i)(SELECTOR_DECK_SILENT=1|AUDIO_QA_SILENT=1|AUDIBLE_APPROVED=1)").is_match(cmd) {
+        return Decision::allow();
+    }
+    // A player only counts where the shell would run it: at the start of a command (after
+    // `;`, `&`, `|`, `(`, `$(`, a backtick, a new line, or `sh -c "`), optionally behind
+    // `sudo`, `env VAR=…`, `nohup`, `exec`, `command` or `time`. The word inside prose, a
+    // quoted search pattern or a here-document body is text, not playback: on 11 Nov 2026 the
+    // older "anywhere after a space" rule refused a notes file containing the verb "say".
+    let heredoc = compiled(r#"(?s)<<-?\s*["']?(\w+)["']?[^\n]*\n.*?\n\s*\1\b"#);
+    let without_bodies = heredoc.replace_all(cmd, "<<HEREDOC");
+    let player = compiled(
+        r#"(?im)(?:^|[;&|(`]|\$\(|-c\s+["'])\s*(?:(?:sudo|nohup|exec|command|time)\s+|env\s+(?:-\S+\s+)*(?:\w+=\S*\s+)*)*(?:\w+=\S*\s+)*(?:/usr/bin/)?(afplay|say|mpg123|ffplay|paplay)\b(?!\s*\()"#,
+    );
+    let osascript_sound = compiled(r"(?i)osascript\b.*\b(play|beep|sound)");
+    if player.is_match(&without_bodies) || osascript_sound.is_match(&without_bodies) {
+        return Decision::deny(
+            "test-audio",
+            "Audible playback is denied by default. Prefix AUDIBLE_APPROVED=1 only when the owner asked to hear it in this session (see audio-doctor register). SELECTOR_DECK_SILENT=1 still silences deck checks.",
+        );
+    }
+    Decision::allow()
 }
 
 /// Known-bad and known-safe commands the doctor runs. A weakened guard fails the doctor.
@@ -609,9 +1012,9 @@ pub fn self_test(cfg: &GuardConfig) -> Result<(), String> {
     if !allow_file.is_allow() {
         return Err("icloud blocked trash of one Desktop file".into());
     }
-    let ask_push = push("git push origin main", cfg);
-    if !ask_push.is_ask() {
-        return Err("push guard did not ask on git push".into());
+    let allow_push = push("git push origin main", cfg);
+    if !allow_push.is_allow() {
+        return Err(format!("push guard blocked plain git push outside gated projects ({})", allow_push.decision));
     }
     let deny_force = push("git push --force origin main", cfg);
     if !deny_force.is_deny() {

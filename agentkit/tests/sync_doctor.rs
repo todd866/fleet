@@ -31,6 +31,12 @@ impl Home {
         fs::create_dir_all(root.join(".config/agentkit")).unwrap();
         fs::create_dir_all(root.join(".local/bin")).unwrap();
         fs::create_dir_all(root.join(".local/state")).unwrap();
+        fs::create_dir_all(root.join(".codex")).unwrap();
+        let mut codex_cfg = String::new();
+        codex_cfg.push_str(
+            "[hooks.state.\"pre_tool_use:0:0\"]\ntrusted_hash = \"sha256:test0\"\n\n",
+        );
+        fs::write(root.join(".codex/config.toml"), codex_cfg).unwrap();
         Self { root }
     }
     fn config(&self) -> PathBuf {
@@ -46,7 +52,10 @@ impl Home {
             "agentkit.toml",
             "schema = 1\nmanage_model = false\n\n[[projects]]\nname = \"example\"\npath = \"work/example\"\n",
         );
-        self.write("rules/global.md", "Use the Trash.\n");
+        self.write("rules/core-always.md", "Use the Trash.\n");
+        self.write("rules/appendix-claude.md", "\n");
+        self.write("rules/appendix-codex.md", "\n");
+        self.write("rules/appendix-cursor.md", "\n");
         self.write("rules/projects/example.md", "# Example\n\nKeep the gate green.\n");
         self.write(
             "skills/sample/SKILL.md",
@@ -119,7 +128,8 @@ fn sync_is_idempotent_and_doctor_sees_drift() {
     assert!(home.root.join(".cursor/rules/skill-sample.mdc").is_file());
     assert!(home.root.join(".cursor/commands/sample.md").is_file());
     let hooks = fs::read_to_string(home.root.join(".cursor/hooks.json")).unwrap();
-    assert!(hooks.contains("hook cursor hard-delete"));
+    assert!(hooks.contains("hook cursor all"), "{hooks}");
+    assert!(!hooks.contains("hook cursor hard-delete"), "expected one combined hook\n{hooks}");
     assert!(hooks.contains("agent-context"));
     assert!(hooks.contains("\"failClosed\": true"));
     let (code, again, err) = home.run(&["sync"]);
@@ -277,24 +287,48 @@ fn context_prints_one_row_per_instrument() {
         p.set_mode(0o755);
         fs::set_permissions(&mail, p).unwrap();
     }
-    fs::create_dir_all(home.root.join(".local/state/fleet")).unwrap();
-    fs::write(home.root.join(".local/state/fleet/health.json"), "{\"issues\":[\"disk\"]}\n").unwrap();
+    fs::create_dir_all(home.root.join(".local/state/fleet/morning")).unwrap();
+    fs::write(
+        home.root.join(".local/state/fleet/morning/board.json"),
+        "{\"ok\":false,\"counts\":{\"fail\":1,\"warn\":0,\"pass\":3}}\n",
+    )
+    .unwrap();
+    fs::create_dir_all(home.root.join(".local/state/mac-sync/registry")).unwrap();
+    fs::write(home.root.join(".local/state/mac-sync/registry/REGISTRY.md"), "# r\n").unwrap();
+    fs::write(
+        home.root.join(".local/state/mac-sync/registry/MACOS-WORKAROUNDS.md"),
+        "# w\n",
+    )
+    .unwrap();
+    fs::create_dir_all(home.root.join(".config/fleet")).unwrap();
+    fs::write(home.root.join(".config/fleet/placement.toml"), "# p\n").unwrap();
+    fs::create_dir_all(home.root.join(".local/state/ai-budget")).unwrap();
+    fs::write(
+        home.root.join(".local/state/ai-budget/posture.json"),
+        r#"{"asOf":"2026-11-10T07:00:00.000Z","pools":{"claude:weekly":{"tier":"LEAN","pct":4,"stale":false},"claude:5h":{"tier":"NORMAL","pct":30,"stale":false},"cursor:api":{"tier":"FULL","pct":56,"stale":false},"codex:primary":{"tier":"HOLD","pct":8,"stale":false}},"route":{"build":"cursor","review":"codex","why":"fixture"}}"#,
+    )
+    .unwrap();
     let out = Command::new(bin("agent-context"))
         .env("HOME", &home.root)
+        .env("AGENTKIT_PROVIDER", "claude")
         .env("AGENTKIT_AI_CAPACITY", &cap)
         .env("AGENTKIT_AGENT_MAIL", &mail)
         .output()
         .unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    let lines: Vec<&str> = text.lines().collect();
-    assert_eq!(lines.len(), 4, "{text}");
+    let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(lines.len(), 6, "{text}");
     assert!(lines[0].contains("time"), "{text}");
-    assert!(lines[1].contains("capacity"), "{text}");
-    assert!(lines[1].contains("8%"), "{text}");
-    assert!(lines[1].contains("250 jobs"), "{text}");
-    assert!(lines[2].contains("1 unread"), "{text}");
-    assert!(lines[3].contains("1 alerts"), "{text}");
+    assert!(lines[1].contains("posture"), "{text}");
+    assert!(lines[1].contains("claude:weekly"), "{text}");
+    assert!(lines[1].contains("route:"), "{text}");
+    assert!(lines[2].contains("capacity"), "{text}");
+    assert!(lines[2].contains("8%"), "{text}");
+    assert!(lines[2].contains("250 jobs"), "{text}");
+    assert!(lines[3].contains("1 unread"), "{text}");
+    assert!(lines[4].contains("1 fail"), "{text}");
+    assert!(lines[5].contains("registry"), "{text}");
 }
 
 #[test]
@@ -331,6 +365,85 @@ fn inventory_names_every_mechanism() {
     ] {
         assert!(out.contains(needle), "missing {needle}");
     }
+}
+
+#[test]
+fn disabled_guard_skips_hooks_and_reports_in_doctor() {
+    let home = Home::new();
+    home.site();
+    home.write(
+        "agentkit.toml",
+        "schema = 1\nmanage_model = false\n\n[guards]\ndisabled = [\"push\"]\n",
+    );
+    let (code, _, err) = home.run(&["sync", "--apply"]);
+    assert_eq!(code, 0, "{err}");
+    let hooks = fs::read_to_string(home.root.join(".cursor/hooks.json")).unwrap();
+    assert!(hooks.contains("hook cursor all"));
+    assert!(!hooks.contains("hook cursor push"));
+    use std::io::Write;
+    let payload = r#"{"tool_name":"Bash","tool_input":{"command":"git push origin main"}}"#;
+    let out = Command::new(bin("agentkit"))
+        .args(["hook", "cursor", "push"])
+        .env("HOME", &home.root)
+        .env("AGENTKIT_CONFIG", home.config())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut child = out;
+    child.stdin.as_mut().unwrap().write_all(payload.as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("disabled (site)"));
+    assert!(out.stdout.is_empty());
+    let (code, doc, err) = home.run(&["doctor", "--conformance"]);
+    assert_eq!(code, 0, "{err}{doc}");
+    assert!(doc.contains("push") && doc.contains("disabled (site)"), "{doc}");
+}
+
+#[test]
+fn site_rejects_unknown_disabled_guard_names() {
+    let home = Home::new();
+    home.write(
+        "agentkit.toml",
+        "schema = 1\n[guards]\ndisabled = [\"not-a-guard\"]\n",
+    );
+    home.write("rules/core-always.md", "x\n");
+    home.write("rules/appendix-claude.md", "\n");
+    home.write("rules/appendix-codex.md", "\n");
+    home.write("rules/appendix-cursor.md", "\n");
+    home.write("memory/INDEX.md", "#\n");
+    let (code, _, err) = home.run(&["sync"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("unknown guard"), "{err}");
+}
+
+#[test]
+fn hook_all_is_stricter_than_any_single_guard() {
+    use std::io::Write;
+    let home = Home::new();
+    home.site();
+    home.run(&["sync", "--apply"]);
+    let payload = r#"{"tool_name":"Bash","tool_input":{"command":"rm -rf /Users/agentkit-hookall/x && git push origin main"}}"#;
+    let run = |guard: &str| {
+        let mut child = Command::new(bin("agentkit"))
+            .args(["hook", "claude", guard])
+            .env("HOME", &home.root)
+            .env("AGENTKIT_CONFIG", home.config())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.as_mut().unwrap().write_all(payload.as_bytes()).unwrap();
+        let out = child.wait_with_output().unwrap();
+        serde_json::from_slice::<Value>(&out.stdout).ok()
+    };
+    let all = run("all").expect("all hook output");
+    let deny = all["hookSpecificOutput"]["permissionDecision"]
+        .as_str()
+        .unwrap_or("allow");
+    assert_eq!(deny, "deny", "{all}");
 }
 
 #[test]

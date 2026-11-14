@@ -18,7 +18,7 @@ hard delete and an iCloud-wide trash. It does not start Cursor.
 8. `agentkit memory import --from ~/.claude/projects`. Read the notebook before trusting it. Secret-shaped files are skipped, not reviewed.
 9. `agentkit doctor --provider cursor`.
 10. Open a Cursor session. Confirm it loaded `AGENTS.md` and `~/.cursor/rules/agentkit-global.mdc`. Run `agent-context`. Send yourself mail and confirm the next prompt shows `N unread`.
-11. Try a command that must be denied (`rm` of a project file, `trash ~/Documents`, a plain `git push`). The hook row is `beforeShellExecution` with `failClosed: true` on the destructive guards.
+11. Try a command that must be denied (`rm` of a project file, `trash ~/Documents`, `git push --force`). The hook row is `beforeShellExecution` with `failClosed: true` on the destructive guards.
 
 `agentkit doctor` with no provider is the report fleet-health and mac-registry consume (`~/.local/state/agentkit/doctor.json`).
 

@@ -21,7 +21,7 @@ pub fn markdown() -> String {
     out.push_str("| icloud | PreToolUse `Bash` | same | `beforeShellExecution`, `failClosed: true` |\n");
     out.push_str("| offload-heavy | PreToolUse `Bash`, fail open if `offload-target` errors | same, fail open | `beforeShellExecution`, fail open |\n");
     out.push_str("| cd-outside | PreToolUse `Bash` (was inside `no-prompt-patterns.py`) | same | `beforeShellExecution`, `failClosed: true` |\n");
-    out.push_str("| push | PreToolUse `Bash`, ask on plain push, deny on `--force` / `-f` | same | `beforeShellExecution`, `failClosed: true` |\n");
+    out.push_str("| push | PreToolUse `Bash`, deny `--force` / `-f`; ask in `push_gate_projects` | same | `beforeShellExecution`, `failClosed: true` |\n");
     out.push_str("\n## Gaps\n\n");
     for gap in GAPS {
         out.push_str(&format!("- **{}** — {} Mitigation: {}\n", gap.provider, gap.gap, gap.mitigation));
@@ -88,8 +88,8 @@ pub const ROWS: &[Row] = &[
     },
     Row {
         mechanism: "guard push",
-        today: "a project PreToolUse hook asks on plain `git push` and denies `--force`",
-        coupling: "one project's Claude hook; other projects have no push ask",
+        today: "a project PreToolUse hook asks on plain `git push` in one expensive project; denies `--force` elsewhere",
+        coupling: "that project keeps its own hook marker; shared guard lists `push_gate_projects`",
         home: "`guard-push`. Project-only rules (shared-tree `git add -A`, worktree `db:seed`) stay in that project's hook",
     },
     Row {

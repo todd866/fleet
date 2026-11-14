@@ -30,6 +30,36 @@
           "gaps": { "type": "array", "items": { "type": "string" } }
         }
       }
+    },
+    "conformance": {
+      "type": "object",
+      "required": ["providers"],
+      "properties": {
+        "providers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "guards"],
+            "properties": {
+              "id": { "type": "string" },
+              "guards": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["name", "installed", "trusted", "firing"],
+                  "properties": {
+                    "name": { "type": "string" },
+                    "installed": { "type": "boolean" },
+                    "trusted": { "type": "boolean" },
+                    "firing": { "type": "boolean" },
+                    "detail": { "type": "string" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
     }
   }
 }

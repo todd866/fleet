@@ -13,7 +13,7 @@ Coupling is what is true of the hand-maintained layer today. The neutral home is
 | guard icloud | `~/.claude/hooks/icloud-guard.py` | Claude PreToolUse only | `guard-icloud` |
 | guard offload-heavy | `~/.claude/hooks/offload-heavy.py` calling `offload-target` | Claude PreToolUse only | `guard-offload-heavy` |
 | guard cd-outside | `~/.claude/hooks/no-prompt-patterns.py` rule `cd-outside-allowed` | Claude PreToolUse only; allowed roots include one site directory | `guard-cd-outside`; extra roots in site `guards.allowed_cd` |
-| guard push | a project PreToolUse hook asks on plain `git push` and denies `--force` | one project's Claude hook; other projects have no push ask | `guard-push`. Project-only rules (shared-tree `git add -A`, worktree `db:seed`) stay in that project's hook |
+| guard push | a project PreToolUse hook asks on plain `git push` in one expensive project; denies `--force` elsewhere | that project keeps its own hook marker; shared guard lists `push_gate_projects` | `guard-push`. Project-only rules (shared-tree `git add -A`, worktree `db:seed`) stay in that project's hook |
 | context time | not injected | none | `agent-context` first row |
 | context capacity | `ai-capacity` / `ai-budget.mjs` on Claude SessionStart and UserPromptSubmit, and on Codex hooks | Claude and Codex hook commands; Cursor has no capacity hook | `agent-context` reads `ai-capacity --json` |
 | context unread mail | `agent-mail unread --hook` on Claude SessionStart and UserPromptSubmit | Claude hook only | `agent-context` runs `agent-mail unread` |
@@ -33,7 +33,7 @@ Coupling is what is true of the hand-maintained layer today. The neutral home is
 | icloud | PreToolUse `Bash` | same | `beforeShellExecution`, `failClosed: true` |
 | offload-heavy | PreToolUse `Bash`, fail open if `offload-target` errors | same, fail open | `beforeShellExecution`, fail open |
 | cd-outside | PreToolUse `Bash` (was inside `no-prompt-patterns.py`) | same | `beforeShellExecution`, `failClosed: true` |
-| push | PreToolUse `Bash`, ask on plain push, deny on `--force` / `-f` | same | `beforeShellExecution`, `failClosed: true` |
+| push | PreToolUse `Bash`, deny `--force` / `-f`; ask in `push_gate_projects` | same | `beforeShellExecution`, `failClosed: true` |
 
 ## Gaps
 

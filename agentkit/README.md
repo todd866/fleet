@@ -17,7 +17,8 @@ path outside `$HOME` is refused.
 | `agentkit sync --apply` | Write them. A second run with no source edit prints `no changes`. |
 | `agentkit doctor` | One row per provider. Exit 1 on drift. Writes `doctor.json`. |
 | `agentkit doctor --provider cursor` | The same check for one provider. |
-| `agent-context` | Time, capacity, unread mail, fleet alerts. Also `agentkit context`. |
+| `agent-context` | Posture (per provider), capacity, mail, fleet alerts. `AGENTKIT_PROVIDER` set by hooks. Also `agentkit context`. |
+| `agentkit posture write` | Refresh `~/.local/state/ai-budget/posture.json` from `ai-capacity --json`. |
 | `agentkit hook <claude\|codex\|cursor> <guard>` | Provider adapter. Tool-call JSON on stdin. |
 | `agentkit memory import --from DIR` | Copy Claude `*/memory/*.md` into the notebook. Skips secret-shaped files. |
 | `agentkit memory path` | Print the notebook directory. |

@@ -1,6 +1,7 @@
 //! Site data lives outside the public repo, at `~/.config/agentkit` or
 //! `AGENTKIT_CONFIG`. The example tree in this crate is the sanitized shape.
 
+use crate::guard::ALL_GUARD_NAMES;
 use serde::Deserialize;
 use std::env;
 use std::fs;
@@ -17,6 +18,10 @@ pub struct GuardConfig {
     pub allowed_cd: Vec<PathBuf>,
     pub email_substrings: Vec<String>,
     pub push_markers: Vec<String>,
+    /// Paths (`~` expanded) where a plain `git push` asks unless a `push_markers` prefix is present.
+    pub push_gate_projects: Vec<PathBuf>,
+    /// Remote repositories (`owner/name`) whose clones and worktrees are gated wherever they live.
+    pub push_gate_remotes: Vec<String>,
     /// `Some("")` means offload-target said stay. `None` means the probe was not run
     /// and the caller fills it. The library decision uses this string as the worker name.
     pub offload_worker: Option<String>,
@@ -37,6 +42,8 @@ impl Default for GuardConfig {
             air_aliases: Vec::new(),
             email_substrings: Vec::new(),
             push_markers: vec!["AGENTKIT_PUSH_APPROVED=1".into()],
+            push_gate_projects: Vec::new(),
+            push_gate_remotes: Vec::new(),
             offload_worker: None,
             resolve_ssh: env::var("AGENTKIT_SKIP_SSH_RESOLVE").ok().as_deref() != Some("1"),
         }
@@ -89,6 +96,10 @@ pub struct Site {
     pub manage_model: bool,
     #[serde(default)]
     pub projects: Vec<Project>,
+    /// File names under `~/.cursor/rules` that the generated global rule replaces. Each is
+    /// rewritten as a stub that is never auto-applied. Site-specific, so it lives in config.
+    #[serde(default)]
+    pub retired_cursor_rules: Vec<String>,
     #[serde(default)]
     pub guards: GuardFile,
     #[serde(default)]
@@ -113,10 +124,34 @@ pub struct GuardFile {
     pub allowed_cd: Vec<String>,
     #[serde(default)]
     pub push_markers: Vec<String>,
+    #[serde(default)]
+    pub push_gate_projects: Vec<String>,
+    #[serde(default)]
+    pub push_gate_remotes: Vec<String>,
     /// Optional file of substrings that must not appear in a command. The file
     /// stays in the private config; nothing from it is written into the repo.
     #[serde(default)]
     pub email_substrings_file: Option<String>,
+    /// Guards omitted from generated hooks (e.g. `push` when sessions run without prompts).
+    #[serde(default)]
+    pub disabled: Vec<String>,
+}
+
+pub fn guard_enabled(name: &str, disabled: &[String]) -> bool {
+    !disabled.iter().any(|d| d == name)
+}
+
+pub fn validate_disabled(disabled: &[String]) -> Result<(), String> {
+    for name in disabled {
+        if !ALL_GUARD_NAMES.contains(&name.as_str()) {
+            return Err(format!(
+                "unknown guard {:?} in [guards] disabled (known: {})",
+                name,
+                ALL_GUARD_NAMES.join(", ")
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -141,6 +176,7 @@ impl Site {
         if site.schema != 1 {
             return Err(format!("unsupported schema {} (this agentkit reads 1)", site.schema));
         }
+        validate_disabled(&site.guards.disabled)?;
         Ok(site)
     }
 }
@@ -160,13 +196,12 @@ pub fn guard_config_from_env() -> GuardConfig {
             apply_guards(&mut cfg, &config, &guards);
         }
     }
-    if let Ok(worker) = probe_offload(&cfg.home) {
-        cfg.offload_worker = Some(worker);
-    }
+    // `offload_worker` stays unset here. The probe can take 20 s when the worker is slow to
+    // answer; the offload-heavy guard runs it only for a command that is actually heavy.
     cfg
 }
 
-fn apply_guards(cfg: &mut GuardConfig, config: &Path, guards: &GuardFile) {
+pub(crate) fn apply_guards(cfg: &mut GuardConfig, config: &Path, guards: &GuardFile) {
     cfg.air_hosts = guards.air_hosts.clone();
     cfg.air_aliases = guards.air_aliases.clone();
     if !guards.allowed_cd.is_empty() {
@@ -178,6 +213,16 @@ fn apply_guards(cfg: &mut GuardConfig, config: &Path, guards: &GuardFile) {
     }
     if !guards.push_markers.is_empty() {
         cfg.push_markers = guards.push_markers.clone();
+    }
+    if !guards.push_gate_projects.is_empty() {
+        cfg.push_gate_projects = guards
+            .push_gate_projects
+            .iter()
+            .map(|p| expand_home(p, &cfg.home))
+            .collect();
+    }
+    if !guards.push_gate_remotes.is_empty() {
+        cfg.push_gate_remotes = guards.push_gate_remotes.clone();
     }
     if let Some(file) = &guards.email_substrings_file {
         let path = if Path::new(file).is_absolute() {
@@ -191,7 +236,7 @@ fn apply_guards(cfg: &mut GuardConfig, config: &Path, guards: &GuardFile) {
     }
 }
 
-fn expand_home(path: &str, home: &Path) -> PathBuf {
+pub fn expand_home(path: &str, home: &Path) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
         home.join(rest)
     } else if path == "~" {
@@ -201,7 +246,7 @@ fn expand_home(path: &str, home: &Path) -> PathBuf {
     }
 }
 
-fn probe_offload(home: &Path) -> Result<String, ()> {
+pub(crate) fn probe_offload(home: &Path) -> Result<String, ()> {
     let bin = env::var_os("AGENTKIT_OFFLOAD_TARGET")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".local/bin/offload-target"));
@@ -216,7 +261,24 @@ fn probe_offload(home: &Path) -> Result<String, ()> {
 }
 
 pub fn rules_global(config: &Path) -> Result<String, String> {
+    let always = config.join("rules/core-always.md");
+    if always.is_file() {
+        return fs::read_to_string(&always).map_err(|e| format!("rules/core-always.md: {e}"));
+    }
     fs::read_to_string(config.join("rules/global.md")).map_err(|e| format!("rules/global.md: {e}"))
+}
+
+pub fn rules_for_provider(config: &Path, provider: &str) -> Result<String, String> {
+    let core = rules_global(config)?;
+    let appendix = config.join(format!("rules/appendix-{provider}.md"));
+    if appendix.is_file() {
+        let extra = fs::read_to_string(&appendix).map_err(|e| format!("rules/appendix-{provider}.md: {e}"))?;
+        if extra.trim().is_empty() {
+            return Ok(core);
+        }
+        return Ok(format!("{}\n\n{}", core.trim_end(), extra.trim_end()));
+    }
+    Ok(core)
 }
 
 pub fn rules_project(config: &Path, name: &str) -> Result<String, String> {

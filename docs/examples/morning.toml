@@ -5,7 +5,7 @@
 hosts = ["primary", "hub", "shared"]
 hub = "hub"
 notify_host = "primary"
-tz = "UTC"
+tz = "local"          # this Mac's own zone; or an IANA name such as "Europe/Paris"
 probe_s = 20
 
 [disk]
