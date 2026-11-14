@@ -26,6 +26,7 @@ Config (all optional): ~/.config/fleet/tripwire.json
   {"host": "hub", "mail_to": "hub:fleet", "registry": "~/path/jobs.tsv", "max_summons_per_day": 4,
    "files": ["~/.ssh/authorized_keys", ...], "must_contain": [["~/.claude/settings.json", "agentkit hook"]],
    "summon": ["claude", "-p", "{brief}", "--max-turns", "40", "--allowedTools", "Bash", "Read", "Glob", "Grep", "Write"],
+   "summon_fallback": [the same shape, started once if the first agent exits without a report],
    "quiet_listeners": ["rapportd"], "hold": true, "hold_timeout_min": 60,
    "hold_files": ["~/.ssh/authorized_keys"], "never_pause": ["sshd", "launchd"]}
 State: ~/.local/state/fleet/tripwire/ (TRIPWIRE_STATE). Config path: TRIPWIRE_CONFIG.
@@ -438,16 +439,39 @@ def release(name, config=None, owner=False, kill=os.kill):
     return 0
 
 
-def release_stale(config, now, kill=os.kill, **hooks):
+def release_stale(config, now, kill=os.kill, spawn=subprocess.Popen, **hooks):
     """A hold whose agent never reported: after hold_timeout_min a stopped process or job goes on
     again (that hold costs work), a file that grants access or wires in a guard stays put back
     (that hold costs nothing), and the owner is told either way."""
     limit = float(config.get("hold_timeout_min", 60)) * 60
     for path in sorted((STATE / "incidents").glob("*/incident.json")):
         record = read_json(path, {})
-        if not (limit and record.get("holds") and not record.get("released") and not record.get("timed_out")
-                and not (path.parent / "report.md").exists() and now - record.get("raised_epoch", now) > limit):
+        if not (record.get("holds") and not record.get("released") and not record.get("timed_out")
+                and not (path.parent / "report.md").exists()):
             continue
+        age = now - record.get("raised_epoch", now)
+        # An agent that has exited without a report (out of allowance, crashed) is not coming back:
+        # try the fallback command once, and failing that do not wait out the hour.
+        died = bool(record.get("agent_pid")) and age > 60 and process_start(record["agent_pid"]) != record.get("agent_started")
+        if died and config.get("summon_fallback") and not record.get("fallback_tried"):
+            record["fallback_tried"] = True
+            try:
+                brief = (path.parent / "brief.md").read_text()
+                command = [part.replace("{brief}", brief).replace("{incident}", str(path.parent))
+                           for part in config["summon_fallback"]]
+                with open(path.parent / "agent.log", "ab") as log:
+                    agent = spawn(command, cwd=str(path.parent), stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                  start_new_session=True)
+                record["agent_pid"] = getattr(agent, "pid", None)
+                record["agent_started"] = process_start(record["agent_pid"]) if record["agent_pid"] else None
+                record["agent"] = "first agent exited without a report; fallback agent summoned"
+                write_json(path, record)
+                continue
+            except OSError:
+                pass
+        if not (died or (limit and age > limit)):
+            continue
+        why = "the agent exited without a report" if died else f"no report after {limit / 60:.0f} min"
         files = [hold for hold in record["holds"] if hold["kind"] == "file"]
         record["release_notes"] = undo_holds([h for h in record["holds"] if h["kind"] != "file"], kill=kill)
         record["holds"], record["timed_out"] = files, True
@@ -456,7 +480,7 @@ def release_stale(config, now, kill=os.kill, **hooks):
         write_json(path, record)
         kept = (f" {len(files)} file(s) stay put back: `tripwire release {path.parent.name} --owner`."
                 if files else "")
-        notify(config, f"{record.get('host')}: no report on {path.parent.name} after {limit / 60:.0f} min; "
+        notify(config, f"{record.get('host')}: {why} on {path.parent.name}; "
                        f"the hold was undone for what was running.{kept} Look at it.", **hooks)
 
 
@@ -499,8 +523,11 @@ def summon(config, incident, host, now, found=(), record=None, spawn=subprocess.
     command = [part.replace("{brief}", brief).replace("{incident}", str(incident)) for part in argv]
     try:
         with open(incident / "agent.log", "ab") as log:
-            spawn(command, cwd=str(incident), stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                  start_new_session=True)
+            agent = spawn(command, cwd=str(incident), stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                          start_new_session=True)
+        pid = getattr(agent, "pid", None)
+        if pid:
+            record["agent_pid"], record["agent_started"] = pid, process_start(pid)
     except OSError as exc:
         if holds:  # nobody is coming to look, so do not leave it paused
             record["release_notes"] = undo_holds(holds, kill=kill)
@@ -570,7 +597,7 @@ def check(config=None, now=None, host=None, wires=WIRES, **hooks):
             refresh_file_wires(config)  # a file just put back is what the baseline must describe
     keep_copies(config)
     told = {k: v for k, v in hooks.items() if k == "runner"}
-    release_stale(config, now, **{k: v for k, v in hooks.items() if k in ("runner", "kill")})
+    release_stale(config, now, **{k: v for k, v in hooks.items() if k in ("runner", "kill", "spawn")})
     read_verdicts(config, **told)
     return 0
 
