@@ -1568,7 +1568,9 @@ fn push(cmd: &str, cfg: &GuardConfig) -> Decision {
     // an assignment on that very `git push`, on a line that is that one command. A marker
     // elsewhere on a compound line approves nothing here.
     if compiled(r"\bgit\s+push\b[^|;&]*\s(?:--delete\b|-d\b|:[^\s|;&]+)").is_match(&c) {
-        let lone = !compiled(r"[|;&`]|\$\(").is_match(c.trim()) && !cmd.trim().contains('\n');
+        // One plain command: no separator, substitution, grouping or redirection, and no lease.
+        let lone = !compiled(r"[|;&`(){}<>\n\r]|\$\(").is_match(cmd.trim())
+            && !compiled(r"--force-with-lease\b").is_match(&c);
         let prefixed = markers.iter().any(|marker| {
             let pat = format!(
                 r"^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*{}\s+(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*git\s+push\b",

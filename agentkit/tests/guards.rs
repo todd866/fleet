@@ -507,6 +507,9 @@ fn push_treats_plus_refspec_and_mirror_as_force_and_asks_on_remote_delete() {
     assert!(decide("push", "AGENTKIT_PUSH_APPROVED=1 git -C ../other push origin --delete a b c", &c).is_allow());
     // only as a prefix of that one command, alone on the line; and never for force-with-lease
     assert!(decide("push", "AGENTKIT_PUSH_APPROVED=1 git push --force-with-lease origin topic", &c).is_ask());
+    assert!(decide("push", "AGENTKIT_PUSH_APPROVED=1 git push --force-with-lease origin topic :old-branch", &c).is_ask());
+    assert!(decide("push", "AGENTKIT_PUSH_APPROVED=1 git push origin --delete old-branch <(git push origin --delete other)", &c).is_ask());
+    assert!(decide("push", "(AGENTKIT_PUSH_APPROVED=1 git push origin --delete old-branch)", &c).is_ask());
     assert!(decide("push", "echo AGENTKIT_PUSH_APPROVED=1; git push origin --delete old-branch", &c).is_ask());
     assert!(decide("push", "AGENTKIT_PUSH_APPROVED=1 git push origin main && git push origin --delete old-branch", &c).is_ask());
     assert!(decide("push", "AGENTKIT_PUSH_APPROVED=1 git push origin --delete old-branch; git push origin --delete other", &c).is_ask());
