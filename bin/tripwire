@@ -5,26 +5,37 @@
   tripwire status     wires, baseline age, open incidents
   tripwire accept     take the current state as the baseline without raising anything
   tripwire test       raise a harmless incident to prove the path (no agent unless --summon)
+  tripwire release ID undo an incident's hold (needs a BENIGN report, or --owner from the owner)
 
 A wire is a snapshot of one thing an intruder, or an agent that has been talked into
 something, would have to change: who may log in, what starts by itself, what listens on the
 network, whether the command guards are still wired in. The first run only records. After
 that a difference becomes an incident: a folder with the evidence, a notification, mail, and
-one headless agent told to work out whether the change is ordinary. The agent investigates
-and reports; it changes nothing. A change raises once: the baseline moves on with it.
+one headless agent told to work out whether the change is ordinary. A change raises once: the
+baseline moves on with it.
+
+Hold first, then think. When an agent is about to look, the changed thing is paused at once in
+a way that can be undone: a new listener's process is stopped (SIGSTOP), a new or changed
+launchd job is disabled and unloaded, a login-key or guard-hook file is put back to its last
+checked version. The agent's last act on a BENIGN verdict is `tripwire release`, which undoes
+it. Any other verdict leaves it held for the owner. A hold whose agent never reports is undone
+after `hold_timeout_min` (default 60). Nothing is held when no agent can be started.
 
 Config (all optional): ~/.config/fleet/tripwire.json
   {"host": "hub", "mail_to": "hub:fleet", "registry": "~/path/jobs.tsv", "max_summons_per_day": 4,
    "files": ["~/.ssh/authorized_keys", ...], "must_contain": [["~/.claude/settings.json", "agentkit hook"]],
    "summon": ["claude", "-p", "{brief}", "--max-turns", "40", "--allowedTools", "Bash", "Read", "Glob", "Grep", "Write"],
-   "quiet_listeners": ["rapportd"]}
+   "quiet_listeners": ["rapportd"], "hold": true, "hold_timeout_min": 60,
+   "hold_files": ["~/.ssh/authorized_keys"], "never_pause": ["sshd", "launchd"]}
 State: ~/.local/state/fleet/tripwire/ (TRIPWIRE_STATE). Config path: TRIPWIRE_CONFIG.
 """
 import hashlib
 import json
 import os
 import pathlib
+import plistlib
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -48,6 +59,9 @@ LAUNCHD_DIRS = ["~/Library/LaunchAgents", "/Library/LaunchAgents", "/Library/Lau
 DEFAULT_SUMMON = ["claude", "-p", "{brief}", "--max-turns", "40",
                   "--allowedTools", "Bash", "Read", "Glob", "Grep", "Write"]
 
+HOLD_FILES = ["~/.ssh/authorized_keys"]
+NEVER_PAUSE = ["sshd", "launchd"]
+
 BRIEF = """You were started by `tripwire` on the Mac `{host}` because something security-relevant changed
 with nobody watching. Work out whether the change is ordinary or not, and report.
 
@@ -66,9 +80,18 @@ What to do:
    or `VERDICT: HOSTILE`. Then: what changed, what caused it, the evidence (commands you ran and
    what they showed), and what the owner should do, most urgent first.
 {mail_step}
+The hold. Until you report, tripwire is holding what changed, so that nothing is lost by taking
+the time to look. incident.json lists it under `holds`: a process stopped with SIGSTOP, a
+launchd job disabled and unloaded, or a file put back to its last checked version (the changed
+version is kept in {incident}/held/). Bear in mind that what you inspect may be in that state.
+If and only if your verdict is BENIGN, finish by running `tripwire release {name}`: it undoes
+the hold and somebody's work carries on. For any other verdict leave it held, and say in the
+report that the owner releases it with `tripwire release {name} --owner`. Never pass --owner
+yourself.
+
 Limits. Investigate only: do not delete, move, edit, unload, kill, disable, push or send anything
-except the report{mail_note}. Do not undo the change, even if it looks hostile; say how to
-undo it in the report. Do not read private keys or print secrets. If a guard refuses a command,
+except the report{mail_note} and that release. Do not undo the change yourself, even if it
+looks hostile; say how to undo it in the report. Do not read private keys or print secrets. If a guard refuses a command,
 do not rephrase it; note it and carry on.
 """
 
@@ -151,19 +174,24 @@ def wire_listeners(config, text=None):
     text = run(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN"]) if text is None else text
     if text is None:
         return None
+    return {what: "listening" for what, _ in listener_rows(config, text)}
+
+
+def listener_rows(config, text):
+    """(what, pid) for every program listening beyond loopback."""
     quiet = set(config.get("quiet_listeners", []))
-    out = {}
+    rows = []
     for line in text.splitlines()[1:]:
         parts = line.split()
-        if len(parts) < 9:
+        if len(parts) < 9 or not parts[1].isdigit():
             continue
         program, address = parts[0], parts[8]
         host, _, port = address.rpartition(":")
         if host in ("127.0.0.1", "[::1]", "localhost") or program in quiet or not port.isdigit():
             continue
         # A port the system hands out at random is not an identity; the program is.
-        out[f"{program} on {'a high port' if int(port) >= 49152 else port}"] = "listening"
-    return out
+        rows.append((f"{program} on {'a high port' if int(port) >= 49152 else port}", int(parts[1])))
+    return rows
 
 
 def wire_accounts(config, users=None, admins=None):
@@ -233,6 +261,180 @@ def write_json(path, value):
     os.replace(tmp, path)
 
 
+# ---- holds: pause the changed thing now, in a way `release` can undo ----
+
+def hold_paths(config):
+    return list(config.get("hold_files", HOLD_FILES)) + [p for p, _ in config.get("must_contain", DEFAULT_MUST_CONTAIN)]
+
+
+def kept_path(path):
+    return STATE / "kept" / digest(str(path).encode())
+
+
+def put(target, data, mode=0o600):
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(target.name + ".tripwire-tmp")
+    with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode), "wb") as handle:
+        handle.write(data)
+    os.chmod(tmp, mode)
+    os.replace(tmp, target)
+
+
+def keep_copies(config):
+    """Remember the checked version of each file a hold may need to put back."""
+    for path in hold_paths(config):
+        try:
+            put(kept_path(path), expand(path).read_bytes())
+        except OSError:
+            pass
+
+
+def process_start(pid):
+    return (run(["ps", "-o", "lstart=", "-p", str(pid)]) or "").strip() or None
+
+
+def launchctl(args):
+    try:
+        return subprocess.run(["launchctl"] + args, capture_output=True, timeout=30).returncode
+    except (OSError, subprocess.TimeoutExpired):
+        return 1
+
+
+def changed_path(change):
+    return change["what"] if change["wire"] == "files" else change["what"].split(" has `")[0]
+
+
+def apply_holds(config, found, incident, kill=os.kill):
+    holds = []
+    if config.get("hold", True) is False:
+        return holds
+    never = set(config.get("never_pause", NEVER_PAUSE))
+    for change in found:
+        try:
+            if change["wire"] == "listeners":
+                program = change["what"].split(" on ")[0]
+                text = run(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN"]) or ""
+                for pid in sorted({pid for what, pid in listener_rows(config, text) if what == change["what"]}):
+                    started = process_start(pid)
+                    if program in never or pid in (os.getpid(), os.getppid()) or not started:
+                        continue
+                    kill(pid, signal.SIGSTOP)
+                    holds.append({"kind": "process", "pid": pid, "started": started, "program": program})
+            elif change["wire"] == "launchd":
+                plist = pathlib.Path(change["what"])
+                text = plist.read_bytes()
+                try:
+                    label = plistlib.loads(text).get("Label") or plist.stem
+                except Exception:
+                    label = plist.stem
+                # Only this user's jobs can be unloaded without root; never the job that runs this.
+                if not str(plist).startswith(str(HOME)) or label in never or b"tripwire" in text:
+                    continue
+                target = f"gui/{os.getuid()}/{label}"
+                loaded = launchctl(["print", target]) == 0
+                launchctl(["disable", target])
+                if loaded:
+                    launchctl(["bootout", target])
+                holds.append({"kind": "job", "label": label, "plist": str(plist), "was_loaded": loaded})
+            elif change["wire"] in ("files", "guards"):
+                path = changed_path(change)
+                kept, target = kept_path(path), expand(path)
+                if path not in hold_paths(config) or not kept.exists():
+                    continue
+                held = None
+                if target.is_file():
+                    held = incident / "held" / target.name
+                    put(held, target.read_bytes())
+                mode = (target.stat().st_mode & 0o777) if target.exists() else 0o600
+                earlier = kept.read_bytes()
+                put(target, earlier, mode)
+                holds.append({"kind": "file", "path": path, "held": str(held) if held else None,
+                              "put_back": "sha:" + digest(earlier)})
+        except OSError as exc:
+            holds.append({"kind": "failed", "what": change["what"], "error": str(exc)})
+    return holds
+
+
+def undo_holds(holds, kill=os.kill):
+    notes = []
+    for hold in holds:
+        try:
+            if hold["kind"] == "process":
+                if process_start(hold["pid"]) == hold["started"]:
+                    kill(hold["pid"], signal.SIGCONT)
+                    notes.append(f"continued {hold['program']} (pid {hold['pid']})")
+                else:
+                    notes.append(f"{hold['program']} (pid {hold['pid']}) is gone")
+            elif hold["kind"] == "job":
+                target = f"gui/{os.getuid()}/{hold['label']}"
+                launchctl(["enable", target])
+                if hold["was_loaded"] and pathlib.Path(hold["plist"]).exists():
+                    launchctl(["bootstrap", f"gui/{os.getuid()}", hold["plist"]])
+                notes.append(f"enabled {hold['label']}" + (" and loaded it" if hold["was_loaded"] else ""))
+            elif hold["kind"] == "file":
+                target = expand(hold["path"])
+                if not hold["held"]:
+                    notes.append(f"{hold['path']} had been removed; the earlier version stays")
+                elif fingerprint(target) != hold["put_back"]:
+                    notes.append(f"{hold['path']} changed again while held; left as it is")
+                else:
+                    put(target, pathlib.Path(hold["held"]).read_bytes(), target.stat().st_mode & 0o777)
+                    notes.append(f"put the changed {hold['path']} back")
+        except OSError as exc:
+            notes.append(f"could not undo {hold.get('kind')}: {exc}")
+    return notes
+
+
+def refresh_file_wires(config):
+    """After a file was put back or returned, the baseline must describe what is there now."""
+    baseline = read_json(STATE / "baseline.json", None)
+    if baseline is not None:
+        for name, collect in (("files", wire_files), ("guards", wire_guards)):
+            if name in baseline:
+                baseline[name] = collect(config)
+        write_json(STATE / "baseline.json", baseline)
+    keep_copies(config)
+
+
+def release(name, config=None, owner=False, kill=os.kill):
+    config = load_config() if config is None else config
+    incident = STATE / "incidents" / pathlib.Path(name).name
+    record = read_json(incident / "incident.json", None)
+    if record is None:
+        print(f"tripwire: no incident {name}")
+        return 2
+    if record.get("released") or not record.get("holds"):
+        print("tripwire: nothing held")
+        return 0
+    try:
+        first = (incident / "report.md").read_text(errors="replace").splitlines()[0].strip()
+    except (OSError, IndexError):
+        first = ""
+    if not owner and not first.upper().startswith("VERDICT: BENIGN"):
+        print("tripwire: not released. It needs a report whose first line is `VERDICT: BENIGN`, "
+              "or the owner's `--owner`.")
+        return 1
+    record["release_notes"] = undo_holds(record["holds"], kill=kill)
+    record["released"] = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + (" (owner or timeout)" if owner else "")
+    write_json(incident / "incident.json", record)
+    if any(hold["kind"] == "file" for hold in record["holds"]):
+        refresh_file_wires(config)
+    print("tripwire: released: " + "; ".join(record["release_notes"]))
+    return 0
+
+
+def release_stale(config, now, kill=os.kill, **hooks):
+    """A hold whose agent never reported is undone after hold_timeout_min, and the owner told."""
+    limit = float(config.get("hold_timeout_min", 60)) * 60
+    for path in sorted((STATE / "incidents").glob("*/incident.json")):
+        record = read_json(path, {})
+        if (limit and record.get("holds") and not record.get("released")
+                and not (path.parent / "report.md").exists() and now - record.get("raised_epoch", now) > limit):
+            release(path.parent.name, config, owner=True, kill=kill)
+            notify(config, f"{record.get('host')}: no report on {path.parent.name} after "
+                           f"{limit / 60:.0f} min; the hold was undone. Look at it.", **hooks)
+
+
 def notify(config, text, runner=subprocess.run):
     """Tell the owner on this Mac and, where configured, by agent mail. Never raises."""
     for argv in (["osascript", "-e", f"display notification {json.dumps(text[:200])} with title \"tripwire\""],
@@ -249,8 +451,9 @@ def summons_today(now):
     return [t for t in log if now - t < 86400]
 
 
-def summon(config, incident, host, now, spawn=subprocess.Popen):
-    """Start one agent on the incident, detached. Returns a word for the incident record."""
+def summon(config, incident, host, now, found=(), record=None, spawn=subprocess.Popen, kill=os.kill):
+    """Hold what changed, then start one agent on the incident, detached. Returns a word for the record."""
+    record = {} if record is None else record
     recent = summons_today(now)
     if len(recent) >= int(config.get("max_summons_per_day", 4)):
         return "not summoned: daily limit reached"
@@ -258,8 +461,12 @@ def summon(config, incident, host, now, spawn=subprocess.Popen):
     if not argv or not shutil.which(argv[0]):
         return "not summoned: no agent command on this Mac"
     mail_to = config.get("mail_to")
+    holds = apply_holds(config, found, incident, kill=kill)
+    if holds:
+        record["holds"] = holds
+        write_json(incident / "incident.json", record)
     brief = BRIEF.format(
-        host=host, incident=incident,
+        host=host, incident=incident, name=incident.name,
         mail_step=(f"4. Send one line with the verdict and the report path: `agent-mail send {mail_to} \"...\"`.\n"
                    if mail_to else ""),
         mail_note=" and that one mail" if mail_to else "")
@@ -270,18 +477,22 @@ def summon(config, incident, host, now, spawn=subprocess.Popen):
             spawn(command, cwd=str(incident), stdin=subprocess.DEVNULL, stdout=log, stderr=log,
                   start_new_session=True)
     except OSError as exc:
+        if holds:  # nobody is coming to look, so do not leave it paused
+            record["release_notes"] = undo_holds(holds, kill=kill)
+            record["released"] = "at once: no agent"
         return f"not summoned: {exc}"
     write_json(STATE / "summons.json", recent + [now])
-    return "agent summoned"
+    return "agent summoned" + (f", {len(holds)} thing(s) held" if holds else "")
 
 
 def raise_incident(config, found, now, host, do_summon=True, **hooks):
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now))
     incident = STATE / "incidents" / f"{stamp}-{found[0]['wire']}"
     incident.mkdir(parents=True, exist_ok=True)
-    record = {"host": host, "raised": stamp, "changes": found}
+    record = {"host": host, "raised": stamp, "raised_epoch": now, "changes": found}
     write_json(incident / "incident.json", record)
-    record["agent"] = (summon(config, incident, host, now, **{k: v for k, v in hooks.items() if k == "spawn"})
+    record["agent"] = (summon(config, incident, host, now, found, record,
+                              **{k: v for k, v in hooks.items() if k in ("spawn", "kill")})
                        if do_summon else "not summoned: test")
     write_json(incident / "incident.json", record)
     names = "; ".join(f"{c['wire']}: {c['what']}" for c in found[:3]) + (" …" if len(found) > 3 else "")
@@ -313,6 +524,7 @@ def check(config=None, now=None, host=None, wires=WIRES, **hooks):
     current = snapshot(config, wires)
     if baseline is None:
         write_json(STATE / "baseline.json", {k: v for k, v in current.items() if v is not None})
+        keep_copies(config)
         print("tripwire: baseline recorded, nothing compared")
         return 0
     registered = registered_labels(config)
@@ -328,7 +540,13 @@ def check(config=None, now=None, host=None, wires=WIRES, **hooks):
     if found:
         incident = raise_incident(config, found, now, host, **hooks)
         print(f"tripwire: {len(found)} change(s) -> {incident}")
-    read_verdicts(config, **{k: v for k, v in hooks.items() if k == "runner"})
+        record = read_json(incident / "incident.json", {})
+        if any(hold["kind"] == "file" for hold in record.get("holds", [])) and not record.get("released"):
+            refresh_file_wires(config)  # a file just put back is what the baseline must describe
+    keep_copies(config)
+    told = {k: v for k, v in hooks.items() if k == "runner"}
+    release_stale(config, now, **{k: v for k, v in hooks.items() if k in ("runner", "kill")})
+    read_verdicts(config, **told)
     return 0
 
 
@@ -347,7 +565,9 @@ def status():
         record = read_json(path, {})
         verdict = (path.parent / "verdict.seen")
         word = verdict.read_text().strip() if verdict.exists() else record.get("agent", "?")
-        print(f"  {path.parent.name}  {len(record.get('changes', []))} change(s)  {word}")
+        held = ("" if not record.get("holds") else
+                f"  released {record['released']}" if record.get("released") else "  HELD")
+        print(f"  {path.parent.name}  {len(record.get('changes', []))} change(s)  {word}{held}")
     return 0
 
 
@@ -359,8 +579,11 @@ def main(argv):
         return status()
     if command == "accept":
         write_json(STATE / "baseline.json", {k: v for k, v in snapshot(load_config()).items() if v is not None})
+        keep_copies(load_config())
         print("tripwire: current state accepted as the baseline")
         return 0
+    if command == "release" and len(argv) > 2:
+        return release(argv[2], owner="--owner" in argv)
     if command == "test":
         found = [{"wire": "test", "what": "tripwire test", "before": None, "after": "raised by hand"}]
         config = load_config()
