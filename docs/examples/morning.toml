@@ -1,0 +1,61 @@
+# Copy to ~/.config/fleet/morning.toml and replace the host aliases with the
+# names in ~/.ssh/config. Roles match docs/examples/placement.toml.
+# primary: the Mac a person uses. hub: always-on home machine. shared: the other one.
+
+hosts = ["primary", "hub", "shared"]
+hub = "hub"
+notify_host = "primary"
+tz = "UTC"
+probe_s = 20
+
+[disk]
+floor_gb = 40
+fail_ratio = 0.5          # free under floor * ratio is a fail
+trend_warn_gb = -20       # 24 h change in free space, at or below this is a warn
+trend_fail_gb = -80
+
+[disk.floors.primary]
+internal = 80
+
+[disk.floors.hub]
+internal = 40
+
+[disk.floors.shared]
+internal = 30
+
+[backups]
+idrive_warn_h = 36
+idrive_fail_h = 72
+drive_mirror_warn_h = 26
+drive_mirror_fail_h = 48
+hdd_backup_warn_h = 36
+hdd_backup_fail_h = 168
+icloud_stall_h = 6
+idrive_hosts = ["primary"]
+mirror_hosts = ["hub"]
+hdd_hosts = ["hub"]
+icloud_hosts = ["primary"]
+syncthing_hosts = ["primary", "hub", "shared"]
+
+[jobs]
+overdue_h = 2
+
+[thermal]
+hot_c = 60
+hot_hours_warn = 2
+hot_hours_fail = 6
+wait_warn_s = 600
+gap_s = 900
+
+[capacity]
+near_empty_pct = 10
+near_empty_jobs = 5
+stale_h = 3
+
+[agents]
+stale_claim_h = 6
+unread_mail_h = 12
+
+[projects]
+heavy_runtime_s = 60
+active_host = "primary"

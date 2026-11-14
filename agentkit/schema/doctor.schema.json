@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/agentkit/doctor.schema.json",
+  "title": "agentkit doctor report",
+  "type": "object",
+  "required": ["schema", "generated", "ok", "issues", "providers"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": { "const": 1 },
+    "generated": { "type": "integer", "minimum": 0 },
+    "ok": { "type": "boolean" },
+    "issues": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "providers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "ok", "rules", "guards", "context", "memory", "issues", "gaps"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "enum": ["claude", "codex", "cursor"] },
+          "ok": { "type": "boolean" },
+          "rules": { "type": "string" },
+          "guards": { "type": "string" },
+          "context": { "type": "string" },
+          "memory": { "type": "string" },
+          "issues": { "type": "array", "items": { "type": "string" } },
+          "gaps": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    }
+  }
+}

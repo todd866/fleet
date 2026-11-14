@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# taskhub is the fleet-board client name. It runs cowork.
+# status, json, update, and report are the old client commands.
+set -euo pipefail
+root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+export PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}"
+py="${COWORK_PYTHON:-python3}"
+if [ "$#" -eq 0 ]; then
+  set -- status
+fi
+cmd="$1"
+shift
+case "$cmd" in
+  status|report) exec "$py" -m cowork board "$@" ;;
+  json) exec "$py" -m cowork board --json "$@" ;;
+  open) exec "$py" -m cowork open "$@" ;;
+  *) exec "$py" -m cowork "$cmd" "$@" ;;
+esac

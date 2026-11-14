@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>com.example.fleet-queue</string>
+<key>ProgramArguments</key><array>
+<string>/opt/homebrew/bin/python3</string>
+<string>REPLACE_HOME/Projects/fleet/design/bin/fleet-queue</string>
+<string>--local</string><string>work</string><string>--foreground</string>
+</array>
+<key>WorkingDirectory</key><string>REPLACE_HOME/Projects/fleet</string>
+<key>EnvironmentVariables</key><dict><key>PATH</key><string>REPLACE_HOME/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
+<key>StartInterval</key><integer>300</integer>
+<key>RunAtLoad</key><true/>
+<key>ProcessType</key><string>Background</string>
+<key>LowPriorityIO</key><true/>
+<key>Nice</key><integer>15</integer>
+<key>StandardOutPath</key><string>REPLACE_HOME/.local/state/fleet/jobs/consumer.stdout.log</string>
+<key>StandardErrorPath</key><string>REPLACE_HOME/.local/state/fleet/jobs/consumer.stderr.log</string>
+</dict></plist>

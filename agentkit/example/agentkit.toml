@@ -1,0 +1,32 @@
+# Sanitized site. Copy this directory to ~/.config/agentkit and edit it there.
+# Nothing in this file is a real host, address, or secret.
+schema = 1
+manage_model = false
+
+[models]
+claude_model = "example-model"
+claude_effort = "medium"
+codex_model = "example-model"
+codex_effort = "medium"
+cursor_model = "example-model"
+
+[[projects]]
+name = "example"
+path = "work/example"
+
+[guards]
+# Hosts where one whole `ssh <host> '<command>'` may hard-delete, because that
+# machine's Trash is not a recovery path. Leave empty unless you have one.
+air_hosts = []
+air_aliases = []
+allowed_cd = [
+  "~/Projects",
+  "~/.cursor/worktrees",
+  "~/.local/state",
+  "~/.claude",
+  "/tmp",
+  "/private/tmp",
+  "/var/folders",
+]
+push_markers = ["AGENTKIT_PUSH_APPROVED=1"]
+# email_substrings_file = "private/email-substrings.txt"

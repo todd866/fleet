@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [{"command": "\"$HOME/.local/bin/agent-mail\" cursor-hook", "timeout": 2}],
+    "postToolUse": [{"command": "\"$HOME/.local/bin/agent-mail\" cursor-hook", "timeout": 2}]
+  }
+}

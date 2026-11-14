@@ -1,0 +1,43 @@
+[package]
+name = "agentkit"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Provider-agnostic operating layer: one canonical site, thin adapters for Claude Code, Codex, and Cursor."
+default-run = "agentkit"
+
+[[bin]]
+name = "agentkit"
+path = "src/main.rs"
+
+[[bin]]
+name = "agent-context"
+path = "src/bin/agent-context.rs"
+
+[[bin]]
+name = "guard-hard-delete"
+path = "src/bin/guard-hard-delete.rs"
+
+[[bin]]
+name = "guard-icloud"
+path = "src/bin/guard-icloud.rs"
+
+[[bin]]
+name = "guard-offload-heavy"
+path = "src/bin/guard-offload-heavy.rs"
+
+[[bin]]
+name = "guard-cd-outside"
+path = "src/bin/guard-cd-outside.rs"
+
+[[bin]]
+name = "guard-push"
+path = "src/bin/guard-push.rs"
+
+[dependencies]
+fancy-regex = "0.14"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+shlex = "1"
+toml = "0.8"

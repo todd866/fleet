@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/agentkit/site.schema.json",
+  "title": "agentkit site (agentkit.toml)",
+  "description": "Private site at ~/.config/agentkit. The public repo ships a sanitized example, not a filled-in site.",
+  "type": "object",
+  "required": ["schema"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": { "const": 1 },
+    "manage_model": { "type": "boolean", "default": false },
+    "projects": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "path"],
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$" },
+          "path": { "type": "string", "description": "Project directory under HOME. Absolute paths outside HOME are refused." }
+        }
+      }
+    },
+    "guards": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "air_hosts": { "type": "array", "items": { "type": "string" } },
+        "air_aliases": { "type": "array", "items": { "type": "string" } },
+        "allowed_cd": { "type": "array", "items": { "type": "string" } },
+        "push_markers": { "type": "array", "items": { "type": "string" } },
+        "email_substrings_file": { "type": "string", "description": "Path of a private substring list. Never commit the file." }
+      }
+    },
+    "models": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "claude_model": { "type": "string" },
+        "claude_effort": { "type": "string" },
+        "codex_model": { "type": "string" },
+        "codex_effort": { "type": "string" },
+        "cursor_model": { "type": "string" }
+      }
+    }
+  }
+}

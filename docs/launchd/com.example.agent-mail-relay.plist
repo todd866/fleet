@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.example.agent-mail-relay</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>REPLACE_HOME/.local/bin/agent-mail</string>
+		<string>relay</string>
+	</array>
+	<key>StartInterval</key>
+	<integer>60</integer>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>REPLACE_HOME/.local/state/agent-mail/relay.stdout.log</string>
+	<key>StandardErrorPath</key>
+	<string>REPLACE_HOME/.local/state/agent-mail/relay.stderr.log</string>
+</dict>
+</plist>

@@ -1,0 +1,98 @@
+# Placement policy. Copy to ~/.config/fleet/placement.toml and edit.
+# The program reads only the file you give it. Host ids here are roles.
+
+[[host]]
+id = "primary"
+role = "travelling-primary" # keeps the working set
+floor_gb = 150
+band_low_gb = 200 # free space below this, and a known-stale install may leave
+band_high_gb = 400
+bulk = "working-set" # working-set | masters-on-external | no-bulk
+
+[[host]]
+id = "hub"
+role = "home-hub" # bulk masters live on volumes, not the internal disk
+floor_gb = 40
+bulk = "masters-on-external"
+
+[[host]]
+id = "shared"
+role = "shared-laptop" # no bulk unless a pin or a recent open says so
+floor_gb = 30
+bulk = "no-bulk"
+
+[[volume]]
+name = "media"
+host = "hub"
+encrypted = false
+accepts = ["re-obtainable"]
+
+[[volume]]
+name = "vault-a"
+host = "hub"
+encrypted = true
+accepts = ["personal-unique"]
+
+[[volume]]
+name = "vault-b"
+host = "hub"
+encrypted = true
+accepts = ["personal-unique"]
+
+# synced-small: configs, saves, notes. Every host keeps them.
+[[dataset]]
+name = "notes"
+class = "synced-small"
+paths = ["Notes"]
+sync = "syncthing"
+keep = ["*"]
+
+# scratch: local only, first to clear when free space is under the band.
+[[dataset]]
+name = "renders"
+class = "scratch"
+paths = ["tmp/renders"]
+
+# personal-unique: two verified encrypted copies, plus an off-site copy.
+# A volume name is a target, not proof. Empty folders do not count.
+[[dataset]]
+name = "photos"
+class = "personal-unique"
+paths = ["Pictures/Library"]
+master_host = "hub"
+master_volume = "vault-a"
+replica_volumes = ["vault-a", "vault-b"]
+offsite = "offsite-backup"
+keep = ["primary"]
+
+# A shared folder. Saves go everywhere. Archives stay on the hub volume.
+# `*` is every other child: an install, kept where it is played.
+[[sync_folder]]
+name = "games"
+root = "Games"
+method = "syncthing"
+played_within_days = 30
+
+[[sync_folder.parts]]
+path = "Saves"
+class = "synced-small"
+keep = ["*"]
+
+[[sync_folder.parts]]
+path = "Archives"
+class = "re-obtainable"
+master_host = "hub"
+master_volume = "media"
+archive = true
+
+[[sync_folder.parts]]
+path = "*"
+class = "re-obtainable"
+master_host = "hub"
+master_volume = "media"
+keep = ["primary"]
+
+# An explicit pin keeps a path on a host that would otherwise refuse bulk.
+[[pin]]
+path = "Games/OneTitle"
+hosts = ["shared"]

@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# cowork: who holds which job, across Claude, Codex, Cursor, and local models.
+set -euo pipefail
+self=$(readlink -f "$0" 2>/dev/null || python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$0")
+root=$(CDPATH= cd -- "$(dirname "$self")/.." && pwd)
+export PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}"
+exec "${COWORK_PYTHON:-python3}" -m cowork "$@"

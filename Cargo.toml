@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["heavy-slot", "agent-mail", "queue-steward", "diskmap", "placement", "agentkit"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
