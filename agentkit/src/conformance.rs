@@ -167,7 +167,13 @@ fn firing_guard(guard_name: &str, cfg: &GuardConfig, _session_home: &Path, site:
     // The metered-link case needs a marker file to exist. It is made in a throwaway home, never
     // in the session's: writing and then removing the real ~/.local/state/METERED_LINK would
     // clear a marker that was there for a reason, and every agent would start big transfers.
-    let scratch = std::env::temp_dir().join(format!("agentkit-conformance-{}", std::process::id()));
+    // A fresh private directory: create_dir fails on anything already at that name (a planted
+    // link included), and the marker is made with create_new, so nothing existing is followed.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let scratch = std::env::temp_dir().join(format!("agentkit-conformance-{}-{nanos}", std::process::id()));
     if guard_name == "metered-link" {
         cfg.home = scratch.clone();
     } else {
@@ -178,10 +184,19 @@ fn firing_guard(guard_name: &str, cfg: &GuardConfig, _session_home: &Path, site:
     cfg.offload_worker = Some("worker".into());
     let marker = cfg.home.join(".local/state/METERED_LINK");
     if guard_name == "metered-link" {
-        if let Some(parent) = marker.parent() {
-            let _ = fs::create_dir_all(parent);
+        let made = {
+            use std::os::unix::fs::DirBuilderExt;
+            fs::DirBuilder::new().mode(0o700).create(&scratch).is_ok()
+        };
+        let state = scratch.join(".local/state");
+        if !made
+            || fs::create_dir_all(&state).is_err()
+            || fs::OpenOptions::new().write(true).create_new(true).open(&marker).is_err()
+        {
+            // No private scratch space: report the guard as not proven rather than guess.
+            let _ = fs::remove_dir_all(&scratch);
+            return false;
         }
-        let _ = fs::write(&marker, "agentkit-conformance\n");
     }
     if !site.guards.push_gate_remotes.is_empty() {
         cfg.push_gate_remotes = site.guards.push_gate_remotes.clone();
