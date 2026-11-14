@@ -18,8 +18,9 @@ Hold first, then think. When an agent is about to look, the changed thing is pau
 a way that can be undone: a new listener's process is stopped (SIGSTOP), a new or changed
 launchd job is disabled and unloaded, a login-key or guard-hook file is put back to its last
 checked version. The agent's last act on a BENIGN verdict is `tripwire release`, which undoes
-it. Any other verdict leaves it held for the owner. A hold whose agent never reports is undone
-after `hold_timeout_min` (default 60). Nothing is held when no agent can be started.
+it. Any other verdict leaves it held for the owner. When the agent never reports, a stopped
+process or job goes on again after `hold_timeout_min` (default 60); a put-back file stays put
+back until the owner releases it. Nothing is held when no agent can be started.
 
 Config (all optional): ~/.config/fleet/tripwire.json
   {"host": "hub", "mail_to": "hub:fleet", "registry": "~/path/jobs.tsv", "max_summons_per_day": 4,
@@ -424,15 +425,25 @@ def release(name, config=None, owner=False, kill=os.kill):
 
 
 def release_stale(config, now, kill=os.kill, **hooks):
-    """A hold whose agent never reported is undone after hold_timeout_min, and the owner told."""
+    """A hold whose agent never reported: after hold_timeout_min a stopped process or job goes on
+    again (that hold costs work), a file that grants access or wires in a guard stays put back
+    (that hold costs nothing), and the owner is told either way."""
     limit = float(config.get("hold_timeout_min", 60)) * 60
     for path in sorted((STATE / "incidents").glob("*/incident.json")):
         record = read_json(path, {})
-        if (limit and record.get("holds") and not record.get("released")
+        if not (limit and record.get("holds") and not record.get("released") and not record.get("timed_out")
                 and not (path.parent / "report.md").exists() and now - record.get("raised_epoch", now) > limit):
-            release(path.parent.name, config, owner=True, kill=kill)
-            notify(config, f"{record.get('host')}: no report on {path.parent.name} after "
-                           f"{limit / 60:.0f} min; the hold was undone. Look at it.", **hooks)
+            continue
+        files = [hold for hold in record["holds"] if hold["kind"] == "file"]
+        record["release_notes"] = undo_holds([h for h in record["holds"] if h["kind"] != "file"], kill=kill)
+        record["holds"], record["timed_out"] = files, True
+        if not files:
+            record["released"] = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now)) + " (timeout)"
+        write_json(path, record)
+        kept = (f" {len(files)} file(s) stay put back: `tripwire release {path.parent.name} --owner`."
+                if files else "")
+        notify(config, f"{record.get('host')}: no report on {path.parent.name} after {limit / 60:.0f} min; "
+                       f"the hold was undone for what was running.{kept} Look at it.", **hooks)
 
 
 def notify(config, text, runner=subprocess.run):
