@@ -27,6 +27,18 @@ pub fn run(args: Vec<String>) -> i32 {
         "json" => cmd_json(),
         "tick" => cmd_tick(),
         "walk" => cmd_walk(),
+        "prune" => match crate::tick::prune_now(&Roots::from_env()) {
+            Ok(rows) => {
+                for (name, removed) in rows {
+                    println!("{name}: {removed} deleted directories dropped from the map");
+                }
+                0
+            }
+            Err(err) => {
+                eprintln!("diskmap: {err}");
+                1
+            }
+        },
         "help" | "-h" | "--help" => {
             println!("{}", usage());
             0

@@ -106,3 +106,77 @@ fn grew_finds_a_new_300mb_file() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+fn walk_all(dir: &std::path::Path, db: &std::path::Path, now: i64) {
+    for _ in 0..50 {
+        if map_volume(dir, db, now, 100, EVENT_MIN_BYTES, || false).unwrap().complete {
+            return;
+        }
+    }
+    panic!("walk did not finish");
+}
+
+fn total_of(db: &std::path::Path, path: &str) -> Option<i64> {
+    let handle = open_readonly(db).unwrap();
+    dir(&handle, path).unwrap().map(|row| row.total_bytes)
+}
+
+#[test]
+fn a_deleted_directory_leaves_the_map_and_its_ancestors_totals() {
+    let dir = scratch("deleted");
+    let root = dir.join("vol");
+    fs::create_dir_all(root.join("keep")).unwrap();
+    fs::create_dir_all(root.join("gone/deep/deeper")).unwrap();
+    fs::write(root.join("keep/a.bin"), vec![1u8; 4_000]).unwrap();
+    fs::write(root.join("gone/b.bin"), vec![1u8; 30_000]).unwrap();
+    fs::write(root.join("gone/deep/deeper/c.bin"), vec![1u8; 50_000]).unwrap();
+    // a sibling whose name starts with the deleted one must survive
+    fs::create_dir_all(root.join("gone2")).unwrap();
+    fs::write(root.join("gone2/d.bin"), vec![1u8; 700]).unwrap();
+    let db = dir.join("v.db");
+    walk_all(&root, &db, 1_700_000_000);
+    // sizes are what the file system allocated, so compare totals with each other
+    let root_before = total_of(&db, "").unwrap();
+    let gone_before = total_of(&db, "gone").unwrap();
+    let keep = total_of(&db, "keep").unwrap();
+    let gone2 = total_of(&db, "gone2").unwrap();
+    assert!(gone_before >= 80_000 && root_before == gone_before + keep + gone2);
+
+    fs::remove_dir_all(root.join("gone")).unwrap();
+    // the parent is what the file system reports as changed
+    enqueue(&db, "", false).unwrap();
+    walk_all(&root, &db, 1_700_000_100);
+    assert_eq!(total_of(&db, "gone"), None);
+    assert_eq!(total_of(&db, "gone/deep/deeper"), None);
+    assert_eq!(total_of(&db, "gone2"), Some(gone2));
+    assert_eq!(total_of(&db, "keep"), Some(keep));
+    assert_eq!(total_of(&db, ""), Some(root_before - gone_before));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn prune_repairs_a_map_that_still_holds_deleted_directories_once() {
+    let dir = scratch("prune");
+    let root = dir.join("vol");
+    fs::create_dir_all(root.join("a/old/inner")).unwrap();
+    fs::create_dir_all(root.join("a/live")).unwrap();
+    fs::write(root.join("a/old/inner/x.bin"), vec![1u8; 60_000]).unwrap();
+    fs::write(root.join("a/live/y.bin"), vec![1u8; 5_000]).unwrap();
+    let db = dir.join("v.db");
+    walk_all(&root, &db, 1_700_000_000);
+    let a_before = total_of(&db, "a").unwrap();
+    let old_before = total_of(&db, "a/old").unwrap();
+    let live = total_of(&db, "a/live").unwrap();
+    assert!(old_before >= 60_000 && a_before == old_before + live);
+    // deleted with no rescan of the parent: the state older maps are in
+    fs::remove_dir_all(root.join("a/old")).unwrap();
+    assert_eq!(prune_missing(&root, &db, 1_700_000_200, EVENT_MIN_BYTES, 1).unwrap(), 1);
+    assert_eq!(total_of(&db, "a/old"), None);
+    assert_eq!(total_of(&db, "a/old/inner"), None);
+    assert_eq!(total_of(&db, "a"), Some(live));
+    assert_eq!(total_of(&db, ""), Some(live));
+    // the repair runs once per map
+    fs::remove_dir_all(root.join("a/live")).unwrap();
+    assert_eq!(prune_missing(&root, &db, 1_700_000_300, EVENT_MIN_BYTES, 1).unwrap(), 0);
+    let _ = fs::remove_dir_all(&dir);
+}

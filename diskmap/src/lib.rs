@@ -15,7 +15,7 @@ mod tick;
 pub use archive::{ship, spool_clear, spool_merge, spool_take, Manifest};
 pub use darwin::{read_dir_entries, thermal_blocks_walk, Entry};
 pub use engine::{
-    apply_scans, enqueue, growth_against_snapshot, growth_since, map_progress, map_volume, queue_len,
+    apply_scans, enqueue, growth_against_snapshot, growth_since, map_progress, map_volume, prune_missing, queue_len,
     remember_volume, scanned_dirs, walk_one_batch, MapProgress, MapStats, WALK_BATCH,
 };
 pub use logic::{

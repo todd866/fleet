@@ -152,6 +152,27 @@ pub fn dir(db: &Db, path: &str) -> Result<Option<DirRow>, String> {
     }
 }
 
+/// Remove a directory's row and every row beneath it, with anything queued for them.
+/// The caller has already taken the directory's totals out of its ancestors.
+pub fn delete_subtree(db: &Db, path: &str) -> Result<(), String> {
+    if path.is_empty() {
+        return Err("refusing to delete the volume root".into());
+    }
+    // Everything beneath `path` sorts between "path/" and "path0" ('0' follows '/').
+    let lo = format!("{path}/");
+    let hi = format!("{path}0");
+    for table in ["dirs", "pending"] {
+        let stmt = db.prepare(&format!(
+            "DELETE FROM {table} WHERE path = ?1 OR (path >= ?2 AND path < ?3)"
+        ))?;
+        stmt.bind_text(1, path)?;
+        stmt.bind_text(2, &lo)?;
+        stmt.bind_text(3, &hi)?;
+        stmt.step()?;
+    }
+    Ok(())
+}
+
 pub fn children(db: &Db, parent: &str) -> Result<Vec<DirRow>, String> {
     // The volume root is stored as path '' with parent ''. Exclude it from its
     // own child list.

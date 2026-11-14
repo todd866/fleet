@@ -238,7 +238,11 @@ fn scan_one(
     let entries = match darwin::read_dir_entries(&abs) {
         Ok(v) => v,
         Err(_) => {
-            let touched = apply_own(db, path, &parent, 0, 0, 0, 0, now)?;
+            let mut touched = apply_own(db, path, &parent, 0, 0, 0, 0, now)?;
+            // Gone, not merely unreadable: nothing beneath it exists either.
+            if is_missing(&abs) {
+                touched.extend(drop_missing_children(db, path, &[])?);
+            }
             store::note_change(db, baseline, &touched, now, event_min)?;
             store::refresh_partial(db, path)?;
             return Ok(());
@@ -247,7 +251,7 @@ fn scan_one(
     let pairs: Vec<(String, FileAttr)> = entries.iter().map(|e| (e.name.clone(), file_attr(e))).collect();
     let refs: Vec<(&str, FileAttr)> = pairs.iter().map(|(n, a)| (n.as_str(), a.clone())).collect();
     let account = logic::account_entries(&refs);
-    let touched = apply_own(
+    let mut touched = apply_own(
         db,
         path,
         &parent,
@@ -257,6 +261,7 @@ fn scan_one(
         account.newest,
         now,
     )?;
+    touched.extend(drop_missing_children(db, path, &account.subdirs)?);
     for name in &account.subdirs {
         let child = join_rel(path, name);
         store::ensure_dir(db, &child, path)?;
@@ -268,6 +273,75 @@ fn scan_one(
     store::note_change(db, baseline, &touched, now, event_min)?;
     store::refresh_partial(db, path)?;
     Ok(())
+}
+
+const PRUNED_KEY: &str = "pruned_missing";
+
+/// True only when the path is known not to exist. A folder this process may not look into
+/// (another user's home, a privacy-protected folder) is not missing.
+fn is_missing(abs: &Path) -> bool {
+    matches!(std::fs::symlink_metadata(abs), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+}
+
+/// A subdirectory that was deleted, moved or renamed leaves its row behind, and every
+/// ancestor's total still counts it. `present` is the sorted list of subdirectory names found
+/// on disk just now; each child row not in it is taken out of the totals and dropped with
+/// everything beneath it.
+fn drop_missing_children(
+    db: &Db,
+    path: &str,
+    present: &[String],
+) -> Result<Vec<(String, i64, i64, i64)>, String> {
+    let mut touched = Vec::new();
+    for child in store::children(db, path)? {
+        let name = child.path.rsplit('/').next().unwrap_or("");
+        if present.binary_search_by(|p| p.as_str().cmp(name)).is_ok() {
+            continue;
+        }
+        touched.extend(bubble(db, path, -child.total_bytes, -child.dataless_bytes, 0)?);
+        store::delete_subtree(db, &child.path)?;
+    }
+    Ok(touched)
+}
+
+/// One-off repair for maps made before missing children were dropped: remove every row whose
+/// directory no longer exists. Returns how many top-level stale directories were removed.
+/// Only rows of at least `min_bytes` are checked; smaller leftovers go when their parent is
+/// next scanned.
+pub fn prune_missing(root: &Path, db_path: &Path, now: i64, event_min: i64, min_bytes: i64) -> Result<usize, String> {
+    let db = store::open(db_path)?;
+    if store::meta_get(&db, PRUNED_KEY)?.is_some() {
+        return Ok(0);
+    }
+    let mut rows = store::dirs_at_least(&db, min_bytes)?;
+    rows.sort_by(|a, b| a.path.cmp(&b.path));
+    let baseline = store::meta_get(&db, "baseline")?.as_deref() == Some("1");
+    in_txn(&db, || {
+        let mut removed = 0usize;
+        let mut last: Option<String> = None;
+        for row in &rows {
+            if row.path.is_empty() {
+                continue;
+            }
+            if let Some(prefix) = &last {
+                if row.path.starts_with(prefix.as_str()) && row.path.as_bytes().get(prefix.len()) == Some(&b'/') {
+                    continue;
+                }
+            }
+            if !is_missing(&abs_path(root, &row.path)) {
+                continue;
+            }
+            // Read the row again: an ancestor's removal or an earlier bubble may have changed it.
+            let Some(current) = store::dir(&db, &row.path)? else { continue };
+            let touched = bubble(&db, &current.parent, -current.total_bytes, -current.dataless_bytes, 0)?;
+            store::delete_subtree(&db, &row.path)?;
+            store::note_change(&db, baseline, &touched, now, event_min)?;
+            last = Some(row.path.clone());
+            removed += 1;
+        }
+        store::meta_set(&db, PRUNED_KEY, &now.to_string())?;
+        Ok(removed)
+    })
 }
 
 fn apply_own(

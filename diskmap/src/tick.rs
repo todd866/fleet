@@ -188,6 +188,29 @@ fn baseline_done(db_path: &Path) -> bool {
     engine::meta(db_path, "baseline").ok().flatten().as_deref() == Some("1")
 }
 
+const PRUNE_MIN_BYTES: i64 = 1_000_000;
+
+/// `diskmap prune`: run the one-off repair now on every mounted, mapped volume and say what
+/// it did. Refuses while the walk worker holds the databases.
+pub fn prune_now(roots: &Roots) -> Result<Vec<(String, usize)>, String> {
+    let Some(_lock) = hold_walk_lock(&roots.state.join("walk.lock"))? else {
+        return Err("the walk worker is running; try again in a minute".into());
+    };
+    let (cfg, _) = load(roots);
+    let now = unix_now();
+    let mut out = Vec::new();
+    for vol in darwin::list_volumes().unwrap_or_default() {
+        let db_path = db_file(roots, &vol.uuid);
+        if !baseline_done(&db_path) {
+            continue;
+        }
+        let removed = engine::prune_missing(&vol.mount, &db_path, now, cfg.event_min_bytes, PRUNE_MIN_BYTES)
+            .map_err(|e| format!("{}: {e}", vol.name))?;
+        out.push((vol.name.clone(), removed));
+    }
+    Ok(out)
+}
+
 pub fn ensure_walk_worker(roots: &Roots, mounted: &[Mounted]) -> Result<(), String> {
     let volumes: Vec<(bool, i64)> = mounted
         .iter()
@@ -270,6 +293,10 @@ pub fn walk_worker(roots: &Roots) -> Result<(), String> {
                 // The tick cannot fold events while this worker holds the
                 // walk lock, so the worker does it, then drains the queue.
                 if fold_due {
+                    // Once per map: drop rows for directories deleted before scans did that.
+                    if let Err(err) = engine::prune_missing(&vol.mount, &db_path, now, cfg.event_min_bytes, PRUNE_MIN_BYTES) {
+                        eprintln!("diskmap: prune {}: {err}", vol.name);
+                    }
                     fold_events(vol, &db_path);
                 }
                 if engine::queue_len(&db_path).unwrap_or(0) == 0 {
