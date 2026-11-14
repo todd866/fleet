@@ -410,15 +410,17 @@ fn release_refuses_a_pid_that_holds_no_slot() {
 #[test]
 fn idle_job_gives_its_slot_back_busy_job_keeps_it() {
     let dir = temp_state_dir();
-    let idle = spawn_hs(&dir, &[("HEAVY_SLOT_IDLE_SECS", "3")], &["--", "/bin/sleep", "8"]);
-    assert!(wait_until(|| !slot1_free(&dir), 5));
+    let idle = spawn_hs(&dir, &[("HEAVY_SLOT_IDLE_SECS", "3")], &["--", "/bin/sleep", "20"]);
+    assert!(wait_until(|| !slot1_free(&dir), 15), "idle job never took the slot");
     assert!(wait_until(|| slot1_free(&dir), 8), "idle job kept its slot");
     let out = idle.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&out.stderr).contains("idle 3 s, under 1% CPU"));
 
-    let busy = spawn_hs(&dir, &[("HEAVY_SLOT_IDLE_SECS", "3")], &["--", "/bin/sh", "-c", "end=$(($(date +%s)+6)); while [ $(date +%s) -lt $end ]; do :; done"]);
-    assert!(wait_until(|| !slot1_free(&dir), 5));
+    let busy = spawn_hs(&dir, &[("HEAVY_SLOT_IDLE_SECS", "3")], &["--", "/bin/sh", "-c", "end=$(($(date +%s)+20)); while [ $(date +%s) -lt $end ]; do :; done"]);
+    // A loaded Mac or a hosted runner can take seconds to start the job; the job runs long
+    // enough that the four-second look below still falls inside it.
+    assert!(wait_until(|| !slot1_free(&dir), 15), "busy job never took the slot");
     thread::sleep(Duration::from_secs(4));
     assert!(!slot1_free(&dir), "busy job lost its slot");
     let out = busy.wait_with_output().unwrap();
