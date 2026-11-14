@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""utc-schedule: move this Mac's calendar-scheduled launchd jobs onto UTC.
+
+    utc-schedule                 show what would change (nothing is written)
+    utc-schedule --apply         convert, back up, reload
+    utc-schedule --revert LABEL  put one job's original plist back
+
+A job with StartCalendarInterval {Hour, Minute[, Weekday]} becomes a StartInterval job whose
+program is `utc-daily`, which runs the original command once per UTC day at the same instant
+the local time meant on the day of conversion. Local 06:30 in a UTC+8 zone becomes 22:30Z.
+
+Left alone, and listed with the reason:
+  - slots with no Hour (hourly at :MM is the same in every whole-hour zone)
+  - one-shot dates (Month and Day)
+  - jobs with KeepAlive other than { SuccessfulExit = false }: launchd restarts those for
+    reasons the wrapper cannot see. The retry-until-success form is kept, with --retry.
+    A StartOnMount job is moved; a start caused by a mount then only runs it if a slot is due.
+  - jobs that are running right now (run again when they finish)
+  - labels outside the managed prefixes (vendor agents). Prefixes come from --prefix or from
+    ~/.config/fleet/utc-prefixes, one per line; with neither, nothing is managed.
+
+Originals are kept in ~/.local/state/utc-daily/plist-backups/. A slot that has already passed
+in UTC today is marked done, so converting never starts a job on the spot.
+"""
+import argparse
+import datetime as dt
+import os
+import pathlib
+import plistlib
+import shutil
+import subprocess
+import sys
+
+HOME = pathlib.Path.home()
+AGENTS = HOME / "Library/LaunchAgents"
+STATE = pathlib.Path(os.environ.get("UTC_DAILY_STATE") or HOME / ".local/state/utc-daily")
+BACKUPS = STATE / "plist-backups"
+WRAPPER = str(HOME / ".local/bin/utc-daily")
+PREFIX_FILE = HOME / ".config/fleet/utc-prefixes"
+
+
+def site_prefixes():
+    try:
+        lines = PREFIX_FILE.read_text().splitlines()
+    except OSError:
+        return ()
+    return tuple(line.strip() for line in lines if line.strip() and not line.startswith("#"))
+
+TICK_S = 300
+
+
+def to_utc(hour, minute, weekday, offset_min):
+    """Local wall-clock slot to (HH:MM, weekday) in UTC. launchd weekdays: 0 and 7 are Sunday."""
+    total = hour * 60 + minute - offset_min
+    shift, total = divmod(total, 1440)
+    if weekday is not None:
+        weekday = (int(weekday) % 7 + shift) % 7
+    return f"{total // 60:02d}:{total % 60:02d}", weekday
+
+
+def plan(plist, offset_min, prefixes):
+    """Return (new_plist, slots, weekday) or a string saying why the job is left alone."""
+    label = plist.get("Label", "")
+    if not label.startswith(prefixes):
+        return "label outside the managed prefixes"
+    args = plist.get("ProgramArguments") or ([plist["Program"]] if plist.get("Program") else [])
+    if any(os.path.basename(str(a)) == "utc-daily" for a in args[:2]):
+        return "already on UTC"
+    raw = plist.get("StartCalendarInterval")
+    if raw is None:
+        return "no calendar schedule"
+    slots = raw if isinstance(raw, list) else [raw]
+    keep = plist.get("KeepAlive")
+    retry = isinstance(keep, dict) and keep == {"SuccessfulExit": False}
+    if keep and not retry:
+        return "has KeepAlive (launchd restarts it for reasons the wrapper cannot see)"
+    if not args:
+        return "no program"
+    days = set()
+    times = []
+    for slot in slots:
+        if not isinstance(slot, dict) or "Hour" not in slot:
+            return "a slot has no Hour (hourly); zone-independent already"
+        if "Month" in slot or "Day" in slot:
+            return "a one-shot or monthly date"
+        hhmm, day = to_utc(int(slot["Hour"]), int(slot.get("Minute", 0)), slot.get("Weekday"), offset_min)
+        times.append(hhmm)
+        days.add(day)
+    if len(days) > 1:
+        return "slots fall on different UTC weekdays"
+    weekday = days.pop()
+    new = dict(plist)
+    new.pop("StartCalendarInterval")
+    new.pop("Program", None)  # Program would override argv[0] and bypass the wrapper
+    new["StartInterval"] = TICK_S
+    head = ["/bin/zsh", WRAPPER, "--label", label]
+    for hhmm in sorted(set(times)):
+        head += ["--at", hhmm]
+    if weekday is not None:
+        head += ["--weekday", str(weekday)]
+    if retry:
+        head += ["--retry"]
+    new["ProgramArguments"] = head + ["--"] + [str(a) for a in args]
+    return new, sorted(set(times)), weekday
+
+
+def running(label):
+    out = subprocess.run(["launchctl", "print", f"gui/{os.getuid()}/{label}"], capture_output=True, text=True)
+    return out.returncode == 0 and any(line.strip() == "state = running" for line in out.stdout.splitlines())
+
+
+def loaded(label):
+    return subprocess.run(["launchctl", "print", f"gui/{os.getuid()}/{label}"], capture_output=True).returncode == 0
+
+
+def seed(label, slots, weekday, now):
+    """Mark slots already past in UTC today as done, so the first tick does not run the job."""
+    folder = STATE / label
+    folder.mkdir(parents=True, exist_ok=True)
+    today = now.strftime("%Y-%m-%d")
+    for hhmm in slots:
+        if now.strftime("%H:%M") >= hhmm:
+            (folder / f"done-{hhmm.replace(':', '')}").write_text(today + "\n")
+
+
+def reload(label, path):
+    domain = f"gui/{os.getuid()}"
+    subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True)
+    out = subprocess.run(["launchctl", "bootstrap", domain, str(path)], capture_output=True, text=True)
+    return out.returncode == 0, out.stderr.strip()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--revert", metavar="LABEL")
+    parser.add_argument("--dir", type=pathlib.Path, default=AGENTS, help="plist folder (default ~/Library/LaunchAgents)")
+    parser.add_argument("--no-reload", action="store_true", help="rewrite files only (for a folder of plist copies)")
+    parser.add_argument("--offset-min", type=int, help="minutes east of UTC the schedules were written in (default: this Mac now)")
+    parser.add_argument("--prefix", action="append", help="label prefix to manage (repeatable)")
+    args = parser.parse_args()
+    prefixes = tuple(args.prefix) if args.prefix else site_prefixes()
+    if not prefixes:
+        print(f"utc-schedule: no label prefixes; pass --prefix or list them in {PREFIX_FILE}", file=sys.stderr)
+        return 2
+
+    if args.revert:
+        saved = BACKUPS / f"{args.revert}.plist"
+        if not saved.is_file():
+            print(f"utc-schedule: no backup for {args.revert}", file=sys.stderr)
+            return 1
+        target = AGENTS / f"{args.revert}.plist"
+        shutil.copy2(saved, target)
+        ok, err = reload(args.revert, target)
+        print(f"{args.revert}: reverted" + ("" if ok else f" (reload failed: {err})"))
+        return 0 if ok else 1
+
+    offset = args.offset_min
+    if offset is None:
+        offset = int(dt.datetime.now().astimezone().utcoffset().total_seconds() // 60)
+    now = dt.datetime.now(dt.timezone.utc)
+    changed = failed = 0
+    for path in sorted(args.dir.glob("*.plist")):
+        try:
+            with open(path, "rb") as handle:
+                plist = plistlib.load(handle)
+        except Exception as error:  # an unreadable plist is reported, never rewritten
+            print(f"{path.name}: unreadable ({error})")
+            continue
+        label = plist.get("Label", path.stem)
+        result = plan(plist, offset, prefixes)
+        if isinstance(result, str):
+            if "StartCalendarInterval" in plist:
+                print(f"left   {label}: {result}")
+            continue
+        new, slots, weekday = result
+        when = " ".join(f"{s}Z" for s in slots) + (f" weekday {weekday}" if weekday is not None else "")
+        live = not args.no_reload
+        if live and running(label):
+            print(f"left   {label}: running now; run utc-schedule again later")
+            continue
+        if not args.apply:
+            print(f"would  {label}: {when}")
+            changed += 1
+            continue
+        if live:
+            BACKUPS.mkdir(parents=True, exist_ok=True)
+            saved = BACKUPS / f"{label}.plist"
+            if not saved.exists():
+                shutil.copy2(path, saved)
+            seed(label, slots, weekday, now)
+        was_loaded = live and loaded(label)
+        tmp = path.with_suffix(".plist.utc-new")
+        with open(tmp, "wb") as handle:
+            plistlib.dump(new, handle)
+        os.replace(tmp, path)
+        note = ""
+        if was_loaded:
+            ok, err = reload(label, path)
+            if not ok:
+                failed += 1
+                note = f" (reload FAILED: {err}; original is in {BACKUPS})"
+        elif live:
+            note = " (was not loaded; left unloaded)"
+        print(f"moved  {label}: {when}{note}")
+        changed += 1
+    print(f"utc-schedule: {changed} job(s) {'moved' if args.apply else 'would move'}; offset used {offset:+d} min")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

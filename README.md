@@ -14,6 +14,7 @@ Rust tools and docs for running several AI coding agents across several Macs wit
 | [diskmap](diskmap/README.md) | Volume map, growth history, archive shipping; summary JSON for health UIs. |
 | [placement](placement/README.md) | Data-set placement planner (`plan` / `apply` / `status`). |
 | [agentkit](agentkit/README.md) | Canonical rules, guards, and provider sync (`sync`, `doctor`). |
+| [utc-daily](bin/utc-daily), [utc-schedule](bin/utc-schedule) | Daily launchd jobs on a UTC schedule: launchd's calendar is local time in the zone the Mac booted in, so a laptop that travels fires jobs hours off. `utc-schedule` converts existing plists. |
 | [cowork](docs/cowork.md) | Work claims, leases, and board JSON for multi-agent coordination. |
 
 Bash originals under `spec/` are the behavioural spec for heavy-slot and agent-mail while you validate Rust drop-ins.

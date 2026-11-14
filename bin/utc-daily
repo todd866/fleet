@@ -1,0 +1,90 @@
+#!/bin/zsh
+# utc-daily: run a command once a day (or once a week) at a UTC time, from a launchd job that
+# ticks every few minutes.
+#
+#   utc-daily --label NAME --at HH:MM [--at HH:MM ...] [--weekday 0-6] [--retry] -- command [args ...]
+#   utc-daily status [NAME]          last run of each job: UTC time, slot, exit code
+#
+# Why: launchd's StartCalendarInterval is local time, and worse, the local time of the zone the
+# Mac booted in. A laptop that travels fires every calendar job hours off, and three Macs in
+# different places disagree about when "06:30" is. A schedule kept in UTC means the same
+# instant everywhere. launchd cannot do that, so the plist uses StartInterval (zone-free) and
+# this script decides whether a run is due.
+#
+# In the plist: ProgramArguments = /bin/zsh, this file, the options, "--", the command.
+# The command is run as a child and never exec'd, so macOS privacy checks keep seeing /bin/zsh.
+#
+# A run is due when the UTC clock has passed a slot today and that slot has not started today.
+# A Mac that was asleep at the slot runs at its next tick. A Mac that was off all day skips
+# that day. --weekday counts in UTC, 0 = Sunday.
+# --retry: a run that fails leaves its slot open, so the next start tries again. For plists
+# with KeepAlive { SuccessfulExit = false }, where launchd restarts a failed job until it works.
+#
+# State: ~/.local/state/utc-daily/NAME/  done-HHMM (UTC date the slot last started) and
+# last (one line: start epoch, end epoch, slot, exit code). A tick that is not due prints
+# nothing and exits 0; a tick that runs exits with the command's code.
+emulate -L zsh
+setopt no_unset pipe_fail
+
+root=${UTC_DAILY_STATE:-$HOME/.local/state/utc-daily}
+
+if [[ ${1:-} == status ]]; then
+  for d in $root/${2:-*}(N/); do
+    [[ -f $d/last ]] || { print -r -- "${d:t}  never run"; continue }
+    read -r start end slot rc < $d/last
+    print -r -- "${d:t}  $(date -u -r $start '+%Y-%m-%d %H:%MZ')  slot ${slot}Z  exit $rc  $(( end - start )) s"
+  done
+  exit 0
+fi
+
+label='' weekday='' retry=0
+typeset -a slots
+while (( $# )); do
+  case $1 in
+    --label) label=$2; shift 2 ;;
+    --at) slots+=($2); shift 2 ;;
+    --weekday) weekday=$2; shift 2 ;;
+    --retry) retry=1; shift ;;
+    --) shift; break ;;
+    *) print -u2 -r -- "utc-daily: unknown option $1"; exit 64 ;;
+  esac
+done
+[[ -n $label && $label != */* && $label != .* ]] || { print -u2 "utc-daily: --label NAME is required"; exit 64 }
+(( ${#slots} )) || { print -u2 "utc-daily: at least one --at HH:MM is required"; exit 64 }
+(( $# )) || { print -u2 "utc-daily: no command after --"; exit 64 }
+for s in $slots; do
+  [[ $s == [0-2][0-9]:[0-5][0-9] && ${s%%:*} -le 23 ]] || { print -u2 -r -- "utc-daily: bad time $s"; exit 64 }
+done
+[[ -z $weekday || $weekday == [0-6] ]] || { print -u2 "utc-daily: --weekday is 0-6, Sunday is 0"; exit 64 }
+
+now=${UTC_DAILY_NOW:-$(date -u +%s)}
+today=$(date -u -r $now +%Y-%m-%d)
+hhmm=$(date -u -r $now +%H%M)
+[[ -z $weekday || $(date -u -r $now +%w) == $weekday ]] || exit 0
+
+dir=$root/$label
+mkdir -p $dir || exit 73
+
+# The latest slot that has passed and not started today. Earlier ones are marked too, so a Mac
+# that slept through two slots runs once, not twice in a row.
+due=''
+for s in ${(o)slots}; do
+  key=${s/:/}
+  (( 10#$hhmm >= 10#$key )) || continue
+  [[ -f $dir/done-$key && $(<$dir/done-$key) == $today ]] && continue
+  due=$s
+done
+[[ -n $due ]] || exit 0
+for s in $slots; do
+  key=${s/:/}
+  (( 10#$key <= 10#${due/:/} )) && print -r -- $today > $dir/done-$key
+done
+
+"$@" &
+child=$!
+trap 'kill -TERM $child 2>/dev/null' TERM INT HUP
+wait $child; rc=$?
+while kill -0 $child 2>/dev/null; do wait $child; rc=$?; done
+print -r -- "$now $(date -u +%s) $due $rc" > $dir/last.tmp && mv -f $dir/last.tmp $dir/last
+(( retry && rc != 0 )) && : > $dir/done-${due/:/}
+exit $rc
