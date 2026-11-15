@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+"""fleet — morning is the scheduled check. Other fleet-* scripts stay separate.
+
+Python >= 3.11 is required (`tomllib` reads morning.toml and `.fleet/check`).
+Launchd's PATH often resolves `python3` to the system interpreter, which is
+older than that. When Homebrew's python3 is installed, start it instead.
+"""
+import os
+import sys
+from pathlib import Path
+
+_BREW = Path("/opt/homebrew/bin/python3")
+if _BREW.is_file() and os.access(_BREW, os.X_OK):
+    if Path(sys.executable).resolve() != _BREW.resolve():
+        os.execv(str(_BREW), [str(_BREW), *sys.argv])
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from fleet.morning.cli import main  # noqa: E402
+
+if __name__ == "__main__":
+    raise SystemExit(main())

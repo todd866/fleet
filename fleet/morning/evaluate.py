@@ -1,0 +1,1109 @@
+"""Turn a collected snapshot into one finding per instrument. No I/O."""
+from fleet import site
+import re
+from dataclasses import dataclass
+from datetime import date, datetime, timezone
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover
+    ZoneInfo = None
+
+MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+RANK = {"pass": 0, "warn": 1, "fail": 2}
+# A sleeping laptop is info once its snapshot is older than 3 h. Warn only after 48 h.
+SNAPSHOT_INFO_S = 3 * 3600
+SNAPSHOT_WARN_S = 48 * 3600
+ORDER = ("host", "disk", "backup", "sync", "update", "job", "thermal", "capacity", "agent", "project", "check", "place", "kit")
+REGISTERED = re.compile(r"^[0-9a-f]{64}$")
+# macOS volumes that live in the boot disk's container: the internal disk again, not another one.
+SYSTEM_VOLUMES = frozenset((
+    "Macintosh HD", "Data", "Recovery", "Preboot", "VM", "Update", "xarts", "iSCPreboot", "Hardware",
+))
+# SIGTERM as launchd reports it (-15) and as a shell reports a child it ended (143).
+TERM_EXITS = ("-15", "143")
+
+
+@dataclass(frozen=True)
+class Finding:
+    key: str
+    status: str
+    area: str
+    name: str
+    value: str
+    datum: str
+    detail: str
+    symbol: str
+
+
+def evaluate(snapshot, config, now):
+    now = int(now)
+    tz = _zone(config.get("tz"))
+    rows = []
+    rows.extend(_hosts(snapshot.get("hosts") or {}, now, tz))
+    rows.extend(_disks_fleet(snapshot.get("hosts") or {}, config, now, tz, snapshot.get("disk_targets") or {}))
+    registry = snapshot.get("registry_jobs")
+    prefixes = ("com.example.", *((config.get("jobs") or {}).get("label_prefixes") or ()))
+    for name, host in (snapshot.get("hosts") or {}).items():
+        if not host.get("ok"):
+            continue
+        rows.extend(_backups(name, host, config, now))
+        rows.extend(_sync(name, host))
+        rows.extend(_updates(name, host))
+        rows.extend(_jobs(name, host, config, now, tz, registry, prefixes))
+        rows.extend(_queue(name, host, now, tz))
+        rows.extend(_thermal(name, host, config, now))
+        rows.extend(_mail(name, host, config, now))
+    rows.extend(_capacity(snapshot.get("capacity"), config, now, tz))
+    rows.extend(_agents(snapshot.get("board"), now))
+    rows.extend(_projects(snapshot.get("projects") or [], _reported_jobs(snapshot.get("hosts") or {}), prefixes))
+    rows.extend(_placement(snapshot.get("placement"), rows))
+    rows.extend(_coverage(snapshot.get("coverage"), now))
+    rows.extend(_agentkit(snapshot.get("agentkit")))
+    rows.extend(_job_reviews(snapshot.get("job_reviews"), now))
+    rows.extend(_unregistered_jobs(snapshot.get("hosts") or {}, registry))
+    rows.sort(key=lambda row: (ORDER.index(row.area) if row.area in ORDER else 99, row.name, row.key))
+    return rows
+
+
+def _hosts(hosts, now, tz):
+    rows = []
+    for name, host in hosts.items():
+        if not isinstance(host, dict):
+            continue
+        if not host.get("ok"):
+            since = host.get("away_since")
+            rows.append(_row(
+                f"host:{name}", "warn", "host", name, "away", _since(since, now, tz),
+                host.get("error") or "no answer", away=True,
+            ))
+            continue
+        collected = host.get("collected_at")
+        if collected is None:
+            continue
+        try:
+            collected = int(collected)
+        except (TypeError, ValueError):
+            continue
+        age = now - collected
+        if age <= SNAPSHOT_INFO_S:
+            continue
+        status = "warn" if age > SNAPSHOT_WARN_S else "info"
+        info_h = SNAPSHOT_INFO_S // 3600
+        warn_h = SNAPSHOT_WARN_S // 3600
+        rows.append(_row(
+            f"host:{name}", status, "host", name, "stale", _since(collected, now, tz),
+            f"snapshot {_hours(age / 3600)}; info after {info_h} h; warn after {warn_h} h",
+        ))
+    return rows
+
+
+def _disks_fleet(hosts, config, now, tz, targets=None):
+    """One row per physical drive, on the host that has it mounted.
+
+    The same volume UUID on several Macs is one drive. Copies with
+    `mounted: false` are not free-space readings. A drive mounted nowhere
+    is away, not a floor breach. Rows without a mount flag stay per host,
+    which is how the older snapshots were judged.
+    """
+    groups = []
+    local = []
+    missing = []
+    for name, host in hosts.items():
+        if not isinstance(host, dict) or not host.get("ok") or "disks" not in host:
+            continue
+        disks = host.get("disks") or []
+        if not disks:
+            missing.append((name, host.get("disk_error") or "disk summary missing"))
+            continue
+        for disk in disks:
+            if not isinstance(disk, dict) or disk.get("name") in SYSTEM_VOLUMES:
+                continue
+            uuids = _uuids(disk)
+            if uuids and "mounted" in disk:
+                _add_drive(groups, uuids, name, disk)
+            else:
+                local.append((name, disk))
+    rows = []
+    for name, reason in missing:
+        rows.append(_row(f"disk:{name}:none", "warn", "disk", name, "none", "no reading", reason))
+    for group in groups:
+        rows.append(_drive_row(group, config, now, tz, targets))
+    for name, disk in local:
+        rows.append(_disk_reading(name, disk, config, targets))
+    return rows
+
+
+def _uuids(disk):
+    found = []
+    for raw in disk.get("volume_uuids") or []:
+        text = str(raw or "").strip().upper()
+        if text and text not in found:
+            found.append(text)
+    single = str(disk.get("volume_uuid") or "").strip().upper()
+    if single and single not in found:
+        found.append(single)
+    return found
+
+
+def _add_drive(groups, uuids, host, disk):
+    ids = set(uuids)
+    hits = [group for group in groups if ids & group["uuids"]]
+    if not hits:
+        groups.append({"uuids": ids, "rows": [(host, disk)], "name": disk.get("name") or "disk"})
+        return
+    primary = hits[0]
+    primary["uuids"] |= ids
+    primary["rows"].append((host, disk))
+    if disk.get("mounted") and disk.get("name"):
+        primary["name"] = disk["name"]
+    for extra in hits[1:]:
+        primary["uuids"] |= extra["uuids"]
+        primary["rows"].extend(extra["rows"])
+        groups.remove(extra)
+
+
+def _drive_row(group, config, now, tz, targets=None):
+    attached = [(host, disk) for host, disk in group["rows"] if disk.get("mounted") is True]
+    drive = group["name"] or "disk"
+    if not attached:
+        seen = max((int(disk.get("last_seen") or 0) for _, disk in group["rows"]), default=0)
+        datum = _since(seen, now, tz) if seen else "unseen"
+        return _row(f"disk:{drive}", "info", "disk", drive, "away", datum, "not attached")
+    host, disk = max(attached, key=lambda item: item[1].get("free_bytes") or 0)
+    return _disk_reading(host, disk, config, targets)
+
+
+def _disk_reading(name, disk, config, targets=None):
+    disk_cfg = config.get("disk") or {}
+    ratio = float(disk_cfg.get("fail_ratio", 0.5))
+    trend_warn = float(disk_cfg.get("trend_warn_gb", -20))
+    trend_fail = float(disk_cfg.get("trend_fail_gb", -80))
+    drive = disk.get("name") or "disk"
+    # warn_line: free space below this is a warning. fail_line: below this is a failure.
+    # A Mac with its own target row is judged by that row (target, then floor); a floor written
+    # in the report's config, or no row at all, keeps the single floor and its ratio.
+    target = None if drive in ((disk_cfg.get("floors") or {}).get(name) or {}) else _target(targets, name, drive)
+    if target:
+        warn_line, fail_line = target["target_gb"], target["floor_gb"]
+        lines = f"target {_num(warn_line)} GB; floor {_num(fail_line)} GB"
+    else:
+        warn_line = _floor(disk_cfg, name, drive)
+        fail_line = warn_line * ratio
+        lines = f"floor {_num(warn_line)} GB"
+    free = None if disk.get("free_bytes") is None else disk["free_bytes"] / 1e9
+    trend = None if disk.get("trend_h24") is None else disk["trend_h24"] / 1e9
+    free_status = "pass"
+    if free is None:
+        free_status = "warn"
+    elif free < fail_line:
+        free_status = "fail"
+    elif free < warn_line:
+        free_status = "warn"
+    trend_status = "pass"
+    if trend is not None:
+        if trend <= trend_fail:
+            trend_status = "fail"
+        elif trend <= trend_warn:
+            trend_status = "warn"
+    status = _worse(free_status, trend_status)
+    if disk.get("alert"):
+        status = _worse(status, "warn")
+    value = "none" if free is None else _gb(free)
+    trend_text = None if trend is None else f"24h {_signed_gb(trend)}"
+    if free_status != "pass" and RANK[free_status] >= RANK[trend_status]:
+        if free is None:
+            datum = "no reading"
+        elif target and free_status == "warn":
+            datum = f"target {_num(warn_line)} GB"
+        else:
+            datum = f"floor {_num(fail_line if target else warn_line)} GB"
+    elif trend_text is not None:
+        datum = trend_text
+    else:
+        datum = "no trend"
+    detail = f"free {value}; {lines}; {trend_text or 'no trend'}"
+    if disk.get("alert"):
+        detail = f"{detail}; {disk['alert']}"
+    return _row(f"disk:{name}:{drive}", status, "disk", f"{name} {drive}", value, datum, detail)
+
+
+def _backups(name, host, config, now):
+    cfg = config.get("backups") or {}
+    rows = []
+    if "idrive" in host:
+        rows.append(_age_row(
+            f"backup:{name}:idrive", "backup", f"{name} idrive", host.get("idrive"), "last_epoch",
+            cfg.get("idrive_warn_h", 36), cfg.get("idrive_fail_h", 72), now, "no backup",
+        ))
+        attempt = host.get("idrive") or {}
+        if attempt.get("failed") or attempt.get("error"):
+            detail = attempt.get("error") or f'{attempt["failed"]} files failed in latest IDrive attempt'
+            rows[-1] = _row(f"backup:{name}:idrive", "fail", "backup", f"{name} idrive",
+                            "incomplete", "check backup", detail)
+        if attempt.get("held_since"):
+            # A deliberate hold is not a broken backup: say since when and what it costs.
+            rows[-1] = _row(f"backup:{name}:idrive", "warn", "backup", f"{name} idrive",
+                            "held", "owner hold",
+                            f'IDrive held since {attempt["held_since"]} (owner hold); nothing new reaches IDrive until it is lifted')
+    if host.get("idrive_ingest") is not None:
+        rows.append(_idrive_ingest(name, host["idrive_ingest"], cfg, now))
+    if host.get("home_mirror") is not None:
+        rows.append(_home_mirror(name, host["home_mirror"], cfg, now))
+    if "drive_mirror_epoch" in host:
+        rows.append(_stamp(
+            f"backup:{name}:drive-mirror", f"{name} drive-mirror", host.get("drive_mirror_epoch"),
+            cfg.get("drive_mirror_warn_h", 26), cfg.get("drive_mirror_fail_h", 48), now, "no stamp",
+        ))
+    if "hdd_backup_epoch" in host:
+        rows.append(_stamp(
+            f"backup:{name}:hdd-backup", f"{name} hdd-backup", host.get("hdd_backup_epoch"),
+            cfg.get("hdd_backup_warn_h", 36), cfg.get("hdd_backup_fail_h", 168), now, "no stamp",
+        ))
+    if "icloud" in host:
+        cloud = host.get("icloud") or {}
+        if not cloud:
+            rows.append(_row(f"backup:{name}:icloud", "warn", "backup", f"{name} icloud", "none", "no reading", "iCloud status missing"))
+            return rows
+        pending = int(cloud.get("pending_upload") or 0)
+        last = cloud.get("last_sync_epoch")
+        stall = float(cfg.get("icloud_stall_h", 6))
+        age = None if not last else (now - int(last)) / 3600
+        status = "pass"
+        if pending and (age is None or age >= stall):
+            status = "warn"
+        value = f"{pending} up" if pending else "0 up"
+        datum = "caught up" if not pending else ("no sync" if age is None else f"sync {_hours(age)}")
+        detail = f"pending upload {pending}; {datum}; stall { _num(stall) } h"
+        rows.append(_row(f"backup:{name}:icloud", status, "backup", f"{name} icloud", value, datum, detail))
+    return rows
+
+
+def _sync(name, host):
+    if "syncthing" not in host or host.get("syncthing") is None:
+        return []
+    sync = host["syncthing"] or {}
+    errors = int(sync.get("errors") or 0)
+    out = int(sync.get("out_of_sync") or 0)
+    local = int(sync.get("receive_only_local") or 0)
+    if sync.get("down"):
+        return [_row(f"sync:{name}", "warn", "sync", name, "down", "no answer", "Syncthing API did not answer")]
+    status = "pass"
+    if errors or local:
+        status = "fail"
+    elif out:
+        status = "warn"
+    if local:
+        value, datum = str(local), "receive-only"
+    elif errors:
+        value, datum = str(errors), "errors"
+    elif out:
+        value, datum = str(out), "out of sync"
+    else:
+        value, datum = "0", "in sync"
+    detail = f"errors {errors}; out of sync {out}; receive-only local changes {local}"
+    return [_row(f"sync:{name}", status, "sync", name, value, datum, detail)]
+
+
+def _updates(name, host):
+    if "glancebar" not in host or host.get("glancebar") is None:
+        return []
+    info = host["glancebar"] or {}
+    behind = info.get("behind")
+    release = info.get("release") if info.get("release") not in (None, "") else None
+    origin = info.get("origin") or release
+    installed = info.get("installed")
+    state = str(info.get("state") or "")
+    note = str(info.get("detail") or "")
+    try:
+        behind_n = None if behind in (None, "") else int(behind)
+    except (TypeError, ValueError):
+        behind_n = None
+    if behind_n is not None and behind_n < 0:
+        behind_n = None
+    if behind_n is None and not origin and not installed and not state:
+        return [_row(f"update:{name}", "warn", "update", name, "none", "no status", "glancebar-update status missing")]
+    # A version-only file with no `state` still means the release name was not recorded.
+    if not state and not release and installed:
+        return [_row(f"update:{name}", "warn", "update", name, "none", "no release", "no release recorded")]
+    if state == "ok" and (behind_n is None or behind_n <= 0):
+        detail = f"installed {installed or '—'}; origin {origin or '—'}; behind {0 if behind_n is None else behind_n}"
+        value = "0" if behind_n == 0 else "ok"
+        return [_row(f"update:{name}", "pass", "update", name, value, "current", detail)]
+    if behind_n is not None and behind_n > 0:
+        detail = f"installed {installed or '—'}; origin {origin or '—'}; behind {behind_n}"
+        if state and state not in ("ok", "current"):
+            detail = f"{detail}; state {state}"
+        if note:
+            detail = f"{detail}; {note}"
+        return [_row(f"update:{name}", "warn", "update", name, str(behind_n), "behind", detail)]
+    if state and state not in ("ok", "current"):
+        text = state.replace("-", " ")
+        detail = note or text
+        return [_row(f"update:{name}", "warn", "update", name, "none", text, detail)]
+    behind_n = int(behind_n or 0)
+    status = "warn" if behind_n > 0 else "pass"
+    value = str(behind_n) if behind_n else (origin or "current")
+    datum = "behind" if behind_n else "current"
+    detail = f"installed {installed or '—'}; origin {origin or '—'}; behind {behind_n}"
+    return [_row(f"update:{name}", status, "update", name, value, datum, detail)]
+
+
+def _jobs(name, host, config, now, tz, registry=None, prefixes=("com.example.",)):
+    if "jobs" not in host:
+        return []
+    grace_h = float((config.get("jobs") or {}).get("overdue_h", 2))
+    rows = []
+    for job in host.get("jobs") or []:
+        label = str(job.get("label") or "job")
+        if _retired(job, label, name, registry):
+            continue
+        short = _short_label(label, prefixes)
+        utc = _on_utc(job)
+        loaded = job.get("loaded", True)
+        exit_code = job.get("exit", job.get("status"))
+        when = str(job.get("when") or "")
+        last = job.get("last_epoch")
+        runs = job.get("runs")
+        state = str(job.get("state") or "")
+        if not loaded:
+            status, value, datum = "fail", "unloaded", "not loaded"
+        elif state == "running" and str(exit_code) in TERM_EXITS:
+            # SIGTERM is what launchctl sends when a job is restarted or reloaded. The exit code
+            # belongs to the previous instance; the job is up now.
+            status, value, datum = "pass", "ran", when or "running"
+        elif job.get("retry_pending") and str(exit_code) in TERM_EXITS:
+            # A UTC run cut short by a restart. The wrapper has reopened its slot and runs it
+            # once more at the next tick; only that second result is the job's.
+            status, value, datum = "pass", "cut", "retry due"
+        elif str(exit_code) == "75":
+            # EX_TEMPFAIL: the job chose not to run this time (a drive another job holds, a
+            # metered link, no capacity) and tries again at its next slot. That is a deferral
+            # to watch, not a failed job: heavy-slot's rows already read 75 this way.
+            status, value, datum = "warn", "deferred", short
+        elif _bad_exit(exit_code):
+            status, value, datum = "fail", f"exit {exit_code}", short
+        elif state == "running":
+            status, value, datum = "pass", "ran", when or "running"
+        else:
+            # A job on the utc-daily wrapper keeps its slot in UTC; anything still on launchd's
+            # calendar is in the Mac's own zone.
+            missed, datum = _missed(when, last, now, grace_h, timezone.utc if utc else tz, runs)
+            if utc and datum:
+                datum += "Z"
+            if missed:
+                status, value = "fail", "not run"
+            else:
+                status, value, datum = "pass", "ran", datum or when or "ok"
+        detail = f"{label}; when {when or '—'}; exit {exit_code}; loaded {bool(loaded)}"
+        rows.append(_row(f"job:{name}:{short}", status, "job", f"{name} {short}", value, datum, detail))
+    return rows
+
+
+def _job_reviews(reviews, now):
+    """One row for jobs whose review date has come, one for jobs no project owns.
+
+    A review asks whether the job should still exist. It is a prompt for an agent or the
+    owner, so it is a warn and never a fail.
+    """
+    if reviews is None:
+        return []
+    today = datetime.fromtimestamp(int(now), timezone.utc).date()
+    due, undated, upcoming, unowned = [], [], [], []
+    for job in reviews:
+        label = str(job.get("label") or "job")
+        project = str(job.get("project") or "")
+        if not project:
+            unowned.append(label)
+        try:
+            when = date.fromisoformat(str(job.get("review") or ""))
+        except ValueError:
+            undated.append(label)
+            continue
+        (due if when <= today else upcoming).append((when, label, project or "no project"))
+    due.sort()
+    rows = []
+    if due:
+        detail = "; ".join(f"{label} ({project}) due {when.isoformat()}" for when, label, project in due)
+        if undated:
+            detail += "; no review date: " + ", ".join(undated)
+        rows.append(_row("job:reviews", "warn", "job", "reviews", f"{len(due)} due",
+                         f"oldest {_day(due[0][0])}", detail))
+    elif undated:
+        rows.append(_row("job:reviews", "warn", "job", "reviews", f"{len(undated)} undated",
+                         "no review date", "no review date: " + ", ".join(undated)))
+    else:
+        nxt = min(upcoming)[0] if upcoming else None
+        rows.append(_row("job:reviews", "pass", "job", "reviews", "none due",
+                         f"next {_day(nxt)}" if nxt else "no jobs", "no job is due for review"))
+    if unowned:
+        rows.append(_row("job:review-projects", "warn", "job", "owners", f"{len(unowned)} unowned",
+                         "no project", "no project in jobs.tsv: " + ", ".join(unowned)))
+    return rows
+
+
+def _unregistered_jobs(hosts, registry):
+    """Jobs installed on a Mac that jobs.tsv does not list. They have no project and no review
+    date, so the review rows cannot see them. Without the registry list nothing is reported."""
+    if registry is None:
+        return []
+    where = {}
+    for name, host in (hosts or {}).items():
+        if not isinstance(host, dict) or not host.get("ok"):
+            continue
+        for job in host.get("jobs") or []:
+            label = str(job.get("label") or "")
+            seen = job.get("plist")
+            if seen is None:   # snapshots from before the flag, as in _retired
+                seen = "runs" in job or "state" in job
+            if label and seen and label not in registry:
+                where.setdefault(label, set()).add(name)
+    if not where:
+        return []
+    detail = "installed but not in jobs.tsv: " + ", ".join(
+        f"{label} ({', '.join(sorted(names))})" for label, names in sorted(where.items()))
+    return [_row("job:unregistered", "warn", "job", "unregistered", f"{len(where)} unregistered",
+                 "not in jobs.tsv", detail)]
+
+
+def _day(when):
+    return f"{when.day} {MONTHS[when.month - 1]}"
+
+
+def _thermal(name, host, config, now):
+    if "heavy" not in host and "samples" not in host:
+        return []
+    heavy = host.get("heavy") or []
+    samples = host.get("samples") or []
+    if not heavy and not samples:
+        return []
+    cfg = config.get("thermal") or {}
+    window = now - float(cfg.get("window_h", 24)) * 3600
+    recent = [job for job in heavy if job.get("end") in (None, "") or int(job.get("end") or 0) >= window]
+    # A job that was stopped on purpose (SIGINT, SIGKILL, SIGTERM) is not a failure, and a job
+    # that failed on its own account (a red test run) says nothing about this Mac: it is a
+    # warning for whoever ran it, never a machine fault.
+    fails = [job for job in recent if _bad_exit(job.get("rc")) and int(job.get("rc") or 0) not in (75, 130, 137, 143, -2, -9, -15)]
+    starved = [job for job in recent if int(job.get("rc") or 0) == 75 or int(job.get("waited") or 0) >= float(cfg.get("wait_warn_s", 600))]
+    hot_c = _hot_line(host, cfg)
+    line = f"≥{_num(hot_c)}C" if hot_c is not None else "no cool target"
+    hours = _hot_hours(samples, now, hot_c, float(cfg.get("gap_s", 900)))
+    status = "pass"
+    if hours >= float(cfg.get("hot_hours_fail", 6)):
+        status = "fail"
+    elif fails or starved or hours >= float(cfg.get("hot_hours_warn", 2)):
+        status = "warn"
+    if hours >= float(cfg.get("hot_hours_warn", 2)):
+        # heat is what makes this row red; say so rather than naming someone's failed test run
+        value, datum = _hours(hours), line
+    elif fails:
+        value, datum = f"{len(fails)} fail", str(fails[0].get("label") or "job")
+    elif starved:
+        value, datum = "wait", str(starved[0].get("label") or "slot")
+    else:
+        value, datum = _hours(hours), line
+    basis = f"{line} or thermal pressure" if hot_c is not None else "thermal pressure only; this Mac sent no cool target"
+    detail = f"failed jobs {len(fails)}; slot waits {len(starved)}; hot {_hours(hours)} ({basis})"
+    return [_row(f"thermal:{name}", status, "thermal", name, value, datum, detail)]
+
+
+def _hot_line(host, cfg):
+    """The chip temperature that counts as hot on this Mac, or None when nothing sets one.
+
+    heavy-slot's `cool` file is the slot policy's own line, so it is the report's: the probe
+    sends it as `cool_c`. `thermal.hot_c` in the config speaks only for a Mac that sent none.
+    """
+    for value in (host.get("cool_c"), cfg.get("hot_c")):
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+            return float(value)
+    return None
+
+
+def _queue(name, host, now, tz):
+    """One failure per attempt that holds this Mac's job queue.
+
+    The queue refuses every dispatch while an attempt's ownership is uncertain. That is on
+    purpose; staying silent about it was not.
+    """
+    rows = []
+    for stall in (host.get("queue") or {}).get("stalls") or []:
+        if not isinstance(stall, dict) or not stall.get("id"):
+            continue
+        ident = str(stall["id"])
+        since = stall.get("since")
+        try:
+            since = int(float(since)) if since is not None else None
+        except (TypeError, ValueError):
+            since = None
+        if since:
+            stamp = datetime.fromtimestamp(since, timezone.utc).strftime("%Y-%m-%d %H:%MZ")
+            datum = _since(since, now, tz)
+        else:
+            stamp, datum = "an unrecorded time", "since unknown"
+        clear = stall.get("clear") or f"fleet-queue show {ident}"
+        detail = (
+            f"attempt {ident} ({stall.get('state') or 'needs_review'}, ownership uncertain) has stopped every "
+            f"dispatch on {name} since {stamp}: {stall.get('blocker') or 'no reason recorded'}. "
+            f"Clear it on {name}: {clear}"
+        )
+        rows.append(_row(f"queue:{name}:{ident}", "fail", "job", f"{name} queue", "blocked", datum, detail))
+    return rows
+
+
+def _mail(name, host, config, now):
+    if "mail" not in host or host.get("mail") is None:
+        return []
+    limit = float((config.get("agents") or {}).get("unread_mail_h", 12))
+    old = []
+    for note in host.get("mail") or []:
+        if note.get("read"):
+            continue
+        at = note.get("at")
+        if at is None:
+            continue
+        age = (now - int(at)) / 3600
+        if age >= limit:
+            old.append(age)
+    if not old:
+        return [_row(f"agent:mail:{name}", "pass", "agent", f"{name} mail", "0", f"under {_num(limit)} h", "no unread mail past the limit")]
+    oldest = max(old)
+    return [_row(
+        f"agent:mail:{name}", "warn", "agent", f"{name} mail", str(len(old)),
+        f"oldest {_hours(oldest)}", f"{len(old)} unread older than {_num(limit)} h",
+    )]
+
+
+def _capacity(capacity, config, now, tz):
+    if not capacity:
+        return []
+    cfg = config.get("capacity") or {}
+    near_pct = float(cfg.get("near_empty_pct", 10))
+    near_jobs = float(cfg.get("near_empty_jobs", 5))
+    rows = []
+    for pool in capacity.get("pools") or []:
+        engine = str(pool.get("engine") or "pool")
+        name = str(pool.get("pool") or "pool")
+        pct = pool.get("remaining_pct")
+        jobs = pool.get("jobs_left")
+        reset = pool.get("reset_epoch")
+        fresh = not pool.get("stale") and (reset is None or int(reset) > now)
+        key = f"capacity:{engine}:{name}"
+        label = f"{engine} {name}"
+        if pool.get("stale") or (reset is not None and int(reset) <= now):
+            value = "unread" if pct is None else "stale"
+            rows.append(_row(key, "warn", "capacity", label, value, "reset" if reset else "unread", "reading is stale or the window has reset"))
+            continue
+        if not fresh:
+            rows.append(_row(key, "warn", "capacity", label, "unread", "unknown", "no fresh capacity reading"))
+            continue
+        status = "pass"
+        if pct is not None and float(pct) <= 0:
+            status = "fail"
+        elif jobs is not None and float(jobs) <= 0:
+            status = "fail"
+        elif pct is not None and float(pct) <= near_pct:
+            status = "warn"
+        elif jobs is not None and float(jobs) <= near_jobs:
+            status = "warn"
+        if jobs is not None and (pct is None or float(jobs) <= near_jobs) and status != "pass":
+            value = f"{_num(jobs)} jobs"
+        elif pct is None:
+            value = "unread"
+        else:
+            value = _pct(pct)
+        datum = _resets(reset, now, tz) if reset else "no reset"
+        detail = f"{value}; {datum}; near { _num(near_pct) }% or {_num(near_jobs)} jobs"
+        rows.append(_row(key, status, "capacity", label, value, datum, detail))
+    return rows
+
+
+def _agents(board, now):
+    if not board:
+        return []
+    stale = []
+    conflicts = []
+    for claim in board.get("claims") or []:
+        state = claim.get("state") or claim.get("status") or "active"
+        if state in ("done", "released"):
+            continue
+        if state == "stale" or _claim_expired(claim, now):
+            stale.append(claim.get("work") or "claim")
+        if claim.get("conflicts"):
+            conflicts.append(claim.get("work") or "claim")
+    unregistered = []
+    for row in board.get("presence") or []:
+        if (row.get("event") or "") == "end":
+            continue
+        ident = str(row.get("id") or "")
+        if REGISTERED.fullmatch(ident):
+            continue
+        unregistered.append(ident or row.get("project") or "session")
+    rows = []
+    if stale:
+        rows.append(_row("agent:stale", "warn", "agent", "claims", f"{len(stale)} stale", stale[0], ", ".join(stale)))
+    if conflicts:
+        rows.append(_row("agent:conflict", "fail", "agent", "conflicts", f"{len(conflicts)}", conflicts[0], ", ".join(conflicts)))
+    if unregistered:
+        rows.append(_row("agent:session", "warn", "agent", "sessions", f"{len(unregistered)}", "unregistered", ", ".join(unregistered)))
+    return rows
+
+
+def _reported_jobs(hosts):
+    """Labels that already have a job row of their own."""
+    found = set()
+    for host in hosts.values():
+        if not isinstance(host, dict) or not host.get("ok"):
+            continue
+        for job in host.get("jobs") or []:
+            if isinstance(job, dict) and job.get("label"):
+                found.add(str(job["label"]))
+    return found
+
+
+def _projects(projects, reported=frozenset(), prefixes=("com.example.",)):
+    rows = []
+    for project in projects:
+        name = project.get("name") or "project"
+        # The repo's own check is a row of its own, so a passing check cannot hide a dirty or
+        # failing checkout on the project row below, and a failing one does not replace it.
+        result = project.get("check_result")
+        if isinstance(result, dict) and result:
+            status = result.get("status") if result.get("status") in ("pass", "warn", "fail") else "fail"
+            detail = str(result.get("detail") or "")
+            host = str(result.get("host") or "")
+            rows.append(_row(
+                f"check:{name}", status, "check", name,
+                str(result.get("value") or status),
+                str(result.get("datum") or "check"),
+                f"{detail} (read on {host})" if detail and host else detail or (f"read on {host}" if host else ""),
+            ))
+        elif project.get("check_declared"):
+            rows.append(_row(
+                f"check:{name}", "warn", "check", name, "missing", "no result",
+                "this repo's .fleet/check names a result file, and no Mac has written one",
+            ))
+        git = project.get("git") or {}
+        ci = project.get("ci") or {}
+        conclusion = (ci.get("conclusion") or "") if ci else ""
+        failed_jobs = [job for job in project.get("jobs") or [] if _bad_exit(job.get("exit", job.get("status")))]
+        # A job on a Mac that reported in is judged in its own job row, with what launchd says
+        # now. Failing the project for it as well counts one fault twice.
+        bad_jobs = [job for job in failed_jobs if str(job.get("label") or "") not in reported]
+        noted = [job for job in failed_jobs if job not in bad_jobs]
+        dirty = bool(git.get("dirty"))
+        ahead = _int(git.get("ahead"))
+        behind = _int(git.get("behind"))
+        unpushed = _int(git.get("unpushed"))
+        if conclusion in ("failure", "failed", "cancelled") or bad_jobs:
+            status = "fail"
+            if bad_jobs:
+                value, datum = "job", _short_label(str(bad_jobs[0].get("label") or "job"), prefixes)
+            else:
+                value, datum = "ci", conclusion or "failure"
+        elif dirty or ahead or behind or unpushed:
+            status = "warn"
+            if dirty:
+                value = "dirty"
+            elif behind:
+                value = "behind"
+            else:
+                value = "ahead"
+            bits = []
+            if ahead or unpushed:
+                bits.append(f"↑{max(ahead, unpushed)}")
+            if behind:
+                bits.append(f"behind {behind}")
+            datum = " ".join(bits) or "uncommitted"
+        else:
+            status, value, datum = "pass", "clean", "ci pass" if conclusion == "success" else "no ci"
+        detail = f"{'dirty' if dirty else 'clean'}; ahead {ahead}; behind {behind}; unpushed {unpushed}; ci {conclusion or '—'}"
+        if bad_jobs:
+            detail = f"{detail}; job {bad_jobs[0].get('label')} exit {bad_jobs[0].get('exit')}"
+        for job in noted:
+            detail = f"{detail}; job {job.get('label')} exit {job.get('exit', job.get('status'))} (see its job row)"
+        rows.append(_row(f"project:{name}", status, "project", name, value, datum, detail))
+    return rows
+
+
+def _placement(placement, existing):
+    if not placement:
+        return []
+    covered = {row.name.split(" ", 1)[0] for row in existing if row.area == "disk"}
+    rows = []
+    for host in placement.get("hosts") or []:
+        state = host.get("state")
+        ident = str(host.get("id") or "")
+        if state not in ("below-floor", "below-band") or ident in covered:
+            continue
+        status = "fail" if state == "below-floor" else "warn"
+        free = host.get("free_gb")
+        rows.append(_row(
+            f"place:{ident}", status, "place", ident,
+            _gb(free) if isinstance(free, (int, float)) else "—", state,
+            f"{ident} {free} GB {state}",
+        ))
+    for viol in placement.get("violations") or []:
+        if not isinstance(viol, dict):
+            continue
+        name = str(viol.get("dataset") or viol.get("host") or "placement")
+        detail = str(viol.get("detail") or viol.get("code") or "")
+        rows.append(_row(f"place:{name}", "fail", "place", name, "gap", detail[:24] or "gap", detail or name))
+    return rows
+
+
+def _coverage(coverage, now):
+    if not coverage:
+        return []
+    generated = coverage.get("generated_epoch") or coverage.get("generated") or 0
+    try:
+        generated = int(generated)
+    except (TypeError, ValueError):
+        generated = 0
+    if generated and now - generated <= 24 * 3600:
+        return [_row("coverage:evidence", "pass", "place", "coverage", "fresh", _hours((now - generated) / 3600), "coverage.json is under a day old")]
+    return [_row("coverage:evidence", "warn", "place", "coverage", "stale", "over 24 h", "coverage.json missing or older than a day")]
+
+
+def _agentkit(kit):
+    if not kit or kit.get("absent"):
+        return []
+    rows = []
+    issues = kit.get("issues") or []
+    if kit.get("ok") is False or issues:
+        text = ", ".join(str(item) for item in issues) or "doctor failed"
+        rows.append(_row("kit:doctor", "fail", "other", "agentkit", "fail", "doctor", text))
+    else:
+        rows.append(_row("kit:doctor", "pass", "other", "agentkit", "ok", "doctor", "agentkit doctor ok"))
+    conformance = kit.get("conformance") or {}
+    providers = conformance.get("providers") or []
+    for block in providers:
+        pid = str(block.get("id") or "agentkit")
+        for guard in block.get("guards") or []:
+            name = str(guard.get("name") or "guard")
+            installed = guard.get("installed")
+            trusted = guard.get("trusted")
+            firing = guard.get("firing")
+            ok = installed and trusted and firing
+            detail = str(guard.get("detail") or "")
+            rows.append(
+                _row(
+                    f"kit:{pid}:{name}",
+                    "pass" if ok else "fail",
+                    "other",
+                    f"{site.primary()}:fleet",
+                    "ok" if ok else "fail",
+                    f"{pid}/{name}",
+                    detail or ("conformance ok" if ok else "not installed/trusted/firing"),
+                )
+            )
+    return rows
+
+
+def _idrive_ingest(name, status, cfg, now):
+    """The daily IDrive Linux-client backup (`idrive-ingest-tick` writes status.json every 30 min).
+
+    Judged by its last successful run: warn and fail at the IDrive ages. A first backup of a
+    large set runs for days; while it runs and is younger than `idrive_seed_fail_d` it is a
+    warning that says how far it has got, not a failure.
+    """
+    key, label = f"backup:{name}:idrive-ingest", f"{name} idrive-ingest"
+    warn_h = float(cfg.get("idrive_warn_h", 36))
+    fail_h = float(cfg.get("idrive_fail_h", 72))
+    seed_fail_h = float(cfg.get("idrive_seed_fail_d", 7)) * 24
+    storage = status.get("storage") or {}
+    used = (f"; IDrive {_num(storage['used_gb'])} of {_num(storage['total_gb'])} GB"
+            if storage.get("used_gb") is not None and storage.get("total_gb") else "")
+    checked = status.get("checked_at")
+    if not checked or now - int(checked) > 2 * 3600:
+        age = "never" if not checked else _hours((now - int(checked)) / 3600)
+        return _row(key, "fail", "backup", label, "stale", "tick stopped",
+                    f"status.json last written {age} ago; the idrive-ingest job is not ticking{used}")
+    problems = [str(item) for item in status.get("problems") or []]
+    if problems:
+        return _row(key, "fail", "backup", label, "down", "check client", "; ".join(problems) + used)
+    last = status.get("last_success_epoch")
+    success = status.get("last_success") or {}
+    running = bool(status.get("running"))
+    since = status.get("started_at")
+    progress = status.get("progress") or {}
+    done = ", ".join(f"{_num(progress[k])} {k}" for k in ("scanned", "backed_up") if progress.get(k) is not None)
+    if last is None:
+        if running and since:
+            ran = (now - int(since)) / 3600
+            status_word = "fail" if ran >= seed_fail_h else "warn"
+            return _row(key, status_word, "backup", label, "seeding", f"running {_hours(ran)}",
+                        f"first backup running {_hours(ran)}{'; ' + done if done else ''}; fail after "
+                        f"{_num(seed_fail_h / 24)} d{used}")
+        return _row(key, "fail", "backup", label, "none", "no success",
+                    f"no successful backup recorded{'; running' if running else ''}{used}")
+    row = _stamp(key, label, last, warn_h, fail_h, now, "no backup")
+    detail = f"{row.detail}; {_num(success.get('considered') or 0)} files considered"
+    status_word = row.status
+    # Coverage: nothing may miss the backup unnoticed (owner, 15 Nov 2026).
+    audit = status.get("coverage") or {}
+    gaps = []
+    if audit.get("unplaced"):
+        gaps.append("not placed: " + ", ".join(str(v) for v in audit["unplaced"]))
+    if audit.get("unexplained_masks"):
+        gaps.append("masks without a reason: " + ", ".join(str(v) for v in audit["unexplained_masks"]))
+    missing = [s.get("name") for s in status.get("sources") or [] if s.get("missing") and not s.get("waiting")]
+    if missing:
+        gaps.append("sources missing: " + ", ".join(str(v) for v in missing))
+    if audit.get("gap") is not None and float(audit["gap"]) > float(cfg.get("idrive_gap_warn", 0.005)):
+        gaps.append(f"{_num(float(audit['gap']) * 100)}% of files on disk not considered")
+    if gaps:
+        status_word = _worse(status_word, "warn")
+        detail += "; " + "; ".join(gaps)
+    if success.get("failed"):
+        status_word = _worse(status_word, "warn")
+        detail += f"; {_num(success['failed'])} failed"
+    if running and since:
+        detail += f"; next run going {_hours((now - int(since)) / 3600)}{' (' + done + ')' if done else ''}"
+        if status_word == "fail" and now - int(since) < seed_fail_h:
+            status_word = "warn"   # a long run is under way; the stale success is not the last word
+    return _row(key, status_word, "backup", label, row.value, row.datum, detail + used)
+
+
+def _home_mirror(name, status, cfg, now):
+    """A laptop's copy of its home on the hub. A laptop away from home for a few days is normal:
+    amber at two days, red at a week; the reason a pass was skipped is in the detail."""
+    key, label = f"backup:{name}:home-mirror", f"{name} home-mirror"
+    warn_h = float(cfg.get("home_mirror_warn_h", 48))
+    fail_h = float(cfg.get("home_mirror_fail_h", 168))
+    state = str(status.get("state") or "")
+    last = status.get("last_success_epoch")
+    if last is None:
+        word = "fail" if state.startswith("failed") else "warn"
+        return _row(key, word, "backup", label, "none", "no copy yet", f"no complete copy on the hub yet; {state or 'not run'}")
+    row = _stamp(key, label, last, warn_h, fail_h, now, "no copy")
+    word = row.status
+    if state.startswith("failed"):
+        word = _worse(word, "warn")
+    detail = f"{row.detail}; last pass: {state or 'unknown'}"
+    if status.get("files") is not None:
+        detail += f"; {_num(status['files'])} files sent"
+    return _row(key, word, "backup", label, row.value, row.datum, detail)
+
+
+def _age_row(key, area, name, payload, field, warn_h, fail_h, now, missing):
+    if not payload or payload.get(field) is None:
+        return _row(key, "fail", area, name, "none", missing, missing)
+    return _stamp(key, name, payload.get(field), warn_h, fail_h, now, missing)
+
+
+def _stamp(key, name, epoch, warn_h, fail_h, now, missing):
+    if epoch is None:
+        return _row(key, "fail", "backup", name, "none", missing, missing)
+    age = (now - int(epoch)) / 3600
+    if age >= float(fail_h):
+        status = "fail"
+        datum = f"floor {_num(fail_h)} h"
+    elif age >= float(warn_h):
+        status = "warn"
+        datum = f"floor {_num(warn_h)} h"
+    else:
+        status = "pass"
+        datum = f"floor {_num(warn_h)} h"
+    detail = f"age {_hours(age)}; warn {_num(warn_h)} h; fail {_num(fail_h)} h"
+    return _row(key, status, "backup", name, _hours(age), datum, detail)
+
+
+def _runs(runs):
+    if isinstance(runs, bool) or runs is None or runs == "":
+        return 0
+    try:
+        return int(runs)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _missed(when, last, now, grace_h, tz, runs=None):
+    text = (when or "").strip()
+    interval = re.fullmatch(r"every (\d+)([hms])", text)
+    if interval:
+        count = int(interval.group(1))
+        mult = {"h": 3600, "m": 60, "s": 1}[interval.group(2)]
+        limit = 2 * count * mult
+        # launchctl's run count is the scheduler. A quiet log is not a missed
+        # interval when the job has actually been started and last exited 0.
+        if _runs(runs) > 0:
+            return False, text
+        if last is None:
+            return (_runs(runs) == 0 and runs is not None), text
+        late = now - int(last) > limit
+        return late, text
+    daily = re.fullmatch(r"daily (\d{2}):(\d{2})", text)
+    if daily and last is not None:
+        hour, minute = int(daily.group(1)), int(daily.group(2))
+        current = datetime.fromtimestamp(now, tz)
+        slot = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        slot_s = int(slot.timestamp())
+        if now < slot_s + grace_h * 3600:
+            return False, text
+        # launchd keeps the time zone the Mac booted in, so after travel a daily job fires
+        # hours off its wall-clock slot. It has still run today if it ran within a day.
+        if now - int(last) < (24 + grace_h) * 3600:
+            return False, text
+        return int(last) < slot_s, text
+    return False, text
+
+
+def _hot_hours(samples, now, hot_c, gap_s):
+    rows = sorted(samples or [], key=lambda sample: int(sample.get("t") or 0))
+    total = 0
+    for index, sample in enumerate(rows):
+        if not _hot(sample, hot_c):
+            continue
+        if index + 1 < len(rows):
+            gap = int(rows[index + 1].get("t") or 0) - int(sample.get("t") or 0)
+        else:
+            gap = now - int(sample.get("t") or 0)
+        if gap > 0:
+            total += min(gap, gap_s)
+    return total / 3600
+
+
+def _hot(sample, hot_c):
+    thermal = sample.get("thermal")
+    if thermal not in (None, "", "nominal", "ok"):
+        return True
+    if hot_c is None:
+        return False
+    chip = sample.get("chipC")
+    return isinstance(chip, (int, float)) and not isinstance(chip, bool) and chip >= hot_c
+
+
+def _claim_expired(claim, now):
+    heartbeat = int(claim.get("heartbeat") or 0)
+    ttl = int(claim.get("ttl") or 0)
+    expires = claim.get("expires")
+    if expires is not None:
+        return now >= int(expires)
+    return bool(ttl) and now > heartbeat + ttl
+
+
+def _floor(disk_cfg, host, drive):
+    floors = (disk_cfg.get("floors") or {}).get(host) or {}
+    if drive in floors:
+        return float(floors[drive])
+    return float(disk_cfg.get("floor_gb", 40))
+
+
+def _target(targets, host, drive):
+    """This Mac's own free-space lines. They are written for the internal disk."""
+    row = (targets or {}).get(host) if drive == "internal" else None
+    if not isinstance(row, dict):
+        return None
+    try:
+        return {"target_gb": float(row["target_gb"]), "floor_gb": float(row["floor_gb"])}
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _retired(job, label, host, registry):
+    """A row left over from an out-of-date host record: no plist on that Mac, and the registry
+    does not place the job there. Without the registry list nothing is called retired."""
+    if registry is None:
+        return False
+    seen = job.get("plist")
+    if seen is None:   # snapshots from before the flag: the probe's fields mark a plist it read
+        seen = "runs" in job or "state" in job
+    if seen:
+        return False
+    homes = registry.get(label) or []
+    return not ("all" in homes or host in homes)
+
+
+def _on_utc(job):
+    """True when the job runs through the utc-daily wrapper, so its `when` is a UTC time."""
+    if job.get("utc"):
+        return True
+    words = str(job.get("cmd") or "").split()
+    return "--at" in words and any(word.rsplit("/", 1)[-1] == "utc-daily" for word in words[:3])
+
+
+def _bad_exit(code):
+    return code not in (None, "", "-", "0", 0)
+
+
+def _short_label(label, prefixes=("com.example.",)):
+    for prefix in prefixes:
+        if label.startswith(prefix):
+            return label[len(prefix):]
+    return label.split(".")[-1]
+
+
+def _since(stamp, now, tz):
+    if not stamp:
+        return "no contact"
+    moment = datetime.fromtimestamp(int(stamp), tz)
+    current = datetime.fromtimestamp(now, tz)
+    if moment.date() == current.date():
+        return f"since {moment:%H:%M}"
+    return f"since {moment.day} {MONTHS[moment.month - 1]}"
+
+
+def _resets(stamp, now, tz):
+    if not stamp:
+        return "no reset"
+    moment = datetime.fromtimestamp(int(stamp), tz)
+    current = datetime.fromtimestamp(now, tz)
+    clock = f"{moment:%H:%M}"
+    if moment.date() == current.date():
+        return f"resets {clock}"
+    return f"resets {moment.day} {MONTHS[moment.month - 1]}"
+
+
+def _row(key, status, area, name, value, datum, detail, away=False):
+    symbol = "?" if away or status == "info" else {"pass": "*", "warn": "~", "fail": "!"}[status]
+    return Finding(key, status, area, name, str(value), str(datum), str(detail), symbol)
+
+
+def _worse(left, right):
+    return left if RANK[left] >= RANK[right] else right
+
+
+def _gb(value):
+    return f"{_num(value)} GB"
+
+
+def _signed_gb(value):
+    number = _num(abs(value))
+    sign = "-" if value < 0 else "+" if value > 0 else ""
+    return f"{sign}{number} GB"
+
+
+def _hours(value):
+    return f"{_num(value)} h"
+
+
+def _pct(value):
+    return f"{_num(value)}%"
+
+
+def _num(value):
+    number = float(value)
+    if abs(number - round(number)) < 0.05:
+        return str(int(round(number)))
+    return f"{number:.1f}"
+
+
+def _int(value):
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _zone(name):
+    if name == "local":
+        # launchd fires calendar jobs in the Mac's own zone, so that is the zone to judge them in.
+        return datetime.now().astimezone().tzinfo
+    if not name or name == "UTC":
+        return timezone.utc
+    if ZoneInfo is None:
+        return timezone.utc
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        return timezone.utc

@@ -67,7 +67,7 @@ Nothing in this layer replaces the owner’s project-specific hooks; fleet-tools
 | **machine-log** | Bash + Python; minute JSONL samples combining Glancebar, heavy-slot status, top processes. Script only. `diskFreeGB` is the free-space series diskmap uses for rates. |
 | **diskmap** | Rust in this repo. Per-volume directory map (sizes, FSEvents, 30-day hot history), iCloud and IDrive as locations, archive on the encrypted volume. Writes `~/.local/state/diskmap/summary.json` for Glancebar and fleet-health. Not a separate report. |
 | **machine-report** | Python; aggregates logs and `jobs.jsonl` over SSH. Script only. |
-| **fleet morning** | Python package `fleet/morning` (3.11+, `tomllib`), command `design/bin/fleet morning`. Each Mac writes `~/.local/state/mac-sync/fleet-snapshots/<host>.json`; the digest reads that directory plus this Mac. No SSH. Writes `~/.local/state/fleet/morning/summary.json`. Does not repair anything. See `docs/morning.md` (not yet published). |
+| **fleet morning** | Python package `fleet/morning` (3.11+, `tomllib`), command `bin/fleet morning`. Each Mac writes `~/.local/state/mac-sync/fleet-snapshots/<host>.json`; the digest reads that directory plus this Mac. No SSH. Writes `~/.local/state/fleet/morning/summary.json`. Does not repair anything. See [morning.md](morning.md). |
 | **link-meter** | Bash; creates `~/.local/state/METERED_LINK` on metered carriers. Script only. |
 
 Glancebar “other machines” rows SSH to each configured host, run `Glancebar --sample`, read `heavy-slot` mode/status — documented in Glancebar’s repo; fleet-tools depends on that contract, not on a private defaults domain name.
