@@ -115,6 +115,16 @@ class Runs(unittest.TestCase):
         self.assertIsNone(M.parse_workers(""))
 
 
+class Held(unittest.TestCase):
+    def test_a_success_holds_the_sources_of_its_own_start_only(self):
+        start = {"at": 1000, "sources": ["A", "B"]}
+        self.assertEqual(M.holds({}, {"epoch": 1004}, start), {"A": 1004, "B": 1004})
+        self.assertEqual(M.holds({"A": 5}, None, start), {"A": 5})
+        later = {"at": 9000, "sources": ["A", "B", "New"]}
+        self.assertEqual(M.holds({"A": 1004}, {"epoch": 1004}, later), {"A": 1004},
+                         "an older success says nothing about a source added since")
+
+
 class Due(unittest.TestCase):
     NOW = 1_800_000_000
 

@@ -447,7 +447,10 @@ fn verified_offsite(unit: &Unit, obs: &Observation) -> bool {
         .any(|r| replica_matches(unit, r) && r.verified && r.offsite && r.bytes > 0)
 }
 
-fn replica_matches(unit: &Unit, replica: &Replica) -> bool {
+pub fn replica_matches(unit: &Unit, replica: &Replica) -> bool {
+    if replica.except.iter().any(|e| path_covers(e, &unit.path)) {
+        return false;
+    }
     path_covers(&unit.path, &replica.path)
         || path_covers(&replica.path, &unit.path)
         || replica.path == unit.label

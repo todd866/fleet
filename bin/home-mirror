@@ -133,6 +133,63 @@ def stats(text):
     return out
 
 
+def excepted(patterns):
+    """Home-relative folders the copy leaves out: the anchored, wildcard-free excludes."""
+    out = []
+    for p in patterns:
+        if p.startswith("/") and not WILD.search(p):
+            rel = p.strip("/")
+            if rel:
+                out.append(rel)
+    return sorted(set(out))
+
+
+def replica_rows(cfg, status, entries, held_at=None):
+    """Rows for placement (replicas.d/home-mirror.json): one per top-level home entry the last
+    good pass copied. `encrypted` says the copy sits in an encrypted image (config `encrypted`);
+    `verified` means rsync finished without error, which checks each file it moved. A second row
+    per entry is off-site once the hub's backup has held the copy's source since that pass."""
+    first = status.get("first_success_epoch")
+    if not status.get("last_success_epoch") or not status.get("total_bytes"):
+        return []
+    skip = set(excepted(cfg["exclude"]))
+    rows = []
+    for name in sorted(entries):
+        if name.startswith(".") or name in skip:
+            continue
+        inner = [e for e in skip if e.startswith(name + "/")]
+        base = {"path": name, "bytes": status["total_bytes"], "verified": True, "except": inner,
+                "pass": status["last_success_epoch"]}
+        rows.append(dict(base, volume=cfg.get("volume") or cfg["hub"], encrypted=bool(cfg.get("encrypted"))))
+        if held_at and first and held_at >= first:
+            rows.append(dict(base, volume=cfg["offsite"].get("name", "offsite"), encrypted=True,
+                             offsite=True, held_at=held_at))
+    return rows
+
+
+def offsite_held_at(cfg, run=subprocess.run):
+    """When the hub's backup last succeeded with the source holding this copy, or None."""
+    off = cfg.get("offsite") or {}
+    if not off.get("status") or not off.get("source"):
+        return None
+    try:
+        done = run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", cfg["hub"],
+                    f"cat {off['status']}"], capture_output=True, text=True, timeout=60)
+        held = json.loads(done.stdout).get("held") or {}
+    except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
+        return None
+    return held.get(off["source"])
+
+
+def write_replicas(rows):
+    target = pathlib.Path(os.environ.get("HOME_MIRROR_REPLICAS",
+                                         HOME / ".local/state/placement/replicas.d/home-mirror.json"))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps({"copies": rows}, indent=1) + "\n")
+    os.replace(tmp, target)
+
+
 def write_status(status):
     STATE.mkdir(parents=True, exist_ok=True)
     tmp = STATE / "status.json.tmp"
@@ -196,6 +253,7 @@ def run_once(cfg, force=False, dry=False):
     # 24: some files vanished while copying (a live home): the pass still counts.
     if done.returncode in (0, 24) and not dry:
         status.update(state="ok", last_success_epoch=now)
+        status.setdefault("first_success_epoch", now)
     else:
         status["state"] = "dry run" if dry else f"failed: rsync exit {done.returncode} (see rsync.log)"
     return status
@@ -243,9 +301,13 @@ def main(argv=None):
         path = STATE / "status.json"
         print(path.read_text() if path.exists() else "no status yet")
         return 0
-    status = run_once(load_config(), force=args.force, dry=args.dry_run)
+    cfg = load_config()
+    status = run_once(cfg, force=args.force, dry=args.dry_run)
     if not args.dry_run:
         write_status(status)
+        if status.get("last_success_epoch"):
+            held = offsite_held_at(cfg)
+            write_replicas(replica_rows(cfg, status, os.listdir(HOME), held))
     print(json.dumps(status, indent=1))
     return 0 if not str(status.get("state", "")).startswith("failed") else 1
 

@@ -65,6 +65,16 @@ exclude in `~/.config/fleet/home-mirror.json` carries a reason, cloud placeholde
 (reading one makes the cloud download it), and replaced files are kept beside the copy. The
 morning check shows `backup:<laptop>:home-mirror`: amber after two days away, red after a week.
 
+## Telling placement what is held
+
+`status.json` keeps `held`: for each source, when the newest successful run that included it
+finished. After each good pass home-mirror writes `~/.local/state/placement/replicas.d/home-mirror.json`
+on the laptop: one row per top-level home folder (encrypted when the copy sits in an encrypted
+image, with the folder's excludes listed as `except`), and a second, off-site row once `held`
+for its source (`offsite.source` in its config) is later than its first pass. `placement status`
+reads every file in `replicas.d/` beside `replicas.json`, so its copy and off-site checks report
+what really exists.
+
 ## Coverage: nothing misses the backup unnoticed
 
 Every 6 hours the tick lists the volumes the VM can see. Each must be a source, inside one, or a

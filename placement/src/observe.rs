@@ -76,21 +76,45 @@ pub fn load_observation(diskmap_dir: &Path, replicas: Option<&Path>, now: i64) -
         }
     }
     if let Some(path) = replicas {
-        if let Ok(text) = fs::read_to_string(path) {
-            if let Ok(file) = serde_json::from_str::<ReplicaFile>(&text) {
-                obs.replicas
-                    .extend(file.copies.into_iter().map(|c| Replica {
-                        path: c.path,
-                        volume: c.volume,
-                        encrypted: c.encrypted,
-                        verified: c.verified,
-                        offsite: c.offsite,
-                        bytes: c.bytes,
-                    }));
+        // replicas.json (placement's own copies) plus replicas.d/*.json, one file per job that
+        // makes copies (a home mirror, an off-site backup), each rewritten whole by its job.
+        let mut files = vec![path.to_path_buf()];
+        if let Some(dir) = path.parent().map(|p| p.join("replicas.d")) {
+            if let Ok(entries) = fs::read_dir(&dir) {
+                let mut more: Vec<_> = entries
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|p| p.extension().is_some_and(|x| x == "json"))
+                    .collect();
+                more.sort();
+                files.extend(more);
             }
+        }
+        for file in files {
+            obs.replicas.extend(read_replica_file(&file));
         }
     }
     obs
+}
+
+fn read_replica_file(path: &Path) -> Vec<Replica> {
+    let Ok(text) = fs::read_to_string(path) else {
+        return vec![];
+    };
+    let Ok(file) = serde_json::from_str::<ReplicaFile>(&text) else {
+        return vec![];
+    };
+    file.copies
+        .into_iter()
+        .map(|c| Replica {
+            path: c.path,
+            volume: c.volume,
+            encrypted: c.encrypted,
+            verified: c.verified,
+            offsite: c.offsite,
+            bytes: c.bytes,
+            except: c.except,
+        })
+        .collect()
 }
 
 #[derive(Deserialize)]
@@ -157,4 +181,6 @@ struct ReplicaRow {
     offsite: bool,
     #[serde(default)]
     bytes: u64,
+    #[serde(default)]
+    except: Vec<String>,
 }

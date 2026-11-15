@@ -236,6 +236,18 @@ def parse_workers(text):
     return {"sent_bytes": done, "total_bytes": total, "percent": round(100.0 * done / total, 2)}
 
 
+def holds(held, success, last_start):
+    """Source name -> epoch of the newest successful run that included it: what IDrive holds.
+    Read by other jobs (home-mirror's off-site row for placement). A success counts for the
+    sources of the start this tool made for it, never for sources added later."""
+    held = dict(held or {})
+    at = int(last_start.get("at") or 0)
+    if success and at and at - 120 <= success["epoch"]:
+        for name in last_start.get("sources") or []:
+            held[name] = max(int(held.get(name) or 0), success["epoch"])
+    return held
+
+
 def due(now, success, every_h, spec, last_start, started_recently):
     """Start a backup now? When none has succeeded, the last success is old, or the sources changed."""
     if started_recently:
@@ -392,6 +404,7 @@ def tick(cfg, dry=False):
     success = next((r for r in history if r["status"] == "Success"), None)
     started_at = previous.get("started_at")
     last_start = previous.get("last_start") or {}
+    held = holds(previous.get("held"), success, last_start)
     if running:
         started_at = now - age
         _rc, size, _e = exec_(cfg, f"stat -c %s {LOGFILE} 2>/dev/null")
@@ -455,6 +468,7 @@ def tick(cfg, dry=False):
         "last_success_epoch": success["epoch"] if success else None,
         "last_success": success,
         "last_start": last_start,
+        "held": held,
         "spec": have_spec,
         "mounted": mounted,
         "sources": [{k: s[k] for k in ("name", "masks", "waiting", "missing")} for s in sources],

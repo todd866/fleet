@@ -347,6 +347,8 @@ pub struct Replica {
     pub verified: bool,
     pub offsite: bool,
     pub bytes: u64,
+    /// Paths under `path` this copy leaves out (a mirror's excludes): units there do not match.
+    pub except: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

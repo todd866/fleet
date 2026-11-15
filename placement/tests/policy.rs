@@ -333,6 +333,7 @@ fn replica(
         verified,
         offsite,
         bytes,
+        except: vec![],
     }
 }
 
@@ -970,6 +971,37 @@ fn diskmap_documents_supply_free_space_and_access_without_a_walk() {
     assert_eq!(seen.frees[0].free_bytes, 120_000_000_000);
     assert_eq!(seen.present[0].path, "Games/Demo");
     assert_eq!(seen.access[0].last_access, NOW - DAY);
+}
+
+#[test]
+fn jobs_report_copies_in_replicas_d_and_a_mirrors_excludes_do_not_count() {
+    let tmp = Tmp::new();
+    fs::create_dir_all(tmp.path().join("replicas.d")).unwrap();
+    fs::write(
+        tmp.path().join("replicas.d/home-mirror.json"),
+        r#"{"copies":[{"path":"Projects","volume":"Home","encrypted":true,"verified":true,"bytes":9,"except":["Projects/Big"]}]}"#,
+    )
+    .unwrap();
+    let seen = load_observation(tmp.path(), Some(&tmp.path().join("replicas.json")), NOW);
+    assert_eq!(seen.replicas.len(), 1, "replicas.json may be absent");
+    let mut ds = Dataset {
+        name: "Work".into(),
+        paths: vec!["Projects/app".into()],
+        ..Dataset::default()
+    };
+    let policy = Policy {
+        datasets: vec![ds.clone()],
+        ..Policy::default()
+    };
+    let unit = &expand_units(&policy, &seen)[0];
+    assert_eq!(verified_encrypted_copies(unit, &seen), 1);
+    ds.paths = vec!["Projects/Big/raw".into()];
+    let policy = Policy {
+        datasets: vec![ds],
+        ..Policy::default()
+    };
+    let unit = &expand_units(&policy, &seen)[0];
+    assert_eq!(verified_encrypted_copies(unit, &seen), 0);
 }
 
 #[test]

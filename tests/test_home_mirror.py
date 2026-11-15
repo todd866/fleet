@@ -57,6 +57,29 @@ class Rsync(unittest.TestCase):
         self.assertEqual(M.stats(text), {"files": 1234, "bytes": 5000})
 
 
+class Replicas(unittest.TestCase):
+    CFG = {"hub": "hub", "volume": "Home", "encrypted": True,
+           "offsite": {"name": "cloud", "status": "s.json", "source": "Home"},
+           "exclude": ["/Library/Caches/", "/Projects/Big/", "/Games/ROMs/", "node_modules/", "/x/*-tmp/"]}
+
+    def test_rows_skip_hidden_and_excluded_entries_and_carry_inner_excludes(self):
+        st = {"last_success_epoch": 200, "first_success_epoch": 100, "total_bytes": 9}
+        rows = M.replica_rows(self.CFG, st, ["Projects", ".ssh", "Library", "Music"])
+        self.assertEqual([r["path"] for r in rows], ["Library", "Music", "Projects"])
+        proj = rows[2]
+        self.assertEqual(proj["except"], ["Projects/Big"])
+        self.assertTrue(proj["encrypted"] and proj["verified"] and not proj.get("offsite"))
+
+    def test_offsite_only_once_the_backup_held_the_copy_after_the_first_pass(self):
+        st = {"last_success_epoch": 200, "first_success_epoch": 100, "total_bytes": 9}
+        self.assertFalse(any(r.get("offsite") for r in M.replica_rows(self.CFG, st, ["Music"], held_at=50)))
+        rows = M.replica_rows(self.CFG, st, ["Music"], held_at=150)
+        self.assertEqual([(r["volume"], bool(r.get("offsite"))) for r in rows], [("Home", False), ("cloud", True)])
+
+    def test_no_rows_before_a_good_pass(self):
+        self.assertEqual(M.replica_rows(self.CFG, {"total_bytes": 9}, ["Music"]), [])
+
+
 class HubAttach(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
