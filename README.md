@@ -1,6 +1,8 @@
 # Fleet
 
-Rust tools and docs for running several AI coding agents across several Macs without them fighting over thermals, slots, or subscription quota. Host names, drive layouts, and limits live in `~/.config/<tool>/`, not in this repository.
+The working setup of one person learning and building in something as complex as medicine, made so that someone else can copy it: several Macs and AI coding agents that share the machines without fighting over heat, slots or quota; guards and tripwires so agents can work without prompts; data placed once and backed up off-site once; a morning check that says what broke; and the learning, media and instrument apps that run on top. [docs/stack.md](docs/stack.md) maps every layer and how far each has got.
+
+Host names, drive layouts and limits live in `~/.config/<tool>/`, not in this repository.
 
 **License:** MIT (see [LICENSE](LICENSE)).
 
@@ -17,10 +19,12 @@ Rust tools and docs for running several AI coding agents across several Macs wit
 | [utc-daily](bin/utc-daily), [utc-schedule](bin/utc-schedule) | Daily launchd jobs on a UTC schedule: launchd's calendar is local time in the zone the Mac booted in, so a laptop that travels fires jobs hours off. `utc-schedule` converts existing plists. |
 | [git-stale-locks](bin/git-stale-locks) | Moves git lock files that no git process can still own (left by a restart or a killed agent) to the Trash, so the next agent is not blocked by `index.lock`. |
 | [cowork](docs/cowork.md) | Work claims, leases, and board JSON for multi-agent coordination. |
+| [tripwire](bin/tripwire) | Watches login keys, startup files, launchd jobs, listeners and accounts; pauses what changed, reversibly, and starts an agent to find out why ([docs](docs/tripwire.md)). |
+| [idrive-ingest](bin/idrive-ingest) | Off-site backup of a Mac's drives and home through IDrive's Linux client in a small VM: one copy of each thing, daily, reported to the morning check ([docs](docs/idrive-ingest.md)). |
 
 Bash originals under `spec/` are the behavioural spec for heavy-slot and agent-mail while you validate Rust drop-ins.
 
-**Not in this tree (yet):** `remote-run`, `offload-target`, `ai-capacity`, Glancebar integration scripts, and fleet-morning digests. See [docs/architecture.md](docs/architecture.md) for the full layer map and gaps.
+**Not in this tree (yet):** `remote-run`, `offload-target`, `ai-capacity`, the fleet morning check (in daily use; published once its site values are in config), and the one-step "join a new Mac" restore. See [docs/architecture.md](docs/architecture.md) for the full layer map and gaps.
 
 **Tested where:** every push runs `cargo test --workspace` on a GitHub macOS runner ([![ci](https://github.com/todd866/fleet/actions/workflows/ci.yml/badge.svg)](https://github.com/todd866/fleet/actions/workflows/ci.yml)), and the author's Macs run the same tests plus the Python tests of the private tree. Multi-machine behaviour is integration-tested with fixture hosts and fake SSH; treat first install on your own fleet as production validation.
 
@@ -101,14 +105,17 @@ SSH host aliases for relay and remote work: `~/.ssh/config` plus `~/.config/remo
 
 ## The rest of the setup
 
-Fleet is the Rust-and-docs core for multi-Mac agent work. These companion projects share menubar UX, telemetry, and ops patterns; install what matches your fleet.
+Fleet is the core. These projects run on the same machines, share the slots, drives and backup, and report into the same morning check. Install what you need.
 
 | Project | Role |
 | --- | --- |
-| [Glancebar](https://github.com/todd866/glancebar) | Menu-bar machine vitals and fleet rows. `heavy-slot`'s cool gate reads Glancebar thermal/`chipC`; Glancebar fleet rows read heavy-slot and diskmap summary state; a morning digest can surface as a Glancebar row. |
-| [Energybar](https://github.com/todd866/energybar) | Same instrument-style menubar for home energy (solar, EV charger). Uses the shared morning-check pattern with Glancebar; not required to run Fleet scheduling or agent-mail. |
-
-More of the stack (offload to a worker Mac, capacity-aware engine picking, the morning digest) is in use on the author's Macs and will be added here as each piece is made config-driven.
+| [Cohort](https://github.com/todd866/cohort) | Open-source spaced repetition for medicine, scheduled over an embedding of concepts. |
+| [anki-harness](https://github.com/todd866/anki-harness) | Scripted scenarios run inside a real Anki, across released versions. |
+| [Carousel](https://github.com/todd866/carousel), [DeckKit](https://github.com/todd866/DeckKit) | Teaching decks an agent can write and revise. |
+| [Glancebar](https://github.com/todd866/glancebar) | Menu-bar vitals and fleet rows, and the music player: lossless hot set on the laptop, cold tier in the cloud, a new-music scout. heavy-slot's cool gate reads its thermal state. |
+| [Onto the TV](https://github.com/todd866/onto-the-tv) | Offline family shuffle and local-network TV playback from the home hub's media drives. |
+| [omnifeed](https://github.com/todd866/omnifeed) | Personal media library and headphone audio client. |
+| [Energybar](https://github.com/todd866/energybar), [Isobar](https://github.com/todd866/isobar) | Home energy and weather/aviation instruments in the same style. |
 
 ## Contributing
 

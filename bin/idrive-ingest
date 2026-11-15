@@ -1,0 +1,471 @@
+#!/usr/bin/env python3
+"""idrive-ingest: back up a Mac's drives and home to IDrive through IDrive's Linux client.
+
+IDrive's macOS app cannot select external volumes and is heavy on the Mac it runs on. Its
+headless Linux client can back up any path, so it runs in a container in a small Lima VM on the
+Mac that holds the data. Every source is mounted READ-ONLY at /backup/<name>; the client's backup
+set is the single line /backup. Folders that would be second copies (a disk image whose mounted
+volume is also a source, caches, the VM's own disk) are blanked with an empty tmpfs.
+
+  idrive-ingest tick [--dry-run]   keep VM and container up; back up once a day; write status.json
+  idrive-ingest plan               the sources and masks this Mac would use now
+  idrive-ingest status             status.json, summarised
+  idrive-ingest build              build the client image in the VM (fetches the installer)
+  idrive-ingest login              the owner signs in to IDrive inside the container (interactive)
+  idrive-ingest import-login DIR   copy an existing client config (a signed-in idriveIt folder) in
+
+Config: ~/.config/fleet/idrive-ingest.json (every key optional except sources):
+  {"vm": "idrive-ingest", "image": "idrive-ingest:latest", "every_h": 24, "count_from": 0,
+   "vm_mounts": ["/Volumes", "~"],
+   "sources": [{"name": "Archive", "path": "/Volumes/Archive",
+                "mask": ["Old.sparsebundle"], "after": "~/.local/state/migrate/done/verify"}],
+   "mask_everywhere": [".Spotlight-V100", ".fseventsd", ".Trashes", ".DocumentRevisions-V100"]}
+A source with `after` is left out until that file exists (a migration's done stamp, say), and one
+with `wait_for` while a process matching that pattern runs (pgrep -f), so a backup does not
+compete with a migration for the same disk. A change to the sources
+takes effect between runs, and counts as a reason to run again at once; a source marked
+`"priority": true` that becomes available stops a running backup so the next run includes it
+(files already uploaded are not sent again).
+
+State: ~/.local/state/idrive-ingest/ (status.json, tick.log, login-backup.tar). The client's own
+config (login, history) lives in the Docker volume `idrive-config` inside the VM; the tick copies
+it to login-backup.tar once a day so a lost VM is not a lost login. Never start a second client on
+the same IDrive device: two containers with one login collide.
+"""
+import argparse
+import hashlib
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import time
+
+HOME = pathlib.Path.home()
+CONFIG = pathlib.Path(os.environ.get("IDRIVE_INGEST_CONFIG", HOME / ".config/fleet/idrive-ingest.json"))
+STATE = pathlib.Path(os.environ.get("IDRIVE_INGEST_STATE", HOME / ".local/state/idrive-ingest"))
+NAME = "idrive-ingest"
+CLIENT = "/opt/IDriveForLinux"
+LOGFILE = f"{CLIENT}/idriveIt/manual-backup.log"
+LOG_MAX = 50 * 1024 * 1024   # the client redraws its progress screen; a multi-day run would fill the disk
+INSTALLER = "https://www.idrivedownloads.com/downloads/linux/download-for-linux/linux-bin/idriveforlinux.bin"
+DEFAULT_MASKS = [".Spotlight-V100", ".fseventsd", ".Trashes", ".DocumentRevisions-V100", ".TemporaryItems"]
+LOG_NAME = re.compile(r"^(\d{9,11})_([A-Za-z]+)_([A-Za-z]+)$")
+COUNTS = {
+    "considered": r"Files considered for backup\s*:\s*(\d+)",
+    "backed_up": r"Files backed up now\s*:\s*(\d+)",
+    "present": r"Files already present in your account\s*:\s*(\d+)",
+    "failed": r"Files failed to backup\s*:\s*(\d+)",
+}
+
+
+def load_config(path=CONFIG):
+    cfg = json.loads(pathlib.Path(path).read_text())
+    cfg.setdefault("vm", NAME)
+    cfg.setdefault("image", f"{NAME}:latest")
+    cfg.setdefault("every_h", 24)
+    cfg.setdefault("count_from", 0)
+    cfg.setdefault("vm_mounts", ["/Volumes", "~"])
+    cfg.setdefault("mask_everywhere", DEFAULT_MASKS)
+    cfg.setdefault("sources", [])
+    return cfg
+
+
+def env_for(cfg):
+    sock = HOME / f".lima/{cfg['vm']}/sock/docker.sock"
+    return dict(os.environ, PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+                DOCKER_HOST=f"unix://{sock}")
+
+
+def run(cfg, args, timeout=120, stdin=None):
+    try:
+        done = subprocess.run(args, capture_output=True, text=True, errors="replace", timeout=timeout,
+                              env=env_for(cfg), stdin=stdin)
+        return done.returncode, done.stdout, done.stderr
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 127, "", str(exc)
+
+
+def expand(path):
+    return str(pathlib.Path(os.path.expanduser(path)))
+
+
+def safe_name(name):
+    name = re.sub(r"[^A-Za-z0-9._ -]+", "-", str(name)).strip(" .-")
+    if not name:
+        raise ValueError("a source needs a name")
+    return name
+
+
+# ---------------------------------------------------------------- plan (pure, tested)
+
+def _openable(path):
+    return os.path.isdir(path) and os.access(path, os.R_OK | os.X_OK)
+
+
+def plan(cfg, isdir=_openable, busy=lambda pattern: False, exists=os.path.exists):
+    """Sources to mount now: [{name, path, masks, waiting}]. Pure apart from the two probes."""
+    out = []
+    for src in cfg.get("sources") or []:
+        path = expand(src["path"])
+        name = safe_name(src.get("name") or pathlib.Path(path).name)
+        entry = {"name": name, "path": path, "masks": [], "waiting": None, "missing": False}
+        if not isdir(path):
+            entry["missing"] = True
+        elif src.get("after") and not exists(expand(src["after"])):
+            entry["waiting"] = f"after {src['after']}"
+        elif src.get("wait_for") and busy(src["wait_for"]):
+            entry["waiting"] = src["wait_for"]
+        for mask in list(cfg.get("mask_everywhere") or []) + list(src.get("mask") or []):
+            rel = str(mask).strip("/")
+            # Only a folder the container can open can be blanked (docker resolves the mount
+            # point); an unreadable one (.Trashes) the client cannot read anyway.
+            if rel and ".." not in rel.split("/") and isdir(os.path.join(path, rel)):
+                entry["masks"].append(rel)
+        out.append(entry)
+    return out
+
+
+def container_args(cfg, sources):
+    """`docker run` arguments for the client container with these (active) sources."""
+    args = ["docker", "run", "-d", "--name", NAME, "--hostname", NAME, "--restart", "unless-stopped",
+            "-v", f"idrive-config:{CLIENT}/idriveIt", "-v", "idrive-cron:/var/spool/cron/crontabs"]
+    for src in sources:
+        target = f"/backup/{src['name']}"
+        args += ["-v", f"{src['path']}:{target}:ro"]
+        for mask in src["masks"]:
+            args += ["--mount", f"type=tmpfs,destination={target}/{mask},tmpfs-size=1m"]
+    spec = spec_hash(cfg, sources)
+    args += ["--label", f"fleet.idrive-ingest.spec={spec}", cfg["image"]]
+    return args, spec
+
+
+def spec_hash(cfg, sources):
+    body = json.dumps([cfg["image"], [(s["name"], s["path"], sorted(s["masks"])) for s in sources]])
+    return hashlib.sha256(body.encode()).hexdigest()[:16]
+
+
+def parse_runs(listing, read_log):
+    """Finished runs, newest first, from the LOGS listing; `read_log(name)` returns a log's text."""
+    rows = []
+    for name in listing:
+        found = LOG_NAME.match(name.strip())
+        if found:
+            rows.append({"epoch": int(found.group(1)), "status": found.group(2), "kind": found.group(3),
+                         "log": name.strip()})
+    rows.sort(key=lambda row: row["epoch"], reverse=True)
+    for row in rows[:3]:
+        text = read_log(row["log"]) or ""
+        for key, pattern in COUNTS.items():
+            hit = re.search(pattern, text)
+            if hit:
+                row[key] = int(hit.group(1))
+        size = re.search(r"Size of backed up files:\s*([^\]]+)\]", text)
+        if size:
+            row["size"] = size.group(1).strip()
+    for row in rows:
+        row.pop("log", None)
+    return rows
+
+
+def parse_progress(tail):
+    tail = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b[78]", "", tail or "").replace("\r", "\n")
+    out = {}
+    for label, key in (("Total Files Scanned", "scanned"), ("Files Backed Up", "backed_up"),
+                       ("Total Files", "total")):
+        hits = re.findall(label + r"\s*:\s*(\d+)", tail)
+        if hits:
+            out[key] = int(hits[-1])
+    pct = re.findall(r"(\d{1,3}(?:\.\d+)?)\s*%", tail)
+    if pct:
+        out["percent"] = float(pct[-1])
+    return out or None
+
+
+def due(now, success, every_h, spec, last_start, started_recently):
+    """Start a backup now? When none has succeeded, the last success is old, or the sources changed."""
+    if started_recently:
+        return False
+    if success is None:
+        return True
+    if now - success["epoch"] >= every_h * 3600:
+        return True
+    return bool(spec and last_start and last_start.get("spec") != spec)
+
+
+# ---------------------------------------------------------------- the VM and container
+
+def vm_status(cfg):
+    rc, out, _ = run(cfg, ["limactl", "list", "--json", cfg["vm"]], timeout=30)
+    if rc != 0:
+        return "missing", []
+    for line in out.splitlines():
+        try:
+            info = json.loads(line)
+        except ValueError:
+            continue
+        mounts = [m.get("location") for m in ((info.get("config") or {}).get("mounts") or [])]
+        return info.get("status") or "unknown", [expand(m) for m in mounts if m]
+    return "missing", []
+
+
+def container(cfg):
+    rc, out, _ = run(cfg, ["docker", "inspect", "-f",
+                           '{{.State.Running}} {{index .Config.Labels "fleet.idrive-ingest.spec"}}', NAME], timeout=30)
+    if rc != 0:
+        return None, None
+    parts = out.split()
+    return parts[0] == "true", (parts[1] if len(parts) > 1 and parts[1] != "<no value>" else None)
+
+
+def exec_(cfg, script, timeout=60):
+    return run(cfg, ["docker", "exec", NAME, "sh", "-c", script], timeout=timeout)
+
+
+def backup_age(cfg):
+    """Seconds the running backup has been going, or None."""
+    rc, out, _ = exec_(cfg, "for p in $(pgrep -f '^./idrive --backup'); do ps -o etimes= -p $p; done", 30)
+    ages = [int(x) for x in out.split() if x.isdigit()] if rc == 0 else []
+    return max(ages) if ages else None
+
+
+def runs(cfg):
+    base = f"{CLIENT}/idriveIt/user_profile/root/*@*/Backup/DefaultBackupSet/LOGS"
+    rc, out, _ = exec_(cfg, f"ls {base} 2>/dev/null")
+    if rc != 0:
+        return None
+    def read_log(name):
+        _rc, text, _ = exec_(cfg, f"tail -c 20000 {base}/{name}")
+        return text
+    return parse_runs(out.split(), read_log)
+
+
+def storage(cfg):
+    _rc, out, _ = exec_(cfg, f"cd {CLIENT}/bin && ./idrive --about", 90)
+    hit = re.search(r"Storage used:\s*([\d.]+)\s*GB of\s*([\d.]+)\s*GB", out or "")
+    return {"used_gb": float(hit.group(1)), "total_gb": float(hit.group(2))} if hit else None
+
+
+def ensure_vm(cfg, dry, actions, problems, idle):
+    status, mounts = vm_status(cfg)
+    wanted = [expand(m) for m in cfg["vm_mounts"]]
+    if status != "missing" and sorted(mounts) != sorted(wanted) and idle:
+        # New mounts need a stopped VM. Only between runs: stopping it ends a backup.
+        if dry:
+            actions.append(f"would remount VM: {wanted}")
+        else:
+            run(cfg, ["limactl", "stop", cfg["vm"]], timeout=300)
+            flags = ["--tty=false", "--mount-only=" + ",".join(wanted)]
+            rc, _o, err = run(cfg, ["limactl", "edit", cfg["vm"], *flags], timeout=300)
+            actions.append("remounted VM" if rc == 0 else f"VM remount failed: {err.strip()[-200:]}")
+            status, mounts = vm_status(cfg)
+    if status == "missing":
+        problems.append(f"VM {cfg['vm']} missing (see docs/idrive-ingest.md to create it)")
+        return False
+    if status != "Running":
+        if dry:
+            actions.append(f"would start VM ({status})")
+            return False
+        rc, _o, err = run(cfg, ["limactl", "start", "--tty=false", cfg["vm"]], timeout=600)
+        actions.append(f"started VM (was {status})" if rc == 0 else f"VM start failed: {err.strip()[-200:]}")
+        status, _m = vm_status(cfg)
+    if status != "Running":
+        problems.append(f"VM {status}")
+        return False
+    return True
+
+
+def busy(cfg):
+    def check(pattern):
+        try:
+            return subprocess.run(["pgrep", "-f", pattern], capture_output=True, timeout=10).returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            return True   # unknown: do not compete with it
+    return check
+
+
+def tick(cfg, dry=False):
+    now = int(time.time())
+    STATE.mkdir(parents=True, exist_ok=True)
+    status_path = STATE / "status.json"
+    try:
+        previous = json.loads(status_path.read_text())
+    except (OSError, ValueError):
+        previous = {}
+    actions, problems = [], []
+    running_before = bool(previous.get("running"))
+    vm_ok = ensure_vm(cfg, dry, actions, problems, idle=not running_before)
+    sources = plan(cfg, busy=busy(cfg))
+    active = [s for s in sources if not s["missing"] and not s["waiting"]]
+    args, spec = container_args(cfg, active)
+    is_running, have_spec = container(cfg) if vm_ok else (None, None)
+    age = backup_age(cfg) if is_running else None
+    running = age is not None
+    mounted = previous.get("mounted") or []
+    urgent = [s["name"] for s in active if s["name"] not in mounted and
+              any(c.get("priority") and safe_name(c.get("name") or "") == s["name"] for c in cfg["sources"])]
+    if running and have_spec != spec and urgent and not dry:
+        # A priority source has just become available: end this run so the next one includes it.
+        exec_(cfg, "pkill -INT -f '^./idrive --backup'; sleep 20; pkill -f '^./idrive --backup'", 60)
+        actions.append(f"stopped the run to add {', '.join(urgent)}")
+        age = backup_age(cfg)
+        running = age is not None
+    if vm_ok and not running and have_spec != spec:
+        # The sources changed (or the container is missing): recreate it between runs.
+        if dry:
+            actions.append("would recreate container")
+        else:
+            run(cfg, ["docker", "rm", "-f", NAME], timeout=120)
+            rc, _o, err = run(cfg, args, timeout=300)
+            actions.append("recreated container" if rc == 0 else f"container create failed: {err.strip()[-300:]}")
+            is_running, have_spec = container(cfg)
+            if rc == 0:
+                mounted = [s["name"] for s in active]
+    elif vm_ok and is_running is False:
+        if not dry:
+            run(cfg, ["docker", "start", NAME], timeout=120)
+            actions.append("started container")
+            is_running, have_spec = container(cfg)
+    if vm_ok and not is_running:
+        problems.append("container not running")
+    if is_running and have_spec == spec:
+        mounted = [s["name"] for s in active]
+    history = runs(cfg) if is_running else None
+    if is_running and history is None:
+        problems.append("no backup set (client not signed in?)")
+    history = [r for r in (history or []) if r["epoch"] >= int(cfg.get("count_from") or 0)]
+    last = history[0] if history else None
+    success = next((r for r in history if r["status"] == "Success"), None)
+    started_at = previous.get("started_at")
+    last_start = previous.get("last_start") or {}
+    if running:
+        started_at = now - age
+        _rc, size, _e = exec_(cfg, f"stat -c %s {LOGFILE} 2>/dev/null")
+        if size.strip().isdigit() and int(size) > LOG_MAX and previous.get("appending") and not dry:
+            exec_(cfg, f": > {LOGFILE}")
+            actions.append("trimmed progress log")
+    elif is_running and history is not None:
+        # Only a start this tool made blocks another for an hour (a run killed by a restart is not one).
+        recently = bool(last_start.get("at") and now - int(last_start["at"]) < 3600)
+        if due(now, success, float(cfg["every_h"]), have_spec, last_start, recently):
+            if dry:
+                actions.append("would start backup")
+            else:
+                exec_(cfg, f": > {LOGFILE}")
+                rc, _o, err = run(cfg, ["docker", "exec", "-d", NAME, "sh", "-c",
+                                        f'cd {CLIENT}/bin && script -qec "./idrive --backup" /dev/null >> {LOGFILE} 2>&1'])
+                if rc == 0:
+                    started_at, running = now, True
+                    last_start = {"at": now, "spec": have_spec, "sources": [s["name"] for s in active]}
+                    actions.append("started backup")
+                else:
+                    problems.append(f"backup start failed: {err.strip()[-200:]}")
+    progress = None
+    if running:
+        _rc, tail, _e = exec_(cfg, f"tail -c 4000 {LOGFILE} 2>/dev/null")
+        progress = parse_progress(tail)
+    if is_running and not dry and now - int(previous.get("login_backup_at") or 0) > 86400:
+        save_login(cfg)
+        previous["login_backup_at"] = now
+    status = {
+        "checked_at": now,
+        "host_vm": "Running" if vm_ok else "down",
+        "container": bool(is_running),
+        "running": running,
+        "started_at": started_at,
+        "appending": True if running else False,
+        "progress": progress,
+        "last": last,
+        "last_success_epoch": success["epoch"] if success else None,
+        "last_success": success,
+        "last_start": last_start,
+        "spec": have_spec,
+        "mounted": mounted,
+        "sources": [{k: s[k] for k in ("name", "masks", "waiting", "missing")} for s in sources],
+        "storage": storage(cfg) if is_running else previous.get("storage"),
+        "every_h": cfg["every_h"],
+        "count_from": cfg.get("count_from") or None,
+        "login_backup_at": previous.get("login_backup_at"),
+        "actions": actions,
+        "problems": problems,
+    }
+    if not dry:
+        tmp = status_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(status, indent=1) + "\n")
+        os.replace(tmp, status_path)
+    return status
+
+
+def save_login(cfg):
+    """The client's config (login, history) as a tar beside status.json, mode 600."""
+    target = STATE / "login-backup.tar"
+    tmp = target.with_suffix(".tar.tmp")
+    try:
+        with open(tmp, "wb") as handle:
+            os.chmod(tmp, 0o600)
+            done = subprocess.run(["docker", "cp", f"{NAME}:{CLIENT}/idriveIt", "-"], stdout=handle,
+                                  stderr=subprocess.DEVNULL, timeout=600, env=env_for(cfg))
+        if done.returncode == 0 and tmp.stat().st_size > 0:
+            os.replace(tmp, target)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def import_login(cfg, folder):
+    """Copy a signed-in client config folder into the idrive-config volume (VM must see the folder)."""
+    folder = expand(folder)
+    rc, _o, err = run(cfg, ["docker", "run", "--rm", "-v", "idrive-config:/dst", "-v", f"{folder}:/src:ro",
+                            "--entrypoint", "sh", cfg["image"], "-c", "cp -a /src/. /dst/ && ls /dst"], timeout=600)
+    print("imported" if rc == 0 else f"import failed: {err.strip()}")
+    return rc
+
+
+def build(cfg):
+    here = pathlib.Path(__file__).resolve().parent.parent / "idrive-ingest"
+    bin_path = STATE / "idriveforlinux.bin"
+    if not bin_path.exists():
+        subprocess.run(["curl", "-fL", "-o", str(bin_path), INSTALLER], check=True)
+    ctx = STATE / "build"
+    ctx.mkdir(parents=True, exist_ok=True)
+    (ctx / "Dockerfile").write_text((here / "Dockerfile").read_text())
+    os.link(bin_path, ctx / "idriveforlinux.bin") if not (ctx / "idriveforlinux.bin").exists() else None
+    return subprocess.run(["docker", "build", "-t", cfg["image"], str(ctx)], env=env_for(cfg)).returncode
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="idrive-ingest", description=__doc__.splitlines()[0])
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    t = sub.add_parser("tick")
+    t.add_argument("--dry-run", action="store_true")
+    sub.add_parser("plan")
+    sub.add_parser("status")
+    sub.add_parser("build")
+    sub.add_parser("login")
+    imp = sub.add_parser("import-login")
+    imp.add_argument("folder")
+    args = parser.parse_args(argv)
+    cfg = load_config()
+    if args.cmd == "tick":
+        status = tick(cfg, dry=args.dry_run)
+        print(json.dumps(status, indent=1))
+        return 1 if status["problems"] else 0
+    if args.cmd == "plan":
+        for src in plan(cfg, busy=busy(cfg)):
+            state = "missing" if src["missing"] else (f"waits: {src['waiting']}" if src["waiting"] else "on")
+            print(f"{state:28} /backup/{src['name']:24} <- {src['path']}  masks: {', '.join(src['masks']) or '-'}")
+        return 0
+    if args.cmd == "status":
+        print((STATE / "status.json").read_text() if (STATE / "status.json").exists() else "no status yet")
+        return 0
+    if args.cmd == "build":
+        return build(cfg)
+    if args.cmd == "login":
+        return subprocess.call(["docker", "exec", "-it", NAME, f"{CLIENT}/bin/idrive"], env=env_for(cfg))
+    if args.cmd == "import-login":
+        return import_login(cfg, args.folder)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

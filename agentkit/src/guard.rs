@@ -1612,7 +1612,15 @@ fn push_targets_gated_project(cmd: &str, cfg: &GuardConfig) -> bool {
     if cfg.push_gate_projects.is_empty() && cfg.push_gate_remotes.is_empty() {
         return false;
     }
-    let mut dirs = vec![cfg.cwd.clone()];
+    // Fail closed: the session's cwd always counts, with one exception. A lone, plain
+    // `[VAR=x ...] git -C <existing dir> push ...` (no separator, subshell, substitution,
+    // redirection or comment) provably runs the push in that directory, so that directory
+    // alone decides. Every other shape (a `cd` in a subshell, `cd -`, `--work-tree`, a second
+    // command) keeps the cwd in (security review, 15 Nov 2026).
+    let mut dirs = match lone_git_c_push_dir(cmd, cfg) {
+        Some(dir) => vec![dir],
+        None => vec![cfg.cwd.clone()],
+    };
     dirs.extend(git_option_paths(cmd, cfg));
     let mut check = Vec::new();
     for d in dirs {
@@ -1687,6 +1695,24 @@ fn git_option_paths(cmd: &str, cfg: &GuardConfig) -> Vec<PathBuf> {
         }
     }
     paths
+}
+
+/// The directory of a lone, plain `git -C <literal dir> push ...`, when `<dir>` exists.
+/// Anything else returns None, so the caller keeps the session cwd: a compound line
+/// (separators, subshells, substitution, redirection, comments, newlines), any environment
+/// prefix (GIT_DIR or GIT_WORK_TREE can move the repository behind the -C), any other git
+/// option before `push`, and any path the shell would rewrite or keep literal where the guard
+/// would not (`$`, `\`, glob characters, `~`).
+fn lone_git_c_push_dir(cmd: &str, cfg: &GuardConfig) -> Option<PathBuf> {
+    let line = cmd.trim();
+    if compiled(r"[|;&`(){}<>#\n\r$\\*?\[\]~]").is_match(line) {
+        return None;
+    }
+    let re = compiled(r#"^git\s+-C\s+(?:"([^"]+)"|'([^']+)'|([^\s"']+))\s+push\b"#);
+    let caps = re.captures(line)?;
+    let raw = caps.get(1).or_else(|| caps.get(2)).or_else(|| caps.get(3))?.as_str();
+    let dir = resolve_to_pathbuf(raw, cfg);
+    dir.is_dir().then_some(dir)
 }
 
 fn resolve_to_pathbuf(raw: &str, cfg: &GuardConfig) -> PathBuf {
@@ -2237,7 +2263,11 @@ pub fn self_test(cfg: &GuardConfig) -> Result<(), String> {
     if !allow_file.is_allow() {
         return Err("icloud blocked trash of one Desktop file".into());
     }
-    let allow_push = push("git push origin main", cfg);
+    // From a neutral directory: the doctor may be started inside a push-gated project, where a
+    // plain push correctly asks. This case checks the ungated rule, so it must not inherit cwd.
+    let mut ungated = cfg.clone();
+    ungated.cwd = PathBuf::from("/var/agentkit-self-test/ungated");
+    let allow_push = push("git push origin main", &ungated);
     if !allow_push.is_allow() {
         return Err(format!("push guard blocked plain git push outside gated projects ({})", allow_push.decision));
     }

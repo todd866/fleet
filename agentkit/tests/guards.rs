@@ -185,6 +185,40 @@ fn push_gate_by_remote_covers_every_clone_but_not_a_similar_name() {
     assert!(decide("push", &via_cd, &c).is_ask());
     c.cwd = gated_ssh.clone();
     assert!(decide("push", "AGENTKIT_PUSH_APPROVED=1 git push", &c).is_allow());
+    // `git -C <ungated repo> push` from inside a gated clone pushes the ungated repo: allowed.
+    let elsewhere = format!("git -C {} push", similar.display());
+    assert!(decide("push", &elsewhere, &c).is_allow(), "the -C repo decides, not the session's cwd");
+    // ...but a lowercase -c (config) or a directory that does not exist names no repository,
+    // so the session's gated cwd still applies.
+    assert!(decide("push", "git -c push.default=current push", &c).is_ask());
+    assert!(decide("push", "git -C /nonexistent/agentkit-repo push", &c).is_ask());
+    // A directory change that does not reach the push never replaces the gated cwd
+    // (security review, 15 Nov 2026): a subshell, `cd -`, a comment, a second command.
+    let sim = similar.display().to_string();
+    for sneaky in [
+        format!("(cd {sim}) && git push"),
+        format!("cd {sim} && cd - && git push"),
+        format!("cd {sim} # && git push\ngit push"),
+        format!("git -C {sim} status; git push"),
+        format!("git --work-tree {sim} push"),
+        format!("cd {sim} && git push"),
+        // An environment prefix can move the repository (GIT_DIR) behind the -C's back, and a
+        // non-literal path is judged on its text, not on what the shell expands it to.
+        format!("GIT_DIR=/elsewhere/.git git -C {sim} push"),
+        format!("FOO=1 git -C {sim} push"),
+        "git -C \"$HOME\" push".to_string(),
+        "git -C $PWD push".to_string(),
+        format!("git -C {sim}* push"),
+        format!("git -C {sim}\\ push"),
+        // Quoted, the shell keeps `~` literal while the guard would expand it: never trust it.
+        "git -C \"~/x\" push".to_string(),
+        "git -C ~ push".to_string(),
+    ] {
+        assert!(decide("push", &sneaky, &c).is_ask(), "{sneaky}");
+    }
+    // And -C into a gated repo from an ungated cwd still asks.
+    c.cwd = similar.clone();
+    assert!(decide("push", &format!("git -C {} push", gated_https.display()), &c).is_ask());
     let _ = fs::remove_dir_all(&base);
 }
 
@@ -438,6 +472,22 @@ fn test_audio_fires_only_where_a_player_would_run() {
 fn hard_delete_denies_ssh_m1_whole_tree_delete() {
     let c = cfg();
     assert!(decide("hard-delete", "ssh bench 'rm -rf ~/x'", &c).is_deny());
+}
+
+#[test]
+fn self_test_passes_when_the_doctor_runs_inside_a_gated_project() {
+    // The doctor runs from wherever it is started. Inside a push-gated project a plain push
+    // correctly asks, so the self-test's "plain push is allowed" case must not depend on cwd.
+    let base = std::env::temp_dir().join(format!("agentkit-selftest-gated-{}", std::process::id()));
+    let project = base.join("Projects").join("gated");
+    fs::create_dir_all(project.join(".git")).unwrap();
+    let mut c = cfg();
+    c.home = PathBuf::from("/var/tmp/fleet-guard-home");
+    c.cwd = project.clone();
+    c.push_gate_projects = vec![project.clone()];
+    assert!(decide("push", "git push origin main", &c).is_ask(), "precondition: the gate applies here");
+    guard::self_test(&c).unwrap();
+    let _ = fs::remove_dir_all(&base);
 }
 
 #[test]
