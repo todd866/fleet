@@ -108,6 +108,12 @@ class Runs(unittest.TestCase):
         tail = "\x1b[JBackup scan progress\r\nTotal Files Scanned : 10\r\n\x1b8Total Files Scanned : 359300\r\n"
         self.assertEqual(M.parse_progress(tail), {"scanned": 359300})
 
+    def test_run_progress_sums_the_workers_not_one_files_percent(self):
+        w = "Full Backup\n459.53 MB\n{}\n1000\n345.1\n/backup/A/x.mp4\n396\n82%\n"
+        text = "\n==\n".join([w.format(100), w.format(150), ""])
+        self.assertEqual(M.parse_workers(text), {"sent_bytes": 250, "total_bytes": 1000, "percent": 25.0})
+        self.assertIsNone(M.parse_workers(""))
+
 
 class Due(unittest.TestCase):
     NOW = 1_800_000_000

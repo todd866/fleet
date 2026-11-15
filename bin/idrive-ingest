@@ -222,6 +222,20 @@ def parse_progress(tail):
     return out or None
 
 
+def parse_workers(text):
+    """The client's PROGRESS_DETAILS_<n> files, joined with '==' lines: per worker, line 3 is the
+    bytes it has sent and line 4 the run's total. The log's own '%' is one file's, not the run's."""
+    done, total = 0, 0
+    for block in (text or "").split("\n==\n"):
+        lines = [l.strip() for l in block.strip().splitlines()]
+        if len(lines) >= 4 and lines[2].isdigit() and lines[3].isdigit():
+            done += int(lines[2])
+            total = max(total, int(lines[3]))
+    if not total:
+        return None
+    return {"sent_bytes": done, "total_bytes": total, "percent": round(100.0 * done / total, 2)}
+
+
 def due(now, success, every_h, spec, last_start, started_recently):
     """Start a backup now? When none has succeeded, the last success is old, or the sources changed."""
     if started_recently:
@@ -420,7 +434,12 @@ def tick(cfg, dry=False):
     progress = None
     if running:
         _rc, tail, _e = exec_(cfg, f"tail -c 4000 {LOGFILE} 2>/dev/null")
-        progress = parse_progress(tail)
+        progress = parse_progress(tail) or {}
+        progress.pop("percent", None)
+        _rc, details, _e = exec_(cfg, "for f in /opt/IDriveForLinux/idriveIt/user_profile/*/*/Backup/"
+                                      "DefaultBackupSet/PROGRESS_DETAILS_*; do cat \"$f\"; echo; echo ==; done 2>/dev/null")
+        progress.update(parse_workers(details) or {})
+        progress = progress or None
     if is_running and not dry and now - int(previous.get("login_backup_at") or 0) > 86400:
         save_login(cfg)
         previous["login_backup_at"] = now
