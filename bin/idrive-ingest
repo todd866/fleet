@@ -115,10 +115,11 @@ def plan(cfg, isdir=_openable, busy=lambda pattern: False, exists=os.path.exists
         path = expand(src["path"])
         name = safe_name(src.get("name") or pathlib.Path(path).name)
         entry = {"name": name, "path": path, "masks": [], "waiting": None, "missing": False}
-        if not isdir(path):
-            entry["missing"] = True
-        elif src.get("after") and not exists(expand(src["after"])):
+        # Waiting comes first: a source that is waiting for its stamp may not exist yet.
+        if src.get("after") and not exists(expand(src["after"])):
             entry["waiting"] = f"after {src['after']}"
+        elif not isdir(path):
+            entry["missing"] = True
         elif src.get("wait_for") and busy(src["wait_for"]):
             entry["waiting"] = src["wait_for"]
         for mask in list(cfg.get("mask_everywhere") or []) + list(src.get("mask") or []):

@@ -47,6 +47,12 @@ class Plan(unittest.TestCase):
         out = M.plan(cfg(sources=sources), isdir=lambda p: True, busy=lambda pat: False, exists=lambda p: True)
         self.assertEqual([s["waiting"] for s in out], [None, None])
 
+    def test_a_source_still_waiting_is_not_called_missing(self):
+        out = M.plan(cfg(sources=[{"name": "X", "path": "/V/X", "after": "/s/done"}]),
+                     isdir=lambda p: False, exists=lambda p: False)
+        self.assertFalse(out[0]["missing"])
+        self.assertTrue(out[0]["waiting"])
+
     def test_a_missing_volume_is_reported_not_mounted(self):
         out = M.plan(cfg(sources=[{"name": "X", "path": "/V/X"}]), isdir=lambda p: False)
         self.assertTrue(out[0]["missing"])

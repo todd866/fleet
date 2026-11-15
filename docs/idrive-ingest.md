@@ -57,7 +57,10 @@ of a few terabytes takes about a week; the morning check stays amber until it fi
 
 A laptop does not run a backup client. [home-mirror](../bin/home-mirror) pushes its home to a
 folder on the hub once a day, when it is on an unmetered link and on mains power, under the hub's
-disk slot; that folder sits inside a source, so it goes off-site with everything else. Every
+disk slot. A home holds keys and personal files, so on a removable drive the copy lives inside an
+encrypted disk image that the hub attaches before each pass (`home-mirror hub-attach`, which
+creates it on first use); the image's volume is a source, the image file itself is masked, and
+the copy goes off-site with everything else. Every
 exclude in `~/.config/fleet/home-mirror.json` carries a reason, cloud placeholders are never read
 (reading one makes the cloud download it), and replaced files are kept beside the copy. The
 morning check shows `backup:<laptop>:home-mirror`: amber after two days away, red after a week.

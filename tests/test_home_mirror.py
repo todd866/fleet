@@ -57,6 +57,37 @@ class Rsync(unittest.TestCase):
         self.assertEqual(M.stats(text), {"files": 1234, "bytes": 5000})
 
 
+class HubAttach(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cfg = Path(self.tmp.name) / "hub.json"
+        self.cfg.write_text(json.dumps({"image": "/D/home.sparsebundle", "volname": "Home", "size": "10g",
+                                        "password_cmd": "cat pw.txt", "volumes_root": "/V"}))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_an_attached_image_is_left_alone(self):
+        calls = []
+        rc = M.hub_attach(self.cfg, run=lambda *a, **k: calls.append(a), ismount=lambda p: p == "/V/Home")
+        self.assertEqual((rc, calls), (0, []))
+
+    def test_the_password_goes_on_stdin_only_and_a_missing_image_is_created_encrypted(self):
+        calls, mounted = [], []
+        def run(args, **kw):
+            calls.append((args, kw.get("input")))
+            if args[:2] == ["/usr/bin/hdiutil", "attach"]:
+                mounted.append(True)
+            out = b"secret\n" if args[0] == "/bin/zsh" else b""
+            return SimpleNamespace(returncode=0, stdout=out, stderr=b"")
+        rc = M.hub_attach(self.cfg, run=run, ismount=lambda p: bool(mounted), exists=lambda p: False)
+        self.assertEqual(rc, 0)
+        create, attach = calls[1], calls[2]
+        self.assertIn("AES-256", create[0])
+        self.assertEqual((create[1], attach[1]), (b"secret", b"secret"))
+        self.assertTrue(all("secret" not in " ".join(args) for args, _ in calls))
+
+
 class Skips(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
