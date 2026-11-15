@@ -5,11 +5,15 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn temp_state() -> PathBuf {
+    // The clock alone is not unique: macOS gives microseconds, and tests run in parallel threads,
+    // so two tests could share a folder and see each other's queue (CI failure, 15 Nov 2026).
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let n = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let d = std::env::temp_dir().join(format!("qs-int-{n}"));
+    let d = std::env::temp_dir().join(format!("qs-int-{}-{n}-{seq}", std::process::id()));
     fs::create_dir_all(&d).unwrap();
     d
 }

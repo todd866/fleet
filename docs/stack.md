@@ -24,7 +24,7 @@ Each layer below says where it lives and how far it has got. "Here" means this r
 | Off-site backup | IDrive's Linux client in a small VM on the Mac that holds the drives; one copy of each thing, daily; laptops push their home to that Mac ([home-mirror](../bin/home-mirror)) instead of running a backup app; a coverage audit proves every drive and folder is backed up or skipped for a stated reason | here: [idrive-ingest](idrive-ingest.md) | first seed running (Nov 2026) |
 | Morning check | One digest at the start of the day: disks, backups, jobs, sync, agent capacity, each project's own check | private tree, `fleet/morning` | in daily use; publishing once its site values are in config |
 | Learning | Spaced repetition scheduled over an embedding of concepts; Anki kept in step; teaching decks; a local-first paper library | [cohort](https://github.com/todd866/cohort), [anki-harness](https://github.com/todd866/anki-harness), [carousel](https://github.com/todd866/carousel), [DeckKit](https://github.com/todd866/DeckKit); a local-first paper library (private for now) | public apps; "run your own copy" guides still to write |
-| Media | A menu-bar music player with a lossless hot set and a cloud cold tier; an offline family shuffle that plays on the TV | [Glancebar](https://github.com/todd866/glancebar), [Onto the TV](https://github.com/todd866/onto-the-tv), [omnifeed](https://github.com/todd866/omnifeed) | in daily use |
+| Media players and feeds | Players and algorithmic feeds that run over your own library and learn from your own signals: music, TV channels, and a feed of posts, articles, papers and podcasts (see below) | [Glancebar](https://github.com/todd866/glancebar), [Onto the TV](https://github.com/todd866/onto-the-tv), [omnifeed](https://github.com/todd866/omnifeed) | music and TV in daily use; omnifeed early |
 | Instruments | Menu-bar vitals, home energy, weather and aviation | [Glancebar](https://github.com/todd866/glancebar), [Energybar](https://github.com/todd866/energybar), [Isobar](https://github.com/todd866/isobar) | in daily use |
 | Joining a Mac | Open a new Mac, point Claude at this repository, wait: tools, guards, jobs, agent setup, then each data set restored from its master (home drives, IDrive, GitHub) | here, [setup](setup.md) | pieces exist; the one-step join and a proven restore are not built yet |
 
@@ -41,6 +41,31 @@ Each layer below says where it lives and how far it has got. "Here" means this r
   undone, tripwires catch the rest, and both send an agent to investigate rather than a person.
 - **Media and learning run on the same machines.** Music, the TV shuffle and the learning apps
   share the slots, the drives and the backup with the agents, and report into the same check.
+
+## Media players and algorithmic feeds
+
+The feeds are the part most people already let a platform run for them. Here each one is a
+program you own: it ranks your own library, learns from what you play, skip and finish, and runs
+on your own machines, offline when it has to.
+
+- **Music ([Glancebar](https://github.com/todd866/glancebar)).** A lossless player in the menu
+  bar. The laptop holds a capped hot set of what is likely to play soon; the masters live on the
+  home hub's drives and a copy in a private cloud bucket, fetched when needed. A scout finds and
+  acquires new music unasked, a daily new-music radio fills its own folder, and likes from other
+  services feed one ledger. Placement pins the hot set and the radio to the laptop.
+- **TV ([Onto the TV](https://github.com/todd866/onto-the-tv)).** A few numbered channels fed by
+  the videos you already have. Each channel picks its next episode from your library, learns from
+  skips and completions (on the TV remote as well as in the app), avoids recent repeats, keeps
+  separate taste per viewer, and plays on a Samsung TV on the same network.
+- **Everything else ([omnifeed](https://github.com/todd866/omnifeed)).** One library and feed for
+  posts, articles, research, music and podcasts, prepared ahead of time for offline use, with a
+  rebuilt pair of headphones as an autonomous player. Early: the storage foundation exists, the
+  feed and the hardware are being built.
+
+They share the rest of the stack: media lives where placement says, the backup takes one copy,
+heavy fetches and transcodes take a heavy slot, and each reports into the morning check
+(Glancebar's media pipeline check covers likes, the scout, the hot set, the radio and the TV
+uploads).
 
 ## Joining a new Mac, or replacing a lost one (target)
 

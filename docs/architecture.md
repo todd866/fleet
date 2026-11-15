@@ -10,7 +10,7 @@ The fleet treats multiple Macs and multiple AI subscriptions (Claude Code, Codex
 |---|---|
 | **heavy-slot** | Rust in this repo; live drop-in for bash `spec/heavy-slot.sh`. Machine-wide slot pool, cool gate, offload exit 75, `jobs.jsonl`; `--now` for the owner's job, `workers` / `$HEAVY_SLOT_WORKERS` to size a pool, lost-job records. |
 | **queue-steward** | Spec only ([queue-steward.md](queue-steward.md)); planned crate + small heavy-slot wait-loop hook. |
-| **Cloud lane** | Modal workspace, enabled 14 Nov 2026 ($30 credit a month); used through per-project scripts, no fleet backend yet. State, measurements and open decisions in [compute-plan.md](compute-plan.md). |
+| **Cloud lane** | Modal workspace, enabled 14 Nov 2026 ($30 credit a month); used through per-project scripts, no fleet backend yet. State, measurements and open decisions are in the private tree. |
 | **git-stale-locks** | Python in `bin/`; launchd at login and every 30 minutes. Trashes git lock files no git process can still own. |
 | **offload-target** | Bash in `~/.local/bin`; reads Glancebar `thermal` / `chipC`, battery, idle. Not in fleet-tools yet. |
 | **remote-run** | Bash; rsync worktree, run under worker `heavy-slot` with `REMOTE_RUN=1`. Not in fleet-tools yet. |

@@ -1,6 +1,6 @@
 # Fleet
 
-The working setup of one person learning and building in something as complex as medicine, made so that someone else can copy it: several Macs and AI coding agents that share the machines without fighting over heat, slots or quota; guards and tripwires so agents can work without prompts; data placed once and backed up off-site once; a morning check that says what broke; and the learning, media and instrument apps that run on top. [docs/stack.md](docs/stack.md) maps every layer and how far each has got.
+The working setup of one person learning and building in something as complex as medicine, made so that someone else can copy it: several Macs and AI coding agents that share the machines without fighting over heat, slots or quota; guards and tripwires so agents can work without prompts; data placed once and backed up off-site once; a morning check that says what broke; and the learning apps, media players and algorithmic feeds, and instruments that run on top. The feeds are yours: they rank your own library, learn from what you play, skip and finish, and run on your own machines. [docs/stack.md](docs/stack.md) maps every layer and how far each has got.
 
 In effect it is a recipe for a free, AI-first operating system. It runs on macOS today; nothing in the design needs macOS, and the platform-specific parts (launchd, FSEvents, cloud placeholders) are kept small.
 
@@ -115,9 +115,9 @@ Fleet is the core. These projects run on the same machines, share the slots, dri
 | [Cohort](https://github.com/todd866/cohort) | Open-source spaced repetition for medicine, scheduled over an embedding of concepts. |
 | [anki-harness](https://github.com/todd866/anki-harness) | Scripted scenarios run inside a real Anki, across released versions. |
 | [Carousel](https://github.com/todd866/carousel), [DeckKit](https://github.com/todd866/DeckKit) | Teaching decks an agent can write and revise. |
-| [Glancebar](https://github.com/todd866/glancebar) | Menu-bar vitals and fleet rows, and the music player: lossless hot set on the laptop, cold tier in the cloud, a new-music scout. heavy-slot's cool gate reads its thermal state. |
-| [Onto the TV](https://github.com/todd866/onto-the-tv) | Offline family shuffle and local-network TV playback from the home hub's media drives. |
-| [omnifeed](https://github.com/todd866/omnifeed) | Personal media library and headphone audio client. |
+| [Glancebar](https://github.com/todd866/glancebar) | Menu-bar vitals and fleet rows, and the music player: lossless hot set on the laptop, masters on the hub, cold tier in the cloud, a scout that finds and acquires new music, a daily new-music radio. heavy-slot's cool gate reads its thermal state. |
+| [Onto the TV](https://github.com/todd866/onto-the-tv) | TV channels fed by your own videos: each learns from skips and completions, avoids repeats, keeps taste per viewer, and plays on the TV over the home network. |
+| [omnifeed](https://github.com/todd866/omnifeed) | One library and feed for posts, articles, research, music and podcasts, prepared for offline use, with rebuilt headphones as the player (early). |
 | [Energybar](https://github.com/todd866/energybar), [Isobar](https://github.com/todd866/isobar) | Home energy and weather/aviation instruments in the same style. |
 
 ## Contributing

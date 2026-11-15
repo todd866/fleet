@@ -23,4 +23,6 @@ jobs:
       - name: Shell and Python tools parse
         run: |
           zsh -n bin/utc-daily
-          python3 -m py_compile bin/utc-schedule bin/git-stale-locks
+          python3 -m py_compile bin/utc-schedule bin/git-stale-locks bin/tripwire bin/idrive-ingest bin/home-mirror
+      - name: Python tool tests
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
