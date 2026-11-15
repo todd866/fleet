@@ -23,12 +23,13 @@ Host names, drive layouts and limits live in `~/.config/<tool>/`, not in this re
 | [cowork](docs/cowork.md) | Work claims, leases, and board JSON for multi-agent coordination. |
 | [tripwire](bin/tripwire) | Watches login keys, startup files, launchd jobs, listeners and accounts; pauses what changed, reversibly, and starts an agent to find out why ([docs](docs/tripwire.md)). |
 | [idrive-ingest](bin/idrive-ingest) | Off-site backup of a Mac's drives and home through IDrive's Linux client in a small VM: one copy of each thing, daily, reported to the morning check, with a coverage audit so nothing misses the backup unnoticed ([docs](docs/idrive-ingest.md)). |
+| [fleet-join](bin/fleet-join) | Makes a Mac one of the fleet, or says what it is missing: a recipe of check/apply steps (packages, repo, sync, tools, guards, one step per registered job), with steps that need a person named rather than attempted. Also the drift check for Macs already in ([example recipe](docs/examples/join.json)). |
 | [fleet morning](docs/morning.md) | The daily check every layer reports into: disks and their trend, the age of each backup, failed launchd jobs, sync, agent capacity, and a check each project supplies (`.fleet/check`). One digest, one notification, findings filed as work items. |
 | [home-mirror](bin/home-mirror) | A laptop pushes its home to the hub once a day (unmetered, on mains, cloud placeholders never read), so it is backed up through the hub's pipe instead of a backup app on the laptop. |
 
 Bash originals under `spec/` are the behavioural spec for heavy-slot and agent-mail while you validate Rust drop-ins.
 
-**Not in this tree (yet):** `remote-run`, `offload-target`, `ai-capacity`, and the one-step "join a new Mac" restore. See [docs/architecture.md](docs/architecture.md) for the full layer map and gaps.
+**Not in this tree (yet):** `remote-run`, `offload-target`, `ai-capacity`, and restoring a new Mac's data from its masters (joining it is [fleet-join](bin/fleet-join)). See [docs/architecture.md](docs/architecture.md) for the full layer map and gaps.
 
 **Tested where:** every push runs `cargo test --workspace` on a GitHub macOS runner ([![ci](https://github.com/todd866/fleet/actions/workflows/ci.yml/badge.svg)](https://github.com/todd866/fleet/actions/workflows/ci.yml)), and the author's Macs run the same tests plus the Python tests of the private tree. Multi-machine behaviour is integration-tested with fixture hosts and fake SSH; treat first install on your own fleet as production validation.
 

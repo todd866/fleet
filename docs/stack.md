@@ -26,7 +26,7 @@ Each layer below says where it lives and how far it has got. "Here" means this r
 | Learning | Spaced repetition scheduled over an embedding of concepts; Anki kept in step; teaching decks | [cohort](https://github.com/todd866/cohort), [anki-harness](https://github.com/todd866/anki-harness), [carousel](https://github.com/todd866/carousel), [DeckKit](https://github.com/todd866/DeckKit) | public apps; "run your own copy" guides still to write. A local-first paper library is embryonic |
 | Media players and feeds | Music and TV players whose algorithmic feeds run over your own library and learn from your own signals (see below) | [Glancebar](https://github.com/todd866/glancebar), [Onto the TV](https://github.com/todd866/onto-the-tv) | in daily use by the author |
 | Instruments | Menu-bar vitals, home energy, weather and aviation | [Glancebar](https://github.com/todd866/glancebar), [Energybar](https://github.com/todd866/energybar), [Isobar](https://github.com/todd866/isobar) | in daily use |
-| Joining a Mac | Open a new Mac, point Claude at this repository, wait: tools, guards, jobs, agent setup, then each data set restored from its master (home drives, IDrive, GitHub) | here, [setup](setup.md) | pieces exist; the one-step join and a proven restore are not built yet |
+| Joining a Mac | Open a new Mac, point Claude at this repository, wait: tools, guards, jobs, agent setup, then each data set restored from its master (home drives, IDrive, GitHub) | here: [fleet-join](../bin/fleet-join), [setup](setup.md) | join and drift check working (one recipe, run on every Mac); data restore and a proven IDrive restore not built yet |
 
 ## How the layers meet
 
@@ -77,5 +77,9 @@ uploads).
    home network, IDrive otherwise, GitHub for code.
 4. The morning check shows the new Mac; nothing is "done" until its rows are green.
 
-Today steps 1, 2 (by hand, with [setup](setup.md)) and 4 exist. The one-step join and a tested
+[fleet-join](../bin/fleet-join) does step 2 now: a recipe of ordered check/apply steps
+([example](examples/join.json)) that installs what is missing, one step per job the registry gives
+that Mac, and names the steps only a person can do (a password, a sign-in) instead of attempting
+them. Run without `--apply` it changes nothing and lists drift, so the same recipe keeps the Macs
+already in the fleet honest. Step 3, restoring each data set from its master, and a tested
 restore from IDrive are the next pieces.

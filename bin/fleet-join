@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""fleet-join: make this Mac one of the fleet, or say exactly what it is missing.
+
+The recipe is data: an ordered list of steps in ~/.config/fleet/join.json (or --recipe), each with
+a shell `check` that exits 0 when the step is done and an `apply` that does it. The engine only
+runs them, in order, and reports. The same recipe joins a new Mac, rebuilds a lost one, and finds
+drift on Macs that are already in.
+
+  fleet-join            check every step; change nothing (the default)
+  fleet-join --apply    run `apply` for each step whose check fails, then check it again
+  fleet-join --as ID    act as host ID (a replacement for a lost Mac takes the lost one's ID)
+  fleet-join --only NAME[,NAME]   just these steps
+
+Recipe:
+  {"host_id": "auto",
+   "steps": [
+     {"name": "repo", "check": "test -d ~/Projects/fleet/.git",
+      "apply": "git clone https://example.com/you/fleet ~/Projects/fleet"},
+     {"name": "guards", "check": "agentkit doctor", "apply": "agentkit sync --apply"},
+     {"name": "jobs", "for_each_job": true, "check": "launchctl print gui/$UID/{label}",
+      "apply": "deploy-service {plist}"},
+     {"name": "sign in to the backup", "owner": true,
+      "check": "test -s ~/.local/state/idrive-ingest/status.json",
+      "say": "run `idrive-ingest login` and type the password yourself"}]}
+`{host}` in a command is this Mac's ID. A step with `"hosts": ["hub"]` runs only there. A
+`for_each_job` step runs once per launchd job that the registry (jobs.tsv: label, hosts, ...)
+gives this host, with `{label}` and `{plist}` (from `plists_dir`); a job whose description starts
+with RETIRED or PAUSED is skipped. An `owner` step is never
+applied: it needs a person (a password, a two-factor code, a consent), so the engine says what
+to do and moves on. Exit 0 when every step passes, 1 otherwise.
+"""
+import argparse
+import json
+import os
+import pathlib
+import subprocess
+import sys
+
+HOME = pathlib.Path.home()
+RECIPE = HOME / ".config/fleet/join.json"
+
+
+def expand(text, host, extra=None):
+    """Fill {host}, {label}, {plist}. The shell (zsh) expands ~ itself."""
+    out = str(text).replace("{host}", host)
+    for key, value in (extra or {}).items():
+        out = out.replace("{" + key + "}", str(value))
+    return out
+
+
+def host_id(recipe):
+    wanted = recipe.get("host_id") or "auto"
+    if wanted != "auto":
+        return wanted
+    for path in (HOME / ".config/agent-mail/name", HOME / ".config/fleet/host"):
+        try:
+            name = path.read_text().strip()
+        except OSError:
+            continue
+        if name:
+            return name
+    return subprocess.run(["scutil", "--get", "LocalHostName"], capture_output=True, text=True).stdout.strip() or "unknown"
+
+
+def jobs_for(recipe, host):
+    """(label, plist) for each registry job whose host list names this host or `all`."""
+    registry = pathlib.Path(os.path.expanduser(recipe.get("registry", "~/.local/state/mac-sync/registry/jobs.tsv")))
+    plists = pathlib.Path(os.path.expanduser(recipe.get("plists_dir", "~/.local/state/mac-sync/plists")))
+    out = []
+    try:
+        lines = registry.read_text().splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        if not line.strip() or line.startswith("#"):
+            continue
+        cols = line.split("\t")
+        if len(cols) < 2:
+            continue
+        hosts = [h.strip() for h in cols[1].split(",")]
+        what = cols[2].strip() if len(cols) > 2 else ""
+        if what.upper().startswith(("RETIRED", "PAUSED")):
+            continue   # the registry says it should not run; nothing to install
+        if host in hosts or "all" in hosts:
+            out.append((cols[0].strip(), str(plists / f"{cols[0].strip()}.plist")))
+    return out
+
+
+def sh(command, timeout):
+    try:
+        done = subprocess.run(["/bin/zsh", "-c", command], capture_output=True, text=True,
+                              errors="replace", timeout=timeout)
+        return done.returncode, (done.stdout + done.stderr).strip()
+    except subprocess.TimeoutExpired:
+        return 124, f"timed out after {timeout} s"
+
+
+def run_step(step, host, apply, timeout, extra=None, label=None):
+    name = label or step["name"]
+    check = expand(step["check"], host, extra)
+    rc, _out = sh(check, timeout)
+    if rc == 0:
+        return "ok", name, ""
+    if step.get("owner"):
+        return "owner", name, step.get("say") or "needs the owner"
+    if not apply or not step.get("apply"):
+        return "missing", name, step.get("say") or ""
+    rc, out = sh(expand(step["apply"], host, extra), int(step.get("timeout", timeout * 10)))
+    if rc != 0:
+        return "failed", name, out[-300:]
+    rc, _o = sh(check, timeout)
+    return ("fixed" if rc == 0 else "failed"), name, "" if rc == 0 else "applied, but the check still fails"
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="fleet-join", description=__doc__.splitlines()[0])
+    parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--as", dest="as_host")
+    parser.add_argument("--only")
+    parser.add_argument("--recipe", default=str(RECIPE))
+    parser.add_argument("--timeout", type=int, default=30, help="seconds per check")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    recipe = json.loads(pathlib.Path(os.path.expanduser(args.recipe)).read_text())
+    host = args.as_host or host_id(recipe)
+    only = set(args.only.split(",")) if args.only else None
+    results = []
+    for step in recipe.get("steps") or []:
+        if only and step["name"] not in only:
+            continue
+        if step.get("hosts") and host not in step["hosts"]:
+            continue
+        if step.get("for_each_job"):
+            for label, plist in jobs_for(recipe, host):
+                results.append(run_step(step, host, args.apply, args.timeout,
+                                        {"label": label, "plist": plist}, f"{step['name']}: {label}"))
+        else:
+            results.append(run_step(step, host, args.apply, args.timeout))
+    if args.json:
+        print(json.dumps({"host": host, "steps": [dict(zip(("state", "name", "note"), r)) for r in results]}, indent=1))
+    else:
+        mark = {"ok": "*", "fixed": "+", "missing": "!", "failed": "!", "owner": "?"}
+        for state, name, note in results:
+            print(f"{mark[state]} {state:8} {name}{('  ' + note) if note else ''}")
+        counts = {s: sum(1 for r in results if r[0] == s) for s in mark}
+        print(f"{host}: " + ", ".join(f"{n} {s}" for s, n in counts.items() if n))
+    return 0 if all(r[0] in ("ok", "fixed") for r in results) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

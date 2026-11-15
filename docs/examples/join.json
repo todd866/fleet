@@ -1,0 +1,85 @@
+{
+ "_why": "Example fleet-join recipe: copy to ~/.config/fleet/join.json and edit. Order matters: each step assumes the ones above it.",
+ "host_id": "auto",
+ "registry": "~/.local/state/mac-sync/registry/jobs.tsv",
+ "plists_dir": "~/.local/state/mac-sync/plists",
+ "steps": [
+  {
+   "name": "homebrew",
+   "owner": true,
+   "check": "test -x /opt/homebrew/bin/brew",
+   "say": "install Homebrew (its installer asks for your password): https://brew.sh"
+  },
+  {
+   "name": "core packages",
+   "check": "for p in rsync gh jq syncthing coreutils; do /opt/homebrew/bin/brew list --versions $p >/dev/null || exit 1; done",
+   "apply": "/opt/homebrew/bin/brew install rsync gh jq syncthing coreutils",
+   "timeout": 1800
+  },
+  {
+   "name": "github sign-in",
+   "owner": true,
+   "check": "/opt/homebrew/bin/gh auth status",
+   "say": "run `gh auth login` (browser sign-in)"
+  },
+  {
+   "name": "fleet repo",
+   "check": "test -d ~/Projects/fleet/.git",
+   "apply": "/opt/homebrew/bin/gh repo clone YOU/fleet ~/Projects/fleet"
+  },
+  {
+   "name": "syncthing running",
+   "check": "pgrep -x syncthing >/dev/null",
+   "apply": "/opt/homebrew/bin/brew services start syncthing"
+  },
+  {
+   "name": "syncthing mesh (tools, rules, registry)",
+   "check": "/opt/homebrew/bin/syncthing cli config folders list | grep -qx local-bin",
+   "say": "a Mac already in the fleet adds this Mac's device ID to ~/.local/state/mac-sync/mesh.sh and runs it on every Mac; then run it here",
+   "apply": "test -x ~/.local/state/mac-sync/mesh.sh && bash ~/.local/state/mac-sync/mesh.sh"
+  },
+  {
+   "name": "shared tools",
+   "check": "test -x ~/.local/bin/heavy-slot && test -x ~/.local/bin/agentkit && test -x ~/.local/bin/agent-mail",
+   "say": "arrive through the Syncthing local-bin folder"
+  },
+  {
+   "name": "fleet tools linked",
+   "check": "for t in tripwire idrive-ingest home-mirror utc-daily utc-schedule git-stale-locks fleet fleet-join; do test -e ~/.local/bin/$t || exit 1; done",
+   "apply": "for t in tripwire idrive-ingest home-mirror utc-daily utc-schedule git-stale-locks fleet fleet-join; do ln -sf ~/Projects/fleet/bin/$t ~/.local/bin/$t; done"
+  },
+  {
+   "name": "site config",
+   "check": "test -s ~/.config/fleet/site.json",
+   "apply": "mkdir -p ~/.config/fleet && scp -q hub:.config/fleet/site.json ~/.config/fleet/site.json"
+  },
+  {
+   "name": "agent mail identity",
+   "check": "test -s ~/.config/agent-mail/name",
+   "apply": "~/.local/bin/agent-mail install {host}"
+  },
+  {
+   "name": "guards and rules",
+   "check": "~/.local/bin/agentkit doctor >/dev/null 2>&1",
+   "apply": "~/.local/bin/agentkit sync --apply"
+  },
+  {
+   "name": "job",
+   "for_each_job": true,
+   "check": "launchctl print gui/$UID/{label} >/dev/null 2>&1 || launchctl print system/{label} >/dev/null 2>&1",
+   "apply": "test -f {plist} && ~/.local/state/mac-sync/deploy-service.sh {plist}"
+  },
+  {
+   "name": "morning snapshot",
+   "check": "find ~/.local/state/mac-sync/fleet-snapshots/{host}.json -mmin -120 2>/dev/null | grep -q .",
+   "apply": "/opt/homebrew/bin/python3 ~/Projects/fleet/bin/fleet morning collect --local"
+  },
+  {
+   "name": "IDrive client signed in",
+   "hosts": ["hub"],
+   "owner": true,
+   "check": "test -s ~/.local/state/idrive-ingest/status.json && ! grep -q 'not signed in' ~/.local/state/idrive-ingest/status.json",
+   "say": "run `idrive-ingest login` on the hub and type the IDrive password yourself"
+  }
+ ]
+}
