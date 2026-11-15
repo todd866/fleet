@@ -6,6 +6,13 @@ the machines and agents, the data and its backups, the daily check that says wha
 learning tools, the media, and a way to bring a new or replacement Mac into all of it. The aim
 is that someone else can copy the lot, and that a lost laptop costs a few hours of waiting.
 
+Put another way, fleet is the recipe for a free, AI-first operating system: the agents are the
+users that do most of the work, and the rest (scheduling, guards, data placement, backup, the
+daily check) is what lets them work unattended without losing anything. It runs on macOS today,
+and nothing in the design needs macOS. The platform-specific parts are kept small and named:
+launchd (systemd timers on Linux), FSEvents (inotify), cloud placeholders (macOS's dataless flag),
+disk images; the backup client already runs on Linux, in a VM on the Mac.
+
 Each layer below says where it lives and how far it has got. "Here" means this repository.
 
 | Layer | What it does | Where | State |
@@ -14,7 +21,7 @@ Each layer below says where it lives and how far it has got. "Here" means this r
 | Guards | Rules every agent provider loads, and hooks that refuse destructive commands where agents run without prompts | here: [agentkit](../agentkit/README.md) | in daily use |
 | Tripwires | Watch login keys, startup files, launchd jobs, listeners, accounts; pause what changed and start an agent to find out why | here: [tripwire](../bin/tripwire) | in daily use |
 | Data placement | Which Mac or drive holds the master of each data set, what is re-obtainable, what may leave a laptop | here: [placement](../placement/README.md), [diskmap](../diskmap/README.md), [storage policy](storage-policy.md) | in daily use |
-| Off-site backup | IDrive's Linux client in a small VM on the Mac that holds the drives; one copy of each thing, daily, judged by the morning check | here: [idrive-ingest](idrive-ingest.md) | first seed running (Nov 2026) |
+| Off-site backup | IDrive's Linux client in a small VM on the Mac that holds the drives; one copy of each thing, daily; laptops push their home to that Mac ([home-mirror](../bin/home-mirror)) instead of running a backup app; a coverage audit proves every drive and folder is backed up or skipped for a stated reason | here: [idrive-ingest](idrive-ingest.md) | first seed running (Nov 2026) |
 | Morning check | One digest at the start of the day: disks, backups, jobs, sync, agent capacity, each project's own check | private tree, `fleet/morning` | in daily use; publishing once its site values are in config |
 | Learning | Spaced repetition scheduled over an embedding of concepts; Anki kept in step; teaching decks; a local-first paper library | [cohort](https://github.com/todd866/cohort), [anki-harness](https://github.com/todd866/anki-harness), [carousel](https://github.com/todd866/carousel), [DeckKit](https://github.com/todd866/DeckKit); a local-first paper library (private for now) | public apps; "run your own copy" guides still to write |
 | Media | A menu-bar music player with a lossless hot set and a cloud cold tier; an offline family shuffle that plays on the TV | [Glancebar](https://github.com/todd866/glancebar), [Onto the TV](https://github.com/todd866/onto-the-tv), [omnifeed](https://github.com/todd866/omnifeed) | in daily use |

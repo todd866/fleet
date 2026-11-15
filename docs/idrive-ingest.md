@@ -52,3 +52,21 @@ deletes from the backup whatever is no longer at the source.
 
 The client uploads at the line's full rate (63 Mbit/s here, about 0.65 TB a day). A first seed
 of a few terabytes takes about a week; the morning check stays amber until it finishes.
+
+## Laptops
+
+A laptop does not run a backup client. [home-mirror](../bin/home-mirror) pushes its home to a
+folder on the hub once a day, when it is on an unmetered link and on mains power, under the hub's
+disk slot; that folder sits inside a source, so it goes off-site with everything else. Every
+exclude in `~/.config/fleet/home-mirror.json` carries a reason, cloud placeholders are never read
+(reading one makes the cloud download it), and replaced files are kept beside the copy. The
+morning check shows `backup:<laptop>:home-mirror`: amber after two days away, red after a week.
+
+## Coverage: nothing misses the backup unnoticed
+
+Every 6 hours the tick lists the volumes the VM can see. Each must be a source, inside one, or a
+key of `not_sources` with a reason; every mask on a source needs a `why`. After each successful
+run it counts the files under `/backup` and compares them with the files the client considered.
+An unplaced volume, a missing source, a mask without a reason or a gap over 0.5 % turns the
+morning row amber. The VM does the listing because it can read every drive: on macOS a
+background job may not be allowed to open removable volumes.

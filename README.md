@@ -2,6 +2,8 @@
 
 The working setup of one person learning and building in something as complex as medicine, made so that someone else can copy it: several Macs and AI coding agents that share the machines without fighting over heat, slots or quota; guards and tripwires so agents can work without prompts; data placed once and backed up off-site once; a morning check that says what broke; and the learning, media and instrument apps that run on top. [docs/stack.md](docs/stack.md) maps every layer and how far each has got.
 
+In effect it is a recipe for a free, AI-first operating system. It runs on macOS today; nothing in the design needs macOS, and the platform-specific parts (launchd, FSEvents, cloud placeholders) are kept small.
+
 Host names, drive layouts and limits live in `~/.config/<tool>/`, not in this repository.
 
 **License:** MIT (see [LICENSE](LICENSE)).
@@ -20,7 +22,8 @@ Host names, drive layouts and limits live in `~/.config/<tool>/`, not in this re
 | [git-stale-locks](bin/git-stale-locks) | Moves git lock files that no git process can still own (left by a restart or a killed agent) to the Trash, so the next agent is not blocked by `index.lock`. |
 | [cowork](docs/cowork.md) | Work claims, leases, and board JSON for multi-agent coordination. |
 | [tripwire](bin/tripwire) | Watches login keys, startup files, launchd jobs, listeners and accounts; pauses what changed, reversibly, and starts an agent to find out why ([docs](docs/tripwire.md)). |
-| [idrive-ingest](bin/idrive-ingest) | Off-site backup of a Mac's drives and home through IDrive's Linux client in a small VM: one copy of each thing, daily, reported to the morning check ([docs](docs/idrive-ingest.md)). |
+| [idrive-ingest](bin/idrive-ingest) | Off-site backup of a Mac's drives and home through IDrive's Linux client in a small VM: one copy of each thing, daily, reported to the morning check, with a coverage audit so nothing misses the backup unnoticed ([docs](docs/idrive-ingest.md)). |
+| [home-mirror](bin/home-mirror) | A laptop pushes its home to the hub once a day (unmetered, on mains, cloud placeholders never read), so it is backed up through the hub's pipe instead of a backup app on the laptop. |
 
 Bash originals under `spec/` are the behavioural spec for heavy-slot and agent-mail while you validate Rust drop-ins.
 

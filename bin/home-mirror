@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""home-mirror: copy this Mac's home folder to the home hub, so the hub's backup can take it off-site.
+
+A laptop's own backup client is the thing being avoided (IDrive's macOS app). Instead the laptop
+pushes its home to a folder on the hub over ssh, once a day, when it is on an unmetered link and on
+mains power; the hub's `idrive-ingest` backs that folder up with everything else. The hub copy is
+also the "verified on the hub" half of an offload.
+
+  home-mirror run [--force] [--dry-run]   one pass when due (or --force); writes status.json
+  home-mirror status                       status.json
+
+Config ~/.config/fleet/home-mirror.json:
+  {"hub": "hub", "dest": "/Volumes/Drive/laptop-home", "every_h": 20, "min_free_gb": 40,
+   "require_ac": true, "exclude": ["/Library/Caches/", "node_modules/"],
+   "skip_dataless": ["Desktop", "Documents"]}
+`exclude` lines are rsync patterns, anchored at the home folder when they start with "/"; a line may
+be {"pattern": ..., "why": ...} so every skip says why (a coverage audit reads the reasons).
+`first_pass_free_gb`: the first pass waits until the destination has this much free.
+Files that are cloud placeholders (dataless) under `skip_dataless` are never read: reading one
+makes the cloud download it. Deleted or changed files are moved to `<dest>-versions/<stamp>` on
+the hub, not lost. On the hub the copy runs under `disk-slot`, so it never shares a disk with
+another heavy job. State: ~/.local/state/home-mirror/.
+"""
+import argparse
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import time
+
+HOME = pathlib.Path.home()
+CONFIG = pathlib.Path(os.environ.get("HOME_MIRROR_CONFIG", HOME / ".config/fleet/home-mirror.json"))
+STATE = pathlib.Path(os.environ.get("HOME_MIRROR_STATE", HOME / ".local/state/home-mirror"))
+RSYNC = next((p for p in ("/opt/homebrew/bin/rsync", "/usr/local/bin/rsync") if os.path.exists(p)), "rsync")
+REMOTE_RSYNC = "/opt/homebrew/bin/rsync"
+METERED = HOME / ".local/state/METERED_LINK"
+WILD = re.compile(r"([*?\[\]\\])")
+
+
+def load_config(path=CONFIG):
+    cfg = json.loads(pathlib.Path(path).read_text())
+    cfg.setdefault("every_h", 20)
+    cfg.setdefault("min_free_gb", 40)
+    cfg.setdefault("require_ac", True)
+    cfg.setdefault("exclude", [])
+    cfg.setdefault("skip_dataless", [])
+    cfg.setdefault("first_pass_free_gb", 0)
+    cfg["exclude"] = [e["pattern"] if isinstance(e, dict) else e for e in cfg["exclude"]]
+    for key in ("hub", "dest"):
+        if not cfg.get(key):
+            raise SystemExit(f"home-mirror: config needs {key}")
+    return cfg
+
+
+def rsync_pattern(rel):
+    """An anchored rsync pattern matching exactly this relative path (wildcards escaped)."""
+    return "/" + WILD.sub(r"\\\1", rel)
+
+
+def dataless(home, folders, run=subprocess.run):
+    """Relative paths of cloud placeholder files under these folders (BSD find -flags)."""
+    out = []
+    for folder in folders:
+        root = home / folder
+        if not root.is_dir():
+            continue
+        done = run(["/usr/bin/find", str(root), "-flags", "+dataless", "-type", "f"],
+                   capture_output=True, text=True, errors="replace", timeout=1800)
+        for line in done.stdout.splitlines():
+            if line.startswith(str(home) + "/"):
+                out.append(line[len(str(home)) + 1:])
+    return out
+
+
+def on_ac(run=subprocess.run):
+    try:
+        out = run(["pmset", "-g", "batt"], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return True
+    return "AC Power" in out or "Battery Power" not in out
+
+
+def remote_free_gb(cfg, run=subprocess.run):
+    parent = os.path.dirname(cfg["dest"].rstrip("/")) or "/"
+    try:
+        done = run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", cfg["hub"],
+                    f"/bin/df -k {sh(parent)} | tail -1"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    parts = done.stdout.split()
+    if done.returncode != 0 or len(parts) < 4 or not parts[3].isdigit():
+        return None
+    return int(parts[3]) / 1e6
+
+
+def sh(text):
+    return "'" + str(text).replace("'", "'\\''") + "'"
+
+
+def rsync_args(cfg, exclude_file, stamp, dry=False):
+    dest = cfg["dest"].rstrip("/")
+    remote = (f"$HOME/.local/bin/disk-slot --label home-mirror --wait 7200 {sh(os.path.dirname(dest))} -- "
+              f"{REMOTE_RSYNC}")
+    args = [RSYNC, "-aHX", "--delete", "--delete-excluded", "--partial", "--stats",
+            "--backup", f"--backup-dir={dest}-versions/{stamp}",
+            "--exclude-from", str(exclude_file), "--rsync-path", remote,
+            "-e", "ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30"]
+    if dry:
+        args.append("--dry-run")
+    return args + [str(HOME) + "/", f"{cfg['hub']}:{dest}/"]
+
+
+def stats(text):
+    out = {}
+    for key, label in (("files", "Number of regular files transferred"),
+                       ("bytes", "Total transferred file size"), ("total_bytes", "Total file size")):
+        hit = re.search(label + r":\s*([\d,]+)", text or "")
+        if hit:
+            out[key] = int(hit.group(1).replace(",", ""))
+    return out
+
+
+def write_status(status):
+    STATE.mkdir(parents=True, exist_ok=True)
+    tmp = STATE / "status.json.tmp"
+    tmp.write_text(json.dumps(status, indent=1) + "\n")
+    os.replace(tmp, STATE / "status.json")
+
+
+def run_once(cfg, force=False, dry=False):
+    now = int(time.time())
+    try:
+        previous = json.loads((STATE / "status.json").read_text())
+    except (OSError, ValueError):
+        previous = {}
+    status = dict(previous, checked_at=now)
+    last = previous.get("last_success_epoch")
+    if not force and last and now - int(last) < float(cfg["every_h"]) * 3600:
+        status["state"] = "ok"
+        return status
+    if METERED.exists():
+        status["state"] = "skipped: metered link"
+        return status
+    if cfg["require_ac"] and not on_ac():
+        status["state"] = "skipped: on battery"
+        return status
+    free = remote_free_gb(cfg)
+    if free is None:
+        status["state"] = "skipped: hub unreachable or destination missing"
+        return status
+    if last is None and free < float(cfg.get("first_pass_free_gb") or 0):
+        status["state"] = f"waiting for space: {free:.0f} GB free, first pass needs {cfg.get('first_pass_free_gb')}"
+        return status
+    if free < float(cfg["min_free_gb"]):
+        status["state"] = f"skipped: {free:.0f} GB free at the destination (floor {cfg['min_free_gb']})"
+        return status
+    STATE.mkdir(parents=True, exist_ok=True)
+    exclude_file = STATE / "exclude.txt"
+    lines = list(cfg["exclude"]) + [rsync_pattern(rel) for rel in dataless(HOME, cfg["skip_dataless"])]
+    exclude_file.write_text("\n".join(lines) + "\n")
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now))
+    status.update(state="running", attempt_epoch=now)
+    if not dry:
+        write_status(status)
+    log = STATE / "rsync.log"
+    with open(log, "w") as handle:
+        done = subprocess.run(["/usr/bin/caffeinate", "-is", *rsync_args(cfg, exclude_file, stamp, dry)],
+                              stdout=handle, stderr=subprocess.STDOUT)
+    text = log.read_text(errors="replace")[-20000:]
+    status.update(stats(text), rc=done.returncode, duration_s=int(time.time()) - now,
+                  dataless_skipped=len(lines) - len(cfg["exclude"]))
+    # 24: some files vanished while copying (a live home): the pass still counts.
+    if done.returncode in (0, 24) and not dry:
+        status.update(state="ok", last_success_epoch=now)
+    else:
+        status["state"] = "dry run" if dry else f"failed: rsync exit {done.returncode} (see rsync.log)"
+    return status
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="home-mirror", description=__doc__.splitlines()[0])
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    r = sub.add_parser("run")
+    r.add_argument("--force", action="store_true")
+    r.add_argument("--dry-run", action="store_true")
+    sub.add_parser("status")
+    args = parser.parse_args(argv)
+    if args.cmd == "status":
+        path = STATE / "status.json"
+        print(path.read_text() if path.exists() else "no status yet")
+        return 0
+    status = run_once(load_config(), force=args.force, dry=args.dry_run)
+    if not args.dry_run:
+        write_status(status)
+    print(json.dumps(status, indent=1))
+    return 0 if not str(status.get("state", "")).startswith("failed") else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

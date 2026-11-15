@@ -20,6 +20,10 @@ Config: ~/.config/fleet/idrive-ingest.json (every key optional except sources):
    "sources": [{"name": "Archive", "path": "/Volumes/Archive",
                 "mask": ["Old.sparsebundle"], "after": "~/.local/state/migrate/done/verify"}],
    "mask_everywhere": [".Spotlight-V100", ".fseventsd", ".Trashes", ".DocumentRevisions-V100"]}
+A mask on a source may be {"path": ..., "why": ...}; one without a reason is reported. Every
+volume the VM sees must be a source, inside one, or a key of `not_sources` (volume path to reason):
+the coverage audit checks every 6 h, and after each successful run the files under /backup are
+counted against the files the client considered, so nothing misses the backup unnoticed.
 A source with `after` is left out until that file exists (a migration's done stamp, say), and one
 with `wait_for` while a process matching that pattern runs (pgrep -f), so a backup does not
 compete with a migration for the same disk. A change to the sources
@@ -118,13 +122,47 @@ def plan(cfg, isdir=_openable, busy=lambda pattern: False, exists=os.path.exists
         elif src.get("wait_for") and busy(src["wait_for"]):
             entry["waiting"] = src["wait_for"]
         for mask in list(cfg.get("mask_everywhere") or []) + list(src.get("mask") or []):
-            rel = str(mask).strip("/")
+            rel = str(mask.get("path") if isinstance(mask, dict) else mask).strip("/")
             # Only a folder the container can open can be blanked (docker resolves the mount
             # point); an unreadable one (.Trashes) the client cannot read anyway.
             if rel and ".." not in rel.split("/") and isdir(os.path.join(path, rel)):
                 entry["masks"].append(rel)
         out.append(entry)
     return out
+
+
+def coverage(cfg, volumes):
+    """Every volume the VM sees is a source, inside one, or named in `not_sources` with a reason.
+    Returns the ones nobody has placed: a new drive must not fall out of the backup unnoticed."""
+    placed = [expand(s["path"]).rstrip("/") for s in cfg.get("sources") or []]
+    reasons = {expand(k).rstrip("/"): v for k, v in (cfg.get("not_sources") or {}).items()}
+    loose = []
+    for vol in volumes:
+        vol = vol.rstrip("/")
+        if not vol or vol in reasons or vol in placed:
+            continue
+        if any(p.startswith(vol + "/") or vol.startswith(p + "/") for p in placed):
+            continue
+        loose.append(vol)
+    return loose
+
+
+def unexplained_masks(cfg):
+    """Masks given as bare names on a source (not the shared defaults) carry no reason."""
+    out = []
+    for src in cfg.get("sources") or []:
+        for mask in src.get("mask") or []:
+            if not (isinstance(mask, dict) and mask.get("why")):
+                name = mask.get("path") if isinstance(mask, dict) else mask
+                out.append(f"{src.get('name')}/{name}")
+    return out
+
+
+def count_gap(on_disk, considered):
+    """Share of files under /backup that the last successful run did not consider."""
+    if not on_disk or considered is None:
+        return None
+    return round((on_disk - considered) / on_disk, 4)
 
 
 def container_args(cfg, sources):
@@ -361,6 +399,23 @@ def tick(cfg, dry=False):
                     actions.append("started backup")
                 else:
                     problems.append(f"backup start failed: {err.strip()[-200:]}")
+    audit = dict(previous.get("coverage") or {})
+    if vm_ok and not dry and now - int(audit.get("checked_at") or 0) > 6 * 3600:
+        # The VM sees every drive (a launchd job on the host may not: macOS privacy).
+        rc, out, _e = run(cfg, ["limactl", "shell", cfg["vm"], "--", "sh", "-c",
+                                'for v in "$0"/*; do [ -L "$v" ] || echo "$v"; done', cfg.get("volumes_root", "/Volumes")],
+                          timeout=120)
+        if rc == 0:
+            volumes = [v for v in out.splitlines() if v.strip()]
+            audit.update(checked_at=now, volumes=volumes, unplaced=coverage(cfg, volumes),
+                         unexplained_masks=unexplained_masks(cfg))
+    if (is_running and not running and success and not dry
+            and audit.get("counted_for") != success["epoch"]):
+        # Once per successful run: does the client consider every file the sources hold?
+        rc, out, _e = exec_(cfg, "find /backup -type f 2>/dev/null | wc -l", 7200)
+        if rc == 0 and out.strip().isdigit():
+            audit.update(files_on_disk=int(out), counted_for=success["epoch"],
+                         gap=count_gap(int(out), success.get("considered")))
     progress = None
     if running:
         _rc, tail, _e = exec_(cfg, f"tail -c 4000 {LOGFILE} 2>/dev/null")
@@ -384,6 +439,7 @@ def tick(cfg, dry=False):
         "mounted": mounted,
         "sources": [{k: s[k] for k in ("name", "masks", "waiting", "missing")} for s in sources],
         "storage": storage(cfg) if is_running else previous.get("storage"),
+        "coverage": audit,
         "every_h": cfg["every_h"],
         "count_from": cfg.get("count_from") or None,
         "login_backup_at": previous.get("login_backup_at"),
