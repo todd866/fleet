@@ -18,6 +18,9 @@ from fleet.morning.work import file_items, work_path
 
 def main(argv=None, notify=None, gather=None, run=None):
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "upstream":
+        from fleet.upstream import main as upstream_main
+        return upstream_main(argv[1:])
     if argv and argv[0] == "morning":
         argv = argv[1:]
     if argv and argv[0] == "follow":

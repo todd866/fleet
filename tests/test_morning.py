@@ -307,6 +307,10 @@ class Thresholds(unittest.TestCase):
         self.assertEqual(unread.value, "unread")
         fine = by_key(evaluate(pool(), config(), NOW_S))["capacity:claude:7d"]
         self.assertEqual(fine.status, "pass")
+        absent = {"capacity": {"pools": [{"engine": "claude", "pool": "5h", "remaining_pct": None,
+                  "jobs_left": None, "reset_epoch": None, "stale": False, "absent": True}]}}
+        none = by_key(evaluate(absent, config(), NOW_S))["capacity:claude:5h"]
+        self.assertEqual((none.status, none.value), ("pass", "none"))
 
     def test_agent_board_mail_and_project_defaults(self):
         stale = {"work": "export", "state": "stale", "heartbeat": NOW_S - 10 * HOUR,

@@ -1,0 +1,9 @@
+# ~/.config/fleet/upstream.toml — projects we watch for ideas (fleet upstream).
+# A first `fleet upstream check` takes every existing release as reviewed.
+# `notes` is where the reviewing agent records what it took or skipped.
+
+[[repo]]
+name = "example"
+github = "owner/repo"
+why = "what we hope to learn from it"
+notes = "~/Projects/fleet/docs/upstream/example.md"

@@ -38,6 +38,7 @@ def collect(config, *, here, now, state=None, run=None, home=None, gather=None, 
     merged["capacity"] = _capacity(home, config, now, run)
     merged["board"] = _board(home, run)
     merged["agentkit"] = _agentkit(run)
+    merged["upstream"] = _upstream(home)
     merged.update(_hub_context(home, config))
     merged["job_reviews"] = job_reviews(
         Path(config.get("registry") or Path(home) / ".local/state/mac-sync/registry"))
@@ -331,6 +332,7 @@ def _capacity(home, config, now, run):
                 "jobs_left": pool.get("jobsLeft", pool.get("jobs_left")),
                 "reset_epoch": _epoch(pool.get("reset")),
                 "stale": stale,
+                "absent": pool.get("freshness") == "none",
             })
     return {"pools": pools} if pools else None
 
@@ -572,6 +574,14 @@ def _placement(home, probed):
         if isinstance(raw.get("placement"), dict) and raw["placement"]:
             return raw["placement"]
     return None
+
+
+def _upstream(home):
+    from fleet.upstream import statuses
+    try:
+        return statuses(home) or None
+    except Exception:  # a bad upstream.toml is not a reason to lose the digest
+        return [{"name": "config", "state": {"error": "upstream.toml unreadable", "new": []}}]
 
 
 def _coverage(home, probed):

@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Daily at 22:00Z (UTC) through utc-daily; launchd only ticks every five minutes.
+	     A calendar schedule with an hour is local time, in the zone the Mac booted in; do not use one. -->
+	<key>Label</key>
+	<string>com.example.fleet-upstream</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/zsh</string>
+		<string>REPLACE_HOME/.local/bin/utc-daily</string>
+		<string>--label</string>
+		<string>com.example.fleet-upstream</string>
+		<string>--at</string>
+		<string>22:00</string>
+		<string>--</string>
+		<string>REPLACE_HOME/.local/bin/fleet</string>
+		<string>upstream</string>
+		<string>check</string>
+	</array>
+	<key>StartInterval</key>
+	<integer>300</integer>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>StandardOutPath</key>
+	<string>REPLACE_HOME/.local/state/fleet/upstream/launchd.stdout.log</string>
+	<key>StandardErrorPath</key>
+	<string>REPLACE_HOME/.local/state/fleet/upstream/launchd.stderr.log</string>
+</dict>
+</plist>

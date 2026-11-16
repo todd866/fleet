@@ -14,7 +14,7 @@ RANK = {"pass": 0, "warn": 1, "fail": 2}
 # A sleeping laptop is info once its snapshot is older than 3 h. Warn only after 48 h.
 SNAPSHOT_INFO_S = 3 * 3600
 SNAPSHOT_WARN_S = 48 * 3600
-ORDER = ("host", "disk", "backup", "sync", "update", "job", "thermal", "capacity", "agent", "project", "check", "place", "kit")
+ORDER = ("host", "disk", "backup", "sync", "update", "job", "thermal", "capacity", "agent", "project", "check", "place", "kit", "upstream")
 REGISTERED = re.compile(r"^[0-9a-f]{64}$")
 # macOS volumes that live in the boot disk's container: the internal disk again, not another one.
 SYSTEM_VOLUMES = frozenset((
@@ -61,6 +61,7 @@ def evaluate(snapshot, config, now):
     rows.extend(_coverage(snapshot.get("coverage"), now))
     rows.extend(_agentkit(snapshot.get("agentkit")))
     rows.extend(_job_reviews(snapshot.get("job_reviews"), now))
+    rows.extend(_upstream(snapshot.get("upstream"), config, now))
     rows.extend(_unregistered_jobs(snapshot.get("hosts") or {}, registry))
     rows.sort(key=lambda row: (ORDER.index(row.area) if row.area in ORDER else 99, row.name, row.key))
     return rows
@@ -589,6 +590,10 @@ def _capacity(capacity, config, now, tz):
         fresh = not pool.get("stale") and (reset is None or int(reset) > now)
         key = f"capacity:{engine}:{name}"
         label = f"{engine} {name}"
+        if pool.get("absent") and not pool.get("stale"):
+            rows.append(_row(key, "pass", "capacity", label, "none", "no such window",
+                             "the provider reports no such window for this account"))
+            continue
         if pool.get("stale") or (reset is not None and int(reset) <= now):
             value = "unread" if pct is None else "stale"
             rows.append(_row(key, "warn", "capacity", label, value, "reset" if reset else "unread", "reading is stale or the window has reset"))
@@ -1052,6 +1057,33 @@ def _resets(stamp, now, tz):
     if moment.date() == current.date():
         return f"resets {clock}"
     return f"resets {moment.day} {MONTHS[moment.month - 1]}"
+
+
+def _upstream(repos, config, now):
+    """Watched upstream repos: an unreviewed release is a work item (review it for ideas)."""
+    stale_h = float((config.get("upstream") or {}).get("stale_h", 72))
+    rows = []
+    for repo in repos or []:
+        name = str(repo.get("name") or "repo")
+        key, label = f"upstream:{name}", f"upstream {name}"
+        st = repo.get("state")
+        if not st:
+            rows.append(_row(key, "warn", "upstream", label, "unread", "never checked",
+                             "run: fleet upstream check"))
+            continue
+        new = st.get("new") or []
+        last_ok = st.get("last_ok")
+        if st.get("error") and (not last_ok or now - int(last_ok) > stale_h * 3600):
+            rows.append(_row(key, "warn", "upstream", label, "unread", "check failing", st["error"]))
+            continue
+        if new:
+            tags = " ".join(r.get("tag", "?") for r in new)
+            notes = f"; record decisions in {st['notes']}" if st.get("notes") else ""
+            rows.append(_row(key, "warn", "upstream", label, f"{len(new)} new", tags,
+                             f"review for ideas: fleet upstream show {name}{notes}; then fleet upstream ack {name}"))
+            continue
+        rows.append(_row(key, "pass", "upstream", label, "0 new", "reviewed", "every release reviewed"))
+    return rows
 
 
 def _row(key, status, area, name, value, datum, detail, away=False):

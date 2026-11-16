@@ -49,6 +49,7 @@ The local probe reads known state files and, for Syncthing only, localhost REST.
 | Mail | `~/.local/state/agent-mail/inbox.jsonl` and `read.txt` | Unread older than `unread_mail_h` (12 by default) is a warn. |
 | agentkit | `agentkit doctor --json` | Missing binary is skipped. A reported issue is a fail. |
 | Projects | mac-registry `descriptions.tsv` and `hosts/*.json` | See below. |
+| Upstream | `~/.local/state/fleet/upstream/<name>.json`, written by `fleet upstream check` (daily 22:00Z on the hub) for each repo in `~/.config/fleet/upstream.toml` | A release nobody has reviewed is a warn and a work item: `fleet upstream show NAME`, record what was taken or skipped in the repo's notes file, `fleet upstream ack NAME`. Never checked, or a check failing for over `upstream.stale_h` (72), is a warn. |
 | Job reviews | mac-registry `jobs.tsv`, columns 4 (project) and 5 (review date) | A job whose review date is today or earlier, or that has no date, is a warn on the `reviews` row. A job with no project is a warn on the `owners` row. Neither is ever a fail. |
 
 Thresholds live in `~/.config/fleet/morning.toml`. The shipped numbers are [examples/morning.toml](examples/morning.toml). A missing key keeps the default in `fleet/morning/config.py`. `tz` is an IANA name (`UTC` in the example). Per-disk floors are `[disk.floors.<host>]` tables, in GB, and win over the targets file.
