@@ -1241,6 +1241,10 @@ fn heredoc_is_data(head: &str, tail: &str) -> bool {
     if parts.len() > 1 && !matches!(parts[parts.len() - 2].sep, ";" | "&&" | "||" | "\n") {
         return false;
     }
+    // A message read from stdin: `git commit -F -`, `git tag -F -`, `--file=-`.
+    if compiled(r#"^\s*git\s+(?:commit|tag)\b[^;&|`$()<>]*\s(?:-[A-Za-z]*F\s*-|--file[= ]-)\s*$"#).is_match(last.text) {
+        return true;
+    }
     let Some(argv) = shlex::split(last.text) else { return false };
     if !argv.first().is_some_and(|prog| matches!(prog.as_str(), "cat" | "tee")) {
         return false;
@@ -2252,34 +2256,45 @@ fn idrive_cleanup(cmd: &str, cfg: &GuardConfig) -> Decision {
     Decision::allow()
 }
 
-/// The path a file-reading tool call (Claude `Read`) names.
+/// The path a file-reading tool call names: Claude `Read` (`file_path`) or `Grep` (`path`).
 fn read_target(value: &Value) -> Option<String> {
     let tool = value.get("tool_name").and_then(|t| t.as_str())?;
-    if tool != "Read" {
-        return None;
-    }
-    value.get("tool_input")?.get("file_path").and_then(|p| p.as_str()).filter(|p| !p.is_empty()).map(str::to_string)
+    let field = match tool {
+        "Read" => "file_path",
+        "Grep" => "path",
+        _ => return None,
+    };
+    value.get("tool_input")?.get(field).and_then(|p| p.as_str()).filter(|p| !p.is_empty()).map(str::to_string)
 }
 
-const SECRETS_REASON: &str = "Private keys are used in place, never read: ssh, git, scp and ssh-add use them as they are. For what a key is, run `ssh-keygen -lf KEY` (fingerprint) or `ssh-keygen -y -f KEY` (its public half). To put a key on another fleet Mac, scp or rsync it there; that is allowed.";
+const SECRETS_REASON: &str = "Private keys are used in place, never read: ssh, git, scp and ssh-add use them as they are. For what a key is, run `ssh-keygen -lf KEY` (fingerprint) or `ssh-keygen -y -f KEY` (its public half). To put a key on another fleet Mac, scp or rsync it there with no -o/-F/-J/-S/-e options; that is allowed.";
 
-/// A private key file: anything in ~/.ssh that is not public material or ssh's own lists, an
-/// `id_*` key anywhere, or a site path in `guards.secret_paths`.
-fn is_private_key(path: &str, cfg: &GuardConfig) -> bool {
-    let raw = path.trim().trim_matches(|c| c == '\'' || c == '"');
+fn ssh_dir(cfg: &GuardConfig) -> String {
+    resolve_path(&cfg.home.join(".ssh").to_string_lossy(), cfg)
+}
+
+/// A word as a path: quotes gone, `$HOME` / `~` expanded, made absolute against `cwd`.
+fn key_path(word: &str, cfg: &GuardConfig) -> String {
+    let raw = word.trim().trim_matches(|c| c == '\'' || c == '"');
     let raw = raw.strip_prefix("$HOME/").or_else(|| raw.strip_prefix("${HOME}/"))
         .map(|rest| cfg.home.join(rest).to_string_lossy().into_owned())
-        .unwrap_or_else(|| raw.to_string());
-    if raw.is_empty() || raw.contains('*') && !raw.contains("/.ssh/") {
+        .unwrap_or_else(|| if raw == "$HOME" { cfg.home.to_string_lossy().into_owned() } else { raw.to_string() });
+    resolve_path(&expand_path(&raw, cfg), cfg)
+}
+
+/// A private key file: anything in ~/.ssh that is not public material or ssh's own lists, an
+/// `id_<type>` key anywhere, or a site path in `guards.secret_paths`.
+fn is_private_key(path: &str, cfg: &GuardConfig) -> bool {
+    if path.trim().is_empty() {
         return false;
     }
-    let full = resolve_path(&expand_path(&raw, cfg), cfg);
+    let full = key_path(path, cfg);
     let base = base_name(&full);
     let public = base.ends_with(".pub") || base.starts_with("known_hosts") || base.starts_with("authorized_keys")
         || base == "config" || base.starts_with("config.") || base == "agent" || base == "environment";
-    let ssh_dir = resolve_path(&cfg.home.join(".ssh").to_string_lossy(), cfg);
-    if full.starts_with(&format!("{ssh_dir}/")) {
-        return !public && !full[ssh_dir.len() + 1..].starts_with("agent/");
+    let ssh = ssh_dir(cfg);
+    if let Some(rest) = full.strip_prefix(&format!("{ssh}/")) {
+        return !public && !rest.starts_with("agent/");
     }
     // ssh-keygen's own names (`id_ed25519`, `id_rsa_work`, ...), not any word that starts with id_.
     let key_type = ["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "id_xmss"].iter().any(|t| {
@@ -2289,77 +2304,174 @@ fn is_private_key(path: &str, cfg: &GuardConfig) -> bool {
         return true;
     }
     cfg.secret_paths.iter().any(|p| {
-        let want = resolve_path(&expand_path(p, cfg), cfg);
+        let want = key_path(p, cfg);
         full == want || full.starts_with(&format!("{}/", want.trim_end_matches('/')))
     })
 }
 
+/// A word names a key, or the folder that holds them, or a glob that could reach one.
+fn names_secret(word: &str, cfg: &GuardConfig) -> bool {
+    if is_private_key(word, cfg) {
+        return true;
+    }
+    let ssh = ssh_dir(cfg);
+    let full = key_path(word, cfg);
+    if full == ssh || cfg.secret_paths.iter().any(|p| key_path(p, cfg) == full) {
+        return true; // the whole folder: a recursive reader or an archiver takes every key in it
+    }
+    if !word.contains(['*', '?', '[']) {
+        return false;
+    }
+    // The shell expands a glob against the disk, so the disk decides: dot files included,
+    // which is stricter than the shell.
+    glob_matches(&full, 200).iter().any(|m| is_private_key(m, cfg))
+}
+
+/// Shell-style glob match of one path segment (`*`, `?`, `[...]`).
+fn seg_match(pat: &[char], s: &[char]) -> bool {
+    match (pat.first(), s.first()) {
+        (None, None) => true,
+        (Some('*'), _) => seg_match(&pat[1..], s) || (!s.is_empty() && seg_match(pat, &s[1..])),
+        (Some('?'), Some(_)) => seg_match(&pat[1..], &s[1..]),
+        (Some('['), Some(c)) => match pat.iter().position(|&x| x == ']') {
+            Some(end) if end > 1 => {
+                let set = &pat[1..end];
+                let (neg, set) = if set[0] == '!' || set[0] == '^' { (true, &set[1..]) } else { (false, set) };
+                let mut hit = false;
+                let mut i = 0;
+                while i < set.len() {
+                    if i + 2 < set.len() && set[i + 1] == '-' {
+                        hit |= set[i] <= *c && *c <= set[i + 2];
+                        i += 3;
+                    } else {
+                        hit |= set[i] == *c;
+                        i += 1;
+                    }
+                }
+                hit != neg && seg_match(&pat[end + 1..], &s[1..])
+            }
+            _ => false,
+        },
+        (Some(p), Some(c)) => p == c && seg_match(&pat[1..], &s[1..]),
+        _ => false,
+    }
+}
+
+/// Paths an absolute glob matches on disk, dot files included, at most `cap` per level.
+fn glob_matches(pattern: &str, cap: usize) -> Vec<String> {
+    let mut found = vec![PathBuf::from("/")];
+    for part in pattern.split('/').filter(|p| !p.is_empty()) {
+        let mut next = Vec::new();
+        for base in &found {
+            if !part.contains(['*', '?', '[']) {
+                let joined = base.join(part);
+                if joined.exists() {
+                    next.push(joined);
+                }
+                continue;
+            }
+            let pat: Vec<char> = part.chars().collect();
+            for e in fs::read_dir(base).into_iter().flatten().flatten() {
+                let name: Vec<char> = e.file_name().to_string_lossy().chars().collect();
+                if seg_match(&pat, &name) {
+                    next.push(base.join(e.file_name()));
+                }
+            }
+        }
+        next.truncate(cap);
+        found = next;
+    }
+    found.into_iter().map(|p| p.to_string_lossy().into_owned()).collect()
+}
+
 fn secrets_read(path: &str, cfg: &GuardConfig) -> Decision {
-    if is_private_key(path, cfg) {
+    if names_secret(path, cfg) {
         Decision::deny("secrets", SECRETS_REASON)
     } else {
         Decision::allow()
     }
 }
 
-/// The words of a command that may name a file: its arguments, redirect targets, and the
-/// `@file` / `name=@file` forms curl and httpie take.
-fn file_words(text: &str) -> Vec<String> {
-    // Split on everything a path cannot hold unquoted, so `open("~/.ssh/k")`, `f=@k` and `<k`
-    // all leave the bare path.
-    text.replace("${HOME}", "$HOME")
-        .split(|c: char| c.is_whitespace() || "()[]{},;|&<>\"'=@`\\".contains(c))
+/// `NAME=value` assignments on the line, so a later `$NAME` / `${NAME}` reads as its value.
+fn assignments(text: &str) -> Vec<(String, String)> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"(?:^|[\s;&|(])(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=([^\s;&|)]+)").unwrap());
+    re.captures_iter(text).flatten().filter_map(|c| Some((c.get(1)?.as_str().to_string(), c.get(2)?.as_str().to_string()))).collect()
+}
+
+/// The words of a command that may name a file: quotes and backslashes removed, assigned
+/// variables substituted, then split on everything a path cannot hold unquoted, so
+/// `open("~/.ssh/k")`, `f=@k`, `<k` and `~/.s''sh/k` all leave the bare path.
+fn file_words(text: &str, vars: &[(String, String)]) -> Vec<String> {
+    let mut t = without_quoting(text).replace("${HOME}", "$HOME");
+    for (name, value) in vars {
+        t = t.replace(&format!("${{{name}}}"), value).replace(&format!("${name}"), value);
+    }
+    t.split(|c: char| c.is_whitespace() || "(){},;|&<>=@`".contains(c))
         .filter(|w| !w.is_empty())
         .map(str::to_string)
         .collect::<Vec<_>>()
 }
 
-/// Exfiltration of keys, not their use. Denied: a reader or sender (`cat`, `base64`, `curl`,
-/// `pbcopy`, an inline script, ...) given a private key file, and a decrypted keychain dump.
-/// ssh, git, ssh-add, ssh-keygen and copies to a fleet Mac use keys and are allowed. No ask:
-/// a guard here never waits on the owner.
+/// Exfiltration of keys, not their use. Any command that names a private key (or ~/.ssh, or a
+/// glob that reaches one) is denied unless its program uses keys in place: ssh, git, ssh-add,
+/// ssh-keygen, chmod, ls, stat, trash; cp/mv that stay inside ~/.ssh; scp/rsync/sftp to a fleet
+/// Mac with no option that can redirect the connection. Also a decrypted keychain dump. Deny
+/// only, never ask. A tripwire for an agent talked into it, not a sandbox: a script file the
+/// agent writes and then runs is not read.
 fn secrets(cmd: &str, cfg: &GuardConfig) -> Decision {
-    const READERS: &[&str] = &[
-        "cat", "head", "tail", "less", "more", "bat", "nl", "tac", "base64", "base32", "xxd", "od", "hexdump",
-        "strings", "pbcopy", "curl", "wget", "nc", "ncat", "socat", "openssl", "gpg", "zip", "tar", "gzip", "awk",
-        "sed", "grep", "cut", "tr", "dd", "tee", "jq", "http", "https", "aws", "gsutil", "rclone", "gh",
-        "agent-mail", "mail", "sendmail", "osascript",
+    const USERS: &[&str] = &[
+        "ssh", "ssh-add", "ssh-keygen", "ssh-copy-id", "git", "chmod", "chown", "chflags", "ls", "stat", "test", "[",
+        "[[", "file", "trash", "echo", "printf", "agent-mail", "cd", "pushd", "wc",
     ];
     const COPIERS: &[&str] = &["scp", "rsync", "sftp"];
-    let names_key = |text: &str| file_words(text).iter().any(|w| is_private_key(w, cfg));
-    if !cmd.contains(".ssh") && !cmd.contains("id_") && !cmd.contains("dump-keychain") && cfg.secret_paths.is_empty() {
-        return Decision::allow();
-    }
-    let all = units_deep(cmd);
-    if any_unparsed(&all) && names_key(cmd) {
-        return Decision::deny("secrets", SECRETS_REASON);
+    let deny = || Decision::deny("secrets", SECRETS_REASON);
+    let all = units(cmd);
+    let vars = assignments(&without_quoting(cmd));
+    let mut local = cfg.clone();
+    if any_unparsed(&all) && file_words(cmd, &vars).iter().any(|w| names_secret(w, cfg)) {
+        return deny();
     }
     for u in &all {
         if u.carrier {
             continue;
         }
         let prog = u.prog();
-        if prog == "security" && u.argv.iter().any(|a| a == "dump-keychain") && u.argv.iter().any(|a| a.starts_with('-') && a.contains('d')) {
+        if prog == "security" && u.argv.iter().any(|a| a == "dump-keychain") && u.argv.iter().any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('d')) {
             return Decision::deny("secrets", "A decrypted keychain dump prints every password on this Mac. Read the one item a job needs with `security find-generic-password -s SERVICE -w`.");
         }
-        let key_here = names_key(&u.text);
-        if !key_here {
+        if matches!(prog, "cd" | "pushd") && u.remote.is_none() {
+            if let Some(dir) = u.operands().first() {
+                local.cwd = PathBuf::from(key_path(dir, &local));
+            }
+        }
+        let words = file_words(&u.text, &vars);
+        if !words.iter().any(|w| names_secret(w, &local)) || prog.is_empty() {
+            continue;
+        }
+        if USERS.contains(&prog) {
+            continue;
+        }
+        let ssh = format!("{}/", ssh_dir(&local));
+        if matches!(prog, "cp" | "mv") && u.operands().iter().all(|w| key_path(w, &local).starts_with(&ssh)) {
             continue;
         }
         if COPIERS.contains(&prog) {
+            let redirect = u.argv.iter().skip(1).any(|a| {
+                a.starts_with("--rsh") || a.starts_with("--rsync-path") || a.starts_with("--proxy")
+                    || (a.starts_with('-') && !a.starts_with("--") && a.contains(['o', 'F', 'J', 'S', 'e']))
+            });
             let fleet = |w: &str| {
                 let host = w.split_once(':').map(|(h, _)| h.rsplit('@').next().unwrap_or(h));
                 host.is_some_and(|h| cfg.air_aliases.iter().chain(cfg.air_hosts.iter()).any(|a| a == h))
             };
-            let remote: Vec<&str> = u.operands().into_iter().filter(|w| w.contains(':') && !w.starts_with('/')).collect();
-            if remote.iter().all(|w| fleet(w)) {
+            let ops = u.operands();
+            let dest = ops.last().copied().unwrap_or("");
+            if !redirect && u.remote.is_none() && ops.len() >= 2 && dest.contains(':') && fleet(dest) {
                 continue;
             }
-            return Decision::deny("secrets", format!("{SECRETS_REASON} This copy goes somewhere that is not a fleet Mac."));
         }
-        if READERS.contains(&prog) || runs_inline_script(prog) || SHELLS.contains(&prog) && u.text.contains("<") {
-            return Decision::deny("secrets", SECRETS_REASON);
-        }
+        return deny();
     }
     Decision::allow()
 }
