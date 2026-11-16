@@ -2259,12 +2259,19 @@ fn idrive_cleanup(cmd: &str, cfg: &GuardConfig) -> Decision {
 /// The path a file-reading tool call names: Claude `Read` (`file_path`) or `Grep` (`path`).
 fn read_target(value: &Value) -> Option<String> {
     let tool = value.get("tool_name").and_then(|t| t.as_str())?;
-    let field = match tool {
-        "Read" => "file_path",
-        "Grep" => "path",
-        _ => return None,
-    };
-    value.get("tool_input")?.get(field).and_then(|p| p.as_str()).filter(|p| !p.is_empty()).map(str::to_string)
+    let input = value.get("tool_input")?;
+    let get = |f: &str| input.get(f).and_then(|p| p.as_str()).filter(|p| !p.is_empty()).map(str::to_string);
+    match tool {
+        "Read" => get("file_path"),
+        // A Grep whose glob aims at ssh's folder or a key name reads keys wherever it starts.
+        "Grep" => match get("glob") {
+            Some(g) if g.contains(".ssh") || ["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"].iter().any(|k| g.contains(k)) => {
+                Some("~/.ssh".into())
+            }
+            _ => Some(get("path").unwrap_or_else(|| ".".into())),
+        },
+        _ => None,
+    }
 }
 
 const SECRETS_REASON: &str = "Private keys are used in place, never read: ssh, git, scp and ssh-add use them as they are. For what a key is, run `ssh-keygen -lf KEY` (fingerprint) or `ssh-keygen -y -f KEY` (its public half). To put a key on another fleet Mac, scp or rsync it there with no -o/-F/-J/-S/-e options; that is allowed.";
@@ -2392,6 +2399,13 @@ fn secrets_read(path: &str, cfg: &GuardConfig) -> Decision {
     }
 }
 
+/// What a command reads on stdin: the word after each `<` (not `<<` or `<(`).
+fn redirect_sources(text: &str) -> Vec<String> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r#"(?<![<0-9])[0-9]?<(?![<(&])\s*([^\s;&|)]+)"#).unwrap());
+    re.captures_iter(&without_quoting(text)).flatten().filter_map(|c| Some(c.get(1)?.as_str().to_string())).collect()
+}
+
 /// `NAME=value` assignments on the line, so a later `$NAME` / `${NAME}` reads as its value.
 fn assignments(text: &str) -> Vec<(String, String)> {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -2446,15 +2460,44 @@ fn secrets(cmd: &str, cfg: &GuardConfig) -> Decision {
             }
         }
         let words = file_words(&u.text, &vars);
-        if !words.iter().any(|w| names_secret(w, &local)) || prog.is_empty() {
+        if !words.iter().any(|w| names_secret(w, &local)) {
+            continue;
+        }
+        // A key read on stdin (`prog < key`, `$(<key)`) is data whatever the program is.
+        let fed = redirect_sources(&u.text).iter().any(|w| {
+            file_words(w, &vars).iter().any(|x| names_secret(x, &local))
+        });
+        if fed {
+            return deny();
+        }
+        if prog.is_empty() {
+            continue;
+        }
+        // git uses a key through ssh (`-c core.sshCommand=...`, GIT_SSH_COMMAND, a message
+        // that names one); a key as a path argument (`git add`, `hash-object`) is read as data.
+        if prog == "git" {
+            let subst = |a: &str| vars.iter().fold(a.replace("${HOME}", "$HOME"), |t, (n, v)| t.replace(&format!("${{{n}}}"), v).replace(&format!("${n}"), v));
+            if u.argv.iter().skip(1).any(|a| !a.contains(char::is_whitespace) && names_secret(&subst(a), &local)) {
+                return deny();
+            }
             continue;
         }
         if USERS.contains(&prog) {
             continue;
         }
         let ssh = format!("{}/", ssh_dir(&local));
-        if matches!(prog, "cp" | "mv") && u.operands().iter().all(|w| key_path(w, &local).starts_with(&ssh)) {
-            continue;
+        // Within ~/.ssh, and the copy is still a key by name: `cp k k.pub; cat k.pub` is not.
+        if matches!(prog, "cp" | "mv") {
+            let ops = u.operands();
+            let inside = ops.iter().all(|w| key_path(w, &local).starts_with(&ssh));
+            let dest = ops.last().map(|w| key_path(w, &local)).unwrap_or_default();
+            let dest_is_dir = dest.ends_with('/') || Path::new(&dest).is_dir();
+            if inside && ops.len() >= 2 && (dest_is_dir || is_private_key(&dest, &local)) {
+                if !dest_is_dir || ops[..ops.len() - 1].iter().all(|w| is_private_key(w, &local)) {
+                    continue;
+                }
+            }
+            return deny();
         }
         if COPIERS.contains(&prog) {
             let redirect = u.argv.iter().skip(1).any(|a| {
@@ -2465,9 +2508,14 @@ fn secrets(cmd: &str, cfg: &GuardConfig) -> Decision {
                 let host = w.split_once(':').map(|(h, _)| h.rsplit('@').next().unwrap_or(h));
                 host.is_some_and(|h| cfg.air_aliases.iter().chain(cfg.air_hosts.iter()).any(|a| a == h))
             };
+            // rsync reads its connection program from the environment too.
+            let env_redirect = ["RSYNC_RSH", "RSYNC_CONNECT_PROG", "RSYNC_PROXY"].iter().any(|n| {
+                u.wrappers.iter().any(|w| w.contains(&format!("{n}="))) || u.text.contains(&format!("{n}="))
+                    || vars.iter().any(|(k, _)| k == n)
+            });
             let ops = u.operands();
             let dest = ops.last().copied().unwrap_or("");
-            if !redirect && u.remote.is_none() && ops.len() >= 2 && dest.contains(':') && fleet(dest) {
+            if !redirect && !env_redirect && u.remote.is_none() && ops.len() >= 2 && dest.contains(':') && fleet(dest) {
                 continue;
             }
         }
