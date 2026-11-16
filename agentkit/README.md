@@ -86,6 +86,14 @@ have no binary of their own:
 | `idrive-cleanup` | deny starting IDrive's Archive Cleanup (AppleScript, the client's program, a cleanup script); the patterns are `guards.idrive_cleanup_patterns` |
 | `secrets` | deny any command that names a private key (a file in `~/.ssh` that is not public material, an `id_<type>` key anywhere, a `guards.secret_paths` entry), the `~/.ssh` folder, or a glob that reaches one on disk, unless its program uses keys in place: `ssh`, git, `ssh-add`, `ssh-keygen`, `chmod`, `ls`, `stat`, `trash`, `echo`/`agent-mail` (text only), `cp`/`mv` within `~/.ssh`, and `scp`/`rsync`/`sftp` to a fleet Mac with no `-o`/`-F`/`-J`/`-S`/`-e`/`--rsh`. Quotes, `$VAR` assignments and `cd` on the line are followed. Also `Read` and `Grep` of a key or the folder, and a decrypted keychain dump. Deny only, never ask. A tripwire for an agent talked into it, not a sandbox: a script file the agent writes and then runs is not read |
 
+`secrets`, known gaps (review of 16 Nov 2026; evasions by an agent working around the
+guard, not normal use): a Grep is judged by its glob's text, not by whether its root holds
+`~/.ssh` (multiple globs, `type`, `!` forms); git's path lists read from a file or stdin
+are only caught when the line also names a key; `cp`/`mv` with `-t`/`--target-directory`
+take the last word as the destination. A shell folder above `~/.ssh` (`find ~`,
+`grep -r … ~`) is left open on purpose. Closing these is fine if it costs ordinary work
+nothing.
+
 The `icloud` guard denies emptying the Trash on every host, an exempt worker included.
 `slot-holder`, `slot-files`, `approval-files` and `idrive-cleanup` work with no site
 configuration; `guards.slot_state_dir`, `guards.slot_files`, `guards.approval_file_patterns`
