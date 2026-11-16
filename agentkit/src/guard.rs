@@ -2264,10 +2264,12 @@ fn read_target(value: &Value) -> Option<String> {
     match tool {
         "Read" => get("file_path"),
         // A Grep whose glob aims at ssh's folder or a key name reads keys wherever it starts.
+        // Grep (ripgrep) skips dot folders unless its glob reaches into one. A glob with a
+        // segment that can match a dot name, or a key name, is judged as a search of ~/.ssh.
         "Grep" => match get("glob") {
-            Some(g) if g.contains(".ssh") || ["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"].iter().any(|k| g.contains(k)) => {
-                Some("~/.ssh".into())
-            }
+            Some(g) if g.split(['/', ',', '{', '}']).any(|seg| {
+                seg.starts_with(['.', '[', '?']) || seg.contains("id_") || seg.contains("ssh")
+            }) => Some("~/.ssh".into()),
             _ => Some(get("path").unwrap_or_else(|| ".".into())),
         },
         _ => None,
@@ -2477,7 +2479,10 @@ fn secrets(cmd: &str, cfg: &GuardConfig) -> Decision {
         // that names one); a key as a path argument (`git add`, `hash-object`) is read as data.
         if prog == "git" {
             let subst = |a: &str| vars.iter().fold(a.replace("${HOME}", "$HOME"), |t, (n, v)| t.replace(&format!("${{{n}}}"), v).replace(&format!("${n}"), v));
-            if u.argv.iter().skip(1).any(|a| !a.contains(char::is_whitespace) && names_secret(&subst(a), &local)) {
+            let as_path = |a: &String| !a.contains(char::is_whitespace)
+                && file_words(&subst(a), &[]).iter().any(|p| names_secret(p, &local));
+            let from_stdin = u.argv.iter().any(|a| a == "--stdin-paths" || a == "--stdin" || a.starts_with("--pathspec-from-file"));
+            if u.argv.iter().skip(1).any(as_path) || from_stdin {
                 return deny();
             }
             continue;
@@ -2492,10 +2497,16 @@ fn secrets(cmd: &str, cfg: &GuardConfig) -> Decision {
             let inside = ops.iter().all(|w| key_path(w, &local).starts_with(&ssh));
             let dest = ops.last().map(|w| key_path(w, &local)).unwrap_or_default();
             let dest_is_dir = dest.ends_with('/') || Path::new(&dest).is_dir();
-            if inside && ops.len() >= 2 && (dest_is_dir || is_private_key(&dest, &local)) {
-                if !dest_is_dir || ops[..ops.len() - 1].iter().all(|w| is_private_key(w, &local)) {
-                    continue;
-                }
+            // Each file the copy leaves behind must still be a key by name.
+            let results: Vec<String> = if dest_is_dir {
+                ops[..ops.len().saturating_sub(1)].iter()
+                    .map(|w| format!("{}/{}", dest.trim_end_matches('/'), base_name(&key_path(w, &local))))
+                    .collect()
+            } else {
+                vec![dest.clone()]
+            };
+            if inside && ops.len() >= 2 && results.iter().all(|r| is_private_key(r, &local)) {
+                continue;
             }
             return deny();
         }
@@ -2510,8 +2521,7 @@ fn secrets(cmd: &str, cfg: &GuardConfig) -> Decision {
             };
             // rsync reads its connection program from the environment too.
             let env_redirect = ["RSYNC_RSH", "RSYNC_CONNECT_PROG", "RSYNC_PROXY"].iter().any(|n| {
-                u.wrappers.iter().any(|w| w.contains(&format!("{n}="))) || u.text.contains(&format!("{n}="))
-                    || vars.iter().any(|(k, _)| k == n)
+                cmd.contains(n) || u.wrappers.iter().any(|w| w.contains(n)) || vars.iter().any(|(k, _)| k == n)
             });
             let ops = u.operands();
             let dest = ops.last().copied().unwrap_or("");
