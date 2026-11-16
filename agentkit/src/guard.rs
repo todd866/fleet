@@ -21,6 +21,7 @@ pub const ALL_GUARD_NAMES: &[&str] = &[
     "slot-files",
     "approval-files",
     "idrive-cleanup",
+    "secrets",
 ];
 use fancy_regex::Regex;
 use serde_json::Value;
@@ -92,6 +93,10 @@ pub fn combine_decisions(decisions: impl IntoIterator<Item = Decision>) -> Decis
 }
 
 pub fn decide_all(value: &Value, cfg: &GuardConfig, enabled: &[&str]) -> Decision {
+    if let Some(path) = read_target(value) {
+        // A file-reading tool call: only the secrets guard reads its path.
+        return if enabled.contains(&"secrets") { secrets_read(&path, cfg) } else { Decision::allow() };
+    }
     if !is_shell(value) {
         // A file-writing tool call: only the two path guards answer, from the path alone. The
         // content is never read, and a missing or malformed path allows.
@@ -111,6 +116,9 @@ pub fn decide_all(value: &Value, cfg: &GuardConfig, enabled: &[&str]) -> Decisio
 pub fn decide_value(name: &str, value: &Value, cfg: &GuardConfig) -> Decision {
     let adjusted = call_dir(value, cfg);
     let cfg = adjusted.as_ref().unwrap_or(cfg);
+    if let Some(path) = read_target(value) {
+        return if name == "secrets" { secrets_read(&path, cfg) } else { Decision::allow() };
+    }
     if !is_shell(value) {
         // A file-writing tool call carries the path it writes. Two guards protect paths, not
         // commands, so they read it; every other guard only reads shell commands.
@@ -138,6 +146,7 @@ pub fn decide_value(name: &str, value: &Value, cfg: &GuardConfig) -> Decision {
         "slot-files" => slot_files(&command, cfg),
         "approval-files" => approval_files(&command, cfg),
         "idrive-cleanup" => idrive_cleanup(&command, cfg),
+        "secrets" => secrets(&command, cfg),
         _ => Decision::allow(),
     }
 }
@@ -2243,6 +2252,118 @@ fn idrive_cleanup(cmd: &str, cfg: &GuardConfig) -> Decision {
     Decision::allow()
 }
 
+/// The path a file-reading tool call (Claude `Read`) names.
+fn read_target(value: &Value) -> Option<String> {
+    let tool = value.get("tool_name").and_then(|t| t.as_str())?;
+    if tool != "Read" {
+        return None;
+    }
+    value.get("tool_input")?.get("file_path").and_then(|p| p.as_str()).filter(|p| !p.is_empty()).map(str::to_string)
+}
+
+const SECRETS_REASON: &str = "Private keys are used in place, never read: ssh, git, scp and ssh-add use them as they are. For what a key is, run `ssh-keygen -lf KEY` (fingerprint) or `ssh-keygen -y -f KEY` (its public half). To put a key on another fleet Mac, scp or rsync it there; that is allowed.";
+
+/// A private key file: anything in ~/.ssh that is not public material or ssh's own lists, an
+/// `id_*` key anywhere, or a site path in `guards.secret_paths`.
+fn is_private_key(path: &str, cfg: &GuardConfig) -> bool {
+    let raw = path.trim().trim_matches(|c| c == '\'' || c == '"');
+    let raw = raw.strip_prefix("$HOME/").or_else(|| raw.strip_prefix("${HOME}/"))
+        .map(|rest| cfg.home.join(rest).to_string_lossy().into_owned())
+        .unwrap_or_else(|| raw.to_string());
+    if raw.is_empty() || raw.contains('*') && !raw.contains("/.ssh/") {
+        return false;
+    }
+    let full = resolve_path(&expand_path(&raw, cfg), cfg);
+    let base = base_name(&full);
+    let public = base.ends_with(".pub") || base.starts_with("known_hosts") || base.starts_with("authorized_keys")
+        || base == "config" || base.starts_with("config.") || base == "agent" || base == "environment";
+    let ssh_dir = resolve_path(&cfg.home.join(".ssh").to_string_lossy(), cfg);
+    if full.starts_with(&format!("{ssh_dir}/")) {
+        return !public && !full[ssh_dir.len() + 1..].starts_with("agent/");
+    }
+    // ssh-keygen's own names (`id_ed25519`, `id_rsa_work`, ...), not any word that starts with id_.
+    let key_type = ["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "id_xmss"].iter().any(|t| {
+        base.strip_prefix(t).is_some_and(|rest| rest.is_empty() || rest.starts_with(['_', '-', '.']))
+    });
+    if key_type && !public {
+        return true;
+    }
+    cfg.secret_paths.iter().any(|p| {
+        let want = resolve_path(&expand_path(p, cfg), cfg);
+        full == want || full.starts_with(&format!("{}/", want.trim_end_matches('/')))
+    })
+}
+
+fn secrets_read(path: &str, cfg: &GuardConfig) -> Decision {
+    if is_private_key(path, cfg) {
+        Decision::deny("secrets", SECRETS_REASON)
+    } else {
+        Decision::allow()
+    }
+}
+
+/// The words of a command that may name a file: its arguments, redirect targets, and the
+/// `@file` / `name=@file` forms curl and httpie take.
+fn file_words(text: &str) -> Vec<String> {
+    // Split on everything a path cannot hold unquoted, so `open("~/.ssh/k")`, `f=@k` and `<k`
+    // all leave the bare path.
+    text.replace("${HOME}", "$HOME")
+        .split(|c: char| c.is_whitespace() || "()[]{},;|&<>\"'=@`\\".contains(c))
+        .filter(|w| !w.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>()
+}
+
+/// Exfiltration of keys, not their use. Denied: a reader or sender (`cat`, `base64`, `curl`,
+/// `pbcopy`, an inline script, ...) given a private key file, and a decrypted keychain dump.
+/// ssh, git, ssh-add, ssh-keygen and copies to a fleet Mac use keys and are allowed. No ask:
+/// a guard here never waits on the owner.
+fn secrets(cmd: &str, cfg: &GuardConfig) -> Decision {
+    const READERS: &[&str] = &[
+        "cat", "head", "tail", "less", "more", "bat", "nl", "tac", "base64", "base32", "xxd", "od", "hexdump",
+        "strings", "pbcopy", "curl", "wget", "nc", "ncat", "socat", "openssl", "gpg", "zip", "tar", "gzip", "awk",
+        "sed", "grep", "cut", "tr", "dd", "tee", "jq", "http", "https", "aws", "gsutil", "rclone", "gh",
+        "agent-mail", "mail", "sendmail", "osascript",
+    ];
+    const COPIERS: &[&str] = &["scp", "rsync", "sftp"];
+    let names_key = |text: &str| file_words(text).iter().any(|w| is_private_key(w, cfg));
+    if !cmd.contains(".ssh") && !cmd.contains("id_") && !cmd.contains("dump-keychain") && cfg.secret_paths.is_empty() {
+        return Decision::allow();
+    }
+    let all = units_deep(cmd);
+    if any_unparsed(&all) && names_key(cmd) {
+        return Decision::deny("secrets", SECRETS_REASON);
+    }
+    for u in &all {
+        if u.carrier {
+            continue;
+        }
+        let prog = u.prog();
+        if prog == "security" && u.argv.iter().any(|a| a == "dump-keychain") && u.argv.iter().any(|a| a.starts_with('-') && a.contains('d')) {
+            return Decision::deny("secrets", "A decrypted keychain dump prints every password on this Mac. Read the one item a job needs with `security find-generic-password -s SERVICE -w`.");
+        }
+        let key_here = names_key(&u.text);
+        if !key_here {
+            continue;
+        }
+        if COPIERS.contains(&prog) {
+            let fleet = |w: &str| {
+                let host = w.split_once(':').map(|(h, _)| h.rsplit('@').next().unwrap_or(h));
+                host.is_some_and(|h| cfg.air_aliases.iter().chain(cfg.air_hosts.iter()).any(|a| a == h))
+            };
+            let remote: Vec<&str> = u.operands().into_iter().filter(|w| w.contains(':') && !w.starts_with('/')).collect();
+            if remote.iter().all(|w| fleet(w)) {
+                continue;
+            }
+            return Decision::deny("secrets", format!("{SECRETS_REASON} This copy goes somewhere that is not a fleet Mac."));
+        }
+        if READERS.contains(&prog) || runs_inline_script(prog) || SHELLS.contains(&prog) && u.text.contains("<") {
+            return Decision::deny("secrets", SECRETS_REASON);
+        }
+    }
+    Decision::allow()
+}
+
 /// Known-bad and known-safe commands the doctor runs. A weakened guard fails the doctor.
 pub fn self_test(cfg: &GuardConfig) -> Result<(), String> {
     // An absolute path outside temp, not `~/...`: a test HOME can sit inside $TMPDIR,
@@ -2297,5 +2418,7 @@ pub fn self_test(cfg: &GuardConfig) -> Result<(), String> {
     stock.idrive_cleanup_patterns = crate::site::DEFAULT_IDRIVE_CLEANUP_PATTERNS.iter().map(|s| (*s).to_string()).collect();
     expect("idrive-cleanup", idrive_cleanup("perl archive_cleanup.pl", &stock), true, "the archive cleanup script")?;
     expect("idrive-cleanup", idrive_cleanup("grep -i 'archive cleanup' notes.md", &stock), false, "a search for the words")?;
+    expect("secrets", secrets("cat ~/.ssh/id_ed25519", cfg), true, "printing a private key")?;
+    expect("secrets", secrets("ssh-keygen -y -f ~/.ssh/id_ed25519", cfg), false, "reading a key's public half")?;
     Ok(())
 }

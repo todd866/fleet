@@ -312,6 +312,14 @@ class Thresholds(unittest.TestCase):
         none = by_key(evaluate(absent, config(), NOW_S))["capacity:claude:5h"]
         self.assertEqual((none.status, none.value), ("pass", "none"))
 
+    def test_a_guard_turned_off_in_site_config_is_info_not_a_failure(self):
+        guards = [{"name": "hard-delete", "installed": False, "trusted": False, "firing": False, "detail": "disabled (site)"},
+                  {"name": "push", "installed": False, "trusted": True, "firing": False, "detail": ""}]
+        kit = {"ok": True, "issues": [], "conformance": {"providers": [{"id": "claude", "guards": guards}]}}
+        found = by_key(evaluate({"agentkit": kit}, config(), NOW_S))
+        self.assertEqual((found["kit:claude:hard-delete"].status, found["kit:claude:hard-delete"].value), ("info", "off"))
+        self.assertEqual(found["kit:claude:push"].status, "fail")
+
     def test_agent_board_mail_and_project_defaults(self):
         stale = {"work": "export", "state": "stale", "heartbeat": NOW_S - 10 * HOUR,
                  "ttl": HOUR, "conflicts": [], "owner": {"session": "abc"}}

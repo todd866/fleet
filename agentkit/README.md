@@ -84,6 +84,7 @@ have no binary of their own:
 | `slot-files` | deny writes to heavy-slot's `limit` and `cool` files: redirect, `tee`, `sed -i`, `cp`/`mv`, an inline script, and Claude's `Write`/`Edit` |
 | `approval-files` | deny creating an `APPROVE_*` marker file from a shell (`touch`, redirect, `tee`, `cp`, `mv`, `install`, over ssh too) or with `Write`/`Edit`; the owner creates those |
 | `idrive-cleanup` | deny starting IDrive's Archive Cleanup (AppleScript, the client's program, a cleanup script); the patterns are `guards.idrive_cleanup_patterns` |
+| `secrets` | deny printing or sending a private key: a reader or sender (`cat`, `base64`, `curl -F @`, `pbcopy`, an inline script, over ssh too) given a file in `~/.ssh` that is not public material, an `id_<type>` key anywhere, or a `guards.secret_paths` entry; `Read` of one; a decrypted keychain dump (`dump-keychain -d`). Using keys is allowed: `ssh -i`, git, `ssh-add`, `ssh-keygen -l`/`-y`, `scp`/`rsync` to a fleet Mac. Deny only, never ask |
 
 The `icloud` guard denies emptying the Trash on every host, an exempt worker included.
 `slot-holder`, `slot-files`, `approval-files` and `idrive-cleanup` work with no site

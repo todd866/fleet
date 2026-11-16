@@ -191,6 +191,7 @@ const GUARD_RULES: &str = "\
 - slot-files: deny writes to heavy-slot's `limit` and `cool` files; a full slot on a cool, idle Mac is a fault to report.
 - approval-files: deny creating an `APPROVE_*` marker file; only the owner creates one.
 - idrive-cleanup: deny starting IDrive's Archive Cleanup, which deletes offloaded files from the backup.
+- secrets: deny printing or sending a private key (cat, base64, curl, pbcopy, Read ...) and a decrypted keychain dump; using keys (ssh, git, ssh-keygen -y/-l, scp to a fleet Mac) is allowed.
 ";
 
 fn render_mdc(
@@ -322,6 +323,7 @@ const GUARDS: &[(&str, u64, bool)] = &[
     ("slot-files", 10, true),
     ("approval-files", 10, true),
     ("idrive-cleanup", 10, true),
+    ("secrets", 10, true),
 ];
 
 fn provider_rules(paths: &Paths, provider: &str, _core_src: &Path) -> Result<Planned, String> {
@@ -447,10 +449,10 @@ fn merge_claude(path: &Path, bin: &str, site: &Site) -> Result<String, String> {
         let guards = enabled_guards(site);
         if !guards.is_empty() {
             let max_timeout = guards.iter().map(|(_, t, _)| *t).max().unwrap_or(20);
-            // File-writing tools too: slot-files and approval-files protect paths, and a Write
-            // or Edit reaches those paths without a shell. Every other guard allows them at once.
+            // File tools too: slot-files and approval-files protect paths a Write or Edit reaches
+            // without a shell, and secrets keeps Read off private keys. Others allow them at once.
             arr.push(json!({
-                "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit",
+                "matcher": "Bash|Read|Write|Edit|MultiEdit|NotebookEdit",
                 "hooks": [{
                     "type": "command",
                     "command": format!("{bin} hook claude all"),

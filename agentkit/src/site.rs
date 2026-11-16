@@ -35,6 +35,8 @@ pub struct GuardConfig {
     pub approval_file_patterns: Vec<String>,
     /// Regular expressions that name the backup client's destructive cleanup.
     pub idrive_cleanup_patterns: Vec<String>,
+    /// More private-key or credential files the secrets guard keeps from being printed or sent.
+    pub secret_paths: Vec<String>,
 }
 
 pub const DEFAULT_SLOT_FILES: &[&str] = &["limit", "cool"];
@@ -63,6 +65,7 @@ impl Default for GuardConfig {
             slot_files: DEFAULT_SLOT_FILES.iter().map(|s| (*s).to_string()).collect(),
             approval_file_patterns: DEFAULT_APPROVAL_FILE_PATTERNS.iter().map(|s| (*s).to_string()).collect(),
             idrive_cleanup_patterns: DEFAULT_IDRIVE_CLEANUP_PATTERNS.iter().map(|s| (*s).to_string()).collect(),
+            secret_paths: Vec::new(),
         }
     }
 }
@@ -168,6 +171,9 @@ pub struct GuardFile {
     /// Regular expressions naming the backup client's cleanup that deletes from the backup.
     #[serde(default)]
     pub idrive_cleanup_patterns: Vec<String>,
+    /// Extra private-key or credential files for the secrets guard (`~/` allowed).
+    #[serde(default)]
+    pub secret_paths: Vec<String>,
     /// Guards omitted from generated hooks (e.g. `push` when sessions run without prompts).
     #[serde(default)]
     pub disabled: Vec<String>,
@@ -276,6 +282,7 @@ pub(crate) fn apply_guards(cfg: &mut GuardConfig, config: &Path, guards: &GuardF
     if !guards.idrive_cleanup_patterns.is_empty() {
         cfg.idrive_cleanup_patterns = guards.idrive_cleanup_patterns.clone();
     }
+    cfg.secret_paths = guards.secret_paths.clone();
     if let Some(file) = &guards.email_substrings_file {
         let path = if Path::new(file).is_absolute() {
             PathBuf::from(file)

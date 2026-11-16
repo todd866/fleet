@@ -790,12 +790,18 @@ def _agentkit(kit):
             firing = guard.get("firing")
             ok = installed and trusted and firing
             detail = str(guard.get("detail") or "")
+            # The digest's own Mac runs the doctor. A guard the owner turned off in that Mac's
+            # site config is a choice on record, not a fault to file every morning.
+            if not ok and detail.startswith("disabled (site)"):
+                rows.append(_row(f"kit:{pid}:{name}", "info", "other", f"{site.hub()}:fleet", "off",
+                                 f"{pid}/{name}", f"{detail}: turned off in this Mac's agentkit.toml"))
+                continue
             rows.append(
                 _row(
                     f"kit:{pid}:{name}",
                     "pass" if ok else "fail",
                     "other",
-                    f"{site.primary()}:fleet",
+                    f"{site.hub()}:fleet",
                     "ok" if ok else "fail",
                     f"{pid}/{name}",
                     detail or ("conformance ok" if ok else "not installed/trusted/firing"),
