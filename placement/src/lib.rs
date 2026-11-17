@@ -16,9 +16,9 @@ mod stignore;
 
 pub use apply::{ApplyOpts, ApplyReport, TAKES_HEAVY_SLOT, apply, copy_tree, verify_trees, ymd};
 pub use eval::{evaluate, expand_units, free_bytes, verified_encrypted_copies};
-pub use init::{fleet_policy, host_id_from_diskmap};
+pub use init::{fleet_policy, host_id_from_diskmap, peers_from_diskmap};
 pub use model::*;
-pub use observe::load_observation;
+pub use observe::{PeerTrust, load_observation, load_observation_with_peers};
 pub use status::{format_plan, format_status, status_file};
 pub use stignore::stignore;
 

@@ -4,7 +4,6 @@ use crate::apply::{ApplyOpts, apply};
 use crate::eval::evaluate;
 use crate::init::{fleet_policy, host_id_from_diskmap};
 use crate::model::{load_policy, render_policy, ActionKind};
-use crate::observe::load_observation;
 use crate::status::{format_plan, format_status, status_file};
 use std::env;
 use std::fs;
@@ -362,11 +361,27 @@ fn cmd_init(args: &[String]) -> i32 {
 fn observation(flags: &Flags) -> crate::model::Observation {
     let dir = flags.diskmap.clone().unwrap_or_else(default_diskmap);
     let replicas = flags.replicas.clone().unwrap_or_else(default_replicas);
-    let mut obs = load_observation(&dir, Some(&replicas), unix_now());
+    let mut obs = crate::observe::load_observation_with_peers(&dir, Some(&replicas), unix_now(), &peer_trust());
     if obs.now == 0 {
         obs.now = unix_now();
     }
     obs
+}
+
+/// This Mac's id from the diskmap host map (or PLACEMENT_HOST), and the peers it may read.
+/// No id, no peers: fail closed rather than guess which rows are this Mac's.
+fn peer_trust() -> crate::observe::PeerTrust {
+    let text = fs::read_to_string(diskmap_config_path()).unwrap_or_default();
+    let self_id = env::var("PLACEMENT_HOST")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| crate::init::host_id_from_diskmap(&text, &local_hostname()))
+        .unwrap_or_default();
+    if self_id.is_empty() {
+        return crate::observe::PeerTrust::default();
+    }
+    let peers = crate::init::peers_from_diskmap(&text, &self_id);
+    crate::observe::PeerTrust { self_id, peers }
 }
 
 fn read_policy(path: Option<&std::path::Path>) -> Result<crate::model::Policy, String> {

@@ -121,7 +121,7 @@ fn cmd_fleet(args: &[String]) -> i32 {
             if peer == &host.id || peer == &host.local_host_name {
                 continue;
             }
-            match fetch_peer(&roots, peer) {
+            match fetch_peer(&roots, peer, &host.id) {
                 Ok(summary) => summaries.push(summary),
                 Err(err) => eprintln!("diskmap: {peer}: {err}"),
             }
@@ -145,9 +145,9 @@ fn load_or_build(roots: &Roots) -> Result<Summary, String> {
     tick::rebuild_summary(roots)
 }
 
-fn fetch_peer(roots: &Roots, peer: &str) -> Result<Summary, String> {
+fn fetch_peer(roots: &Roots, peer: &str, self_id: &str) -> Result<Summary, String> {
     if let Ok(out) = ssh_output(peer, "diskmap json") {
-        if let Ok(summary) = crate::peers::store_summary(&roots.state, peer, &out) {
+        if let Ok(summary) = crate::peers::store_summary(&roots.state, peer, self_id, &out) {
             return Ok(summary);
         }
     }
@@ -170,12 +170,12 @@ fn cmd_peers() -> i32 {
         if peer == &me.id || peer == &me.local_host_name {
             continue;
         }
-        let summary = match fetch_peer(&roots, peer) {
+        let summary = match fetch_peer(&roots, peer, &me.id) {
             Ok(s) => format!("summary {}", logic::fmt_age(now, s.generated)),
             Err(err) => format!("summary {err}"),
         };
         let fresh = ssh_output(peer, "diskmap where '*' --json --remote-ask")
-            .and_then(|out| crate::peers::store_where(&roots.state, peer, &out, now));
+            .and_then(|out| crate::peers::store_where(&roots.state, peer, &me.id, &out, now));
         let rows = match fresh {
             Ok(doc) => format!("where {} rows, measured {} ago", doc.matches.len(), logic::fmt_age(now, doc.generated)),
             Err(err) => match crate::peers::read_where(&roots.state, peer) {

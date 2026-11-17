@@ -320,6 +320,33 @@ fn map_class(class: &str) -> Class {
 }
 
 /// `~/.config/diskmap/config.json` maps a local host name to the id used in the policy.
+/// The peers this Mac may read caches for: diskmap's `peers` list and the ids in its host
+/// map, without this Mac's own id.
+pub fn peers_from_diskmap(config_text: &str, self_id: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<Value>(config_text) else {
+        return vec![];
+    };
+    let mut out: Vec<String> = value
+        .get("peers")
+        .and_then(|p| p.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p.as_str().map(str::to_string))
+        .chain(
+            value
+                .get("hosts")
+                .and_then(|h| h.as_object())
+                .into_iter()
+                .flat_map(|h| h.values())
+                .filter_map(|h| h.get("id").and_then(|i| i.as_str()).map(str::to_string)),
+        )
+        .filter(|p| !p.is_empty() && p != self_id)
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 pub fn host_id_from_diskmap(config_text: &str, local_host_name: &str) -> Option<String> {
     let value: Value = serde_json::from_str(config_text).ok()?;
     let id = value

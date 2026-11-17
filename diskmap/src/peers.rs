@@ -25,12 +25,29 @@ pub fn summary_path(state: &Path, peer: &str) -> PathBuf {
     state.join("peers").join(format!("{peer}.json"))
 }
 
-/// Store the output of `diskmap where '*' --json --remote-ask` from `peer`. Refuses output
-/// that does not parse or holds no rows, so a broken answer never replaces a good cache.
-pub fn store_where(state: &Path, peer: &str, stdout: &[u8], now: i64) -> Result<PeerWhere, String> {
-    let rows: Vec<WhereHit> = serde_json::from_slice(stdout).map_err(|e| format!("where: {e}"))?;
+/// A peer speaks only for itself: never for this Mac (`self_id`), never for a third Mac.
+fn trusted(peer: &str, self_id: &str) -> Result<(), String> {
+    if peer.is_empty() || peer == self_id || peer.contains('/') || peer.starts_with('.') {
+        return Err(format!("{peer}: not a peer of {self_id}"));
+    }
+    Ok(())
+}
+
+/// Store the output of `diskmap where '*' --json --remote-ask` from `peer`. Keeps only rows
+/// whose host is `peer`. Refuses output that does not parse or holds no such rows, so a broken
+/// answer never replaces a good cache.
+pub fn store_where(
+    state: &Path,
+    peer: &str,
+    self_id: &str,
+    stdout: &[u8],
+    now: i64,
+) -> Result<PeerWhere, String> {
+    trusted(peer, self_id)?;
+    let mut rows: Vec<WhereHit> = serde_json::from_slice(stdout).map_err(|e| format!("where: {e}"))?;
+    rows.retain(|r| r.host == peer);
     if rows.is_empty() {
-        return Err("where: no rows".into());
+        return Err("where: no rows for this peer".into());
     }
     let doc = PeerWhere {
         generated: rows.iter().map(|r| r.as_of).max().unwrap_or(0),
@@ -43,10 +60,17 @@ pub fn store_where(state: &Path, peer: &str, stdout: &[u8], now: i64) -> Result<
     Ok(doc)
 }
 
-/// Store the output of `diskmap json` from `peer`. Same refusal rule as `store_where`.
-pub fn store_summary(state: &Path, peer: &str, stdout: &[u8]) -> Result<Summary, String> {
-    let summary: Summary = serde_json::from_slice(stdout).map_err(|e| format!("summary: {e}"))?;
-    write_atomic(&summary_path(state, peer), stdout)?;
+/// Store the output of `diskmap json` from `peer`. The summary must be the peer's own
+/// (`host_id`), and only its own locations are kept. Same refusal rule as `store_where`.
+pub fn store_summary(state: &Path, peer: &str, self_id: &str, stdout: &[u8]) -> Result<Summary, String> {
+    trusted(peer, self_id)?;
+    let mut summary: Summary = serde_json::from_slice(stdout).map_err(|e| format!("summary: {e}"))?;
+    if summary.host_id != peer {
+        return Err(format!("summary: from {}, not {peer}", summary.host_id));
+    }
+    summary.locations.retain(|l| l.host == peer);
+    let text = serde_json::to_string(&summary).map_err(|e| e.to_string())? + "\n";
+    write_atomic(&summary_path(state, peer), text.as_bytes())?;
     Ok(summary)
 }
 

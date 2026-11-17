@@ -3,12 +3,39 @@
 //! `peers/<peer>.where.json`, written by `diskmap peers`); this Mac's own files win for its host.
 
 use crate::model::{Access, Free, Observation, PeerSeen, Present, Replica};
-use std::collections::BTreeSet;
 use serde::Deserialize;
 use std::fs;
 use std::path::Path;
 
+/// Which peer caches may be read: `self_id` is this Mac's own id (from the diskmap host map,
+/// never inferred from the files), `peers` the ids it may hear from. A peer file speaks only
+/// for its own host; rows or frees it claims for any other host, this Mac included, are dropped.
+#[derive(Debug, Clone, Default)]
+pub struct PeerTrust {
+    pub self_id: String,
+    pub peers: Vec<String>,
+}
+
+impl PeerTrust {
+    fn allows(&self, peer: &str) -> bool {
+        !self.self_id.is_empty()
+            && !peer.is_empty()
+            && peer != self.self_id
+            && self.peers.iter().any(|p| p == peer)
+    }
+}
+
+/// This Mac's files only; peer caches are ignored.
 pub fn load_observation(diskmap_dir: &Path, replicas: Option<&Path>, now: i64) -> Observation {
+    load_observation_with_peers(diskmap_dir, replicas, now, &PeerTrust::default())
+}
+
+pub fn load_observation_with_peers(
+    diskmap_dir: &Path,
+    replicas: Option<&Path>,
+    now: i64,
+    trust: &PeerTrust,
+) -> Observation {
     let mut obs = Observation {
         now,
         diskmap_present: false,
@@ -18,23 +45,15 @@ pub fn load_observation(diskmap_dir: &Path, replicas: Option<&Path>, now: i64) -
         obs.diskmap_present = true;
         obs.frees.extend(frees);
     }
-    let local_rows = read_where(&diskmap_dir.join("where.json"));
-    let local_hosts: BTreeSet<String> = local_rows
-        .iter()
-        .flatten()
-        .map(|r| r.host.clone())
-        .chain(obs.frees.iter().map(|f| f.host.clone()))
-        .collect();
-    add_rows(&mut obs, local_rows.unwrap_or_default());
+    add_rows(&mut obs, read_where(&diskmap_dir.join("where.json")).unwrap_or_default());
     for (stem, file) in peer_files(diskmap_dir, ".where.json") {
+        if !trust.allows(&stem) {
+            continue;
+        }
         let Some(doc) = read_peer_where(&file) else {
             continue;
         };
-        let rows: Vec<WhereMatch> = doc
-            .matches
-            .into_iter()
-            .filter(|r| !local_hosts.contains(&r.host))
-            .collect();
+        let rows: Vec<WhereMatch> = doc.matches.into_iter().filter(|r| r.host == stem).collect();
         obs.peers.push(PeerSeen {
             host: stem,
             rows: rows.len(),
@@ -43,9 +62,12 @@ pub fn load_observation(diskmap_dir: &Path, replicas: Option<&Path>, now: i64) -
         });
         add_rows(&mut obs, rows);
     }
-    for (_, file) in peer_files(diskmap_dir, ".json") {
+    for (stem, file) in peer_files(diskmap_dir, ".json") {
+        if !trust.allows(&stem) {
+            continue;
+        }
         for free in read_frees(&file).unwrap_or_default() {
-            if !obs.frees.iter().any(|f| f.host == free.host) {
+            if free.host == stem && !obs.frees.iter().any(|f| f.host == free.host) {
                 obs.frees.push(free);
             }
         }

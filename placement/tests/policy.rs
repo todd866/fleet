@@ -1160,7 +1160,8 @@ fn write_peer_fixture(dir: &Path, with_peer: bool) {
             r#"{{"generated":{g},"fetched":{f},"min_bytes":0,"matches":[
               {{"host":"hub","location":"media","path":"Games/Demo","home_path":null,"bytes":4000000000,"as_of":{g},"kind":"volume"}},
               {{"host":"hub","location":"internal","path":"Users/u/Games/.stversions","home_path":"Games/.stversions","bytes":400000000,"as_of":{g},"kind":"volume"}},
-              {{"host":"primary","location":"internal","path":"Users/u/Games/Stale","home_path":"Games/Stale","bytes":9000000000,"as_of":{g},"kind":"volume"}}
+              {{"host":"primary","location":"internal","path":"Users/u/Games/Stale","home_path":"Games/Stale","bytes":9000000000,"as_of":{g},"kind":"volume"}},
+              {{"host":"shared","location":"internal","path":"Users/u/Games/Third","home_path":"Games/Third","bytes":9000000000,"as_of":{g},"kind":"volume"}}
             ]}}"#,
             g = NOW - 3600,
             f = NOW - 60
@@ -1170,9 +1171,28 @@ fn write_peer_fixture(dir: &Path, with_peer: bool) {
     fs::write(
         dir.join("peers/hub.json"),
         r#"{"generated":1,"locations":[{"kind":"volume","host":"hub","name":"internal","physical_drive":"internal","free_bytes":80000000000},
-           {"kind":"volume","host":"primary","name":"internal","physical_drive":"internal","free_bytes":1}]}"#,
+           {"kind":"volume","host":"primary","name":"internal","physical_drive":"internal","free_bytes":1},
+           {"kind":"volume","host":"shared","name":"internal","physical_drive":"internal","free_bytes":2}]}"#,
     )
     .unwrap();
+    // A cache named for this Mac is never read, whatever it claims.
+    fs::write(
+        dir.join("peers/primary.where.json"),
+        r#"{"generated":1,"fetched":1,"matches":[{"host":"primary","location":"internal","home_path":"Games/Forged","bytes":9000000000}]}"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.join("peers/primary.json"),
+        r#"{"generated":1,"locations":[{"kind":"volume","host":"primary","name":"internal","physical_drive":"internal","free_bytes":3}]}"#,
+    )
+    .unwrap();
+}
+
+fn trust() -> PeerTrust {
+    PeerTrust {
+        self_id: "primary".into(),
+        peers: vec!["hub".into(), "shared".into()],
+    }
 }
 
 fn master_gaps(plan: &Plan) -> Vec<String> {
@@ -1199,7 +1219,9 @@ fn a_master_on_a_peers_drive_is_seen_through_the_peer_cache() {
 
     let tmp = Tmp::new();
     write_peer_fixture(tmp.path(), true);
-    let seen = load_observation(tmp.path(), None, NOW);
+    let untrusted = load_observation(tmp.path(), None, NOW);
+    assert!(untrusted.peers.is_empty(), "without a known self id no peer cache is read");
+    let seen = load_observation_with_peers(tmp.path(), None, NOW, &trust());
     let plan = evaluate(&policy, &seen);
     assert!(master_gaps(&plan).is_empty(), "{:?}", master_gaps(&plan));
     assert_eq!(free_bytes(&seen, "hub"), Some(80_000_000_000), "peer summary gives the hub's free space");
@@ -1207,6 +1229,15 @@ fn a_master_on_a_peers_drive_is_seen_through_the_peer_cache() {
     assert!(
         !seen.present.iter().any(|p| p.path == "Games/Stale"),
         "a peer's copy of this Mac's rows never overrides this Mac's own"
+    );
+    assert!(
+        !seen.present.iter().any(|p| p.path == "Games/Third"),
+        "a peer's file never speaks for a third Mac"
+    );
+    assert_eq!(free_bytes(&seen, "shared"), None, "nor gives a third Mac's free space");
+    assert!(
+        !seen.present.iter().any(|p| p.path == "Games/Forged"),
+        "a cache named for this Mac is ignored"
     );
     assert_eq!(
         seen.peers,
@@ -1221,4 +1252,28 @@ fn a_master_on_a_peers_drive_is_seen_through_the_peer_cache() {
         !expand_units(&policy, &seen).iter().any(|u| u.path.contains(".stversions")),
         "Syncthing's version store is not a data set"
     );
+}
+
+#[test]
+fn local_files_that_fail_to_parse_do_not_let_a_peer_claim_this_mac() {
+    let tmp = Tmp::new();
+    write_peer_fixture(tmp.path(), true);
+    fs::write(tmp.path().join("summary.json"), "{broken").unwrap();
+    fs::write(tmp.path().join("where.json"), "{broken").unwrap();
+    let seen = load_observation_with_peers(tmp.path(), None, NOW, &trust());
+    assert!(seen.present.iter().all(|p| p.host == "hub"), "{:?}", seen.present);
+    assert!(seen.frees.iter().all(|f| f.host == "hub"));
+    assert_eq!(free_bytes(&seen, "primary"), None);
+    let lost = PeerTrust {
+        self_id: String::new(),
+        peers: vec!["hub".into()],
+    };
+    assert!(load_observation_with_peers(tmp.path(), None, NOW, &lost).present.is_empty());
+}
+
+#[test]
+fn diskmap_config_names_the_peers_but_never_this_mac() {
+    let cfg = r#"{"hosts":{"A":{"id":"primary"},"B":{"id":"hub"}},"peers":["hub","shared","primary"]}"#;
+    assert_eq!(peers_from_diskmap(cfg, "primary"), vec!["hub".to_string(), "shared".to_string()]);
+    assert!(peers_from_diskmap("nope", "primary").is_empty());
 }
