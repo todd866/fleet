@@ -83,3 +83,17 @@ run it counts the files under `/backup` and compares them with the files the cli
 An unplaced volume, a missing source, a mask without a reason or a gap over 0.5 % turns the
 morning row amber. The VM does the listing because it can read every drive: on macOS a
 background job may not be allowed to open removable volumes.
+
+## Resuming laptop copies safely
+
+`home-mirror` can check `hub_mount` before `hub_prepare`, avoiding a disk-slot wait when the
+existing encrypted destination is already mounted. Set `preflight_space: true` to measure the
+remaining rsync transfer instead of requiring the original first-seed capacity after a partial
+copy. The receiver rechecks that requirement inside its disk slot; the reserve is never waived.
+`bwlimit_kib` can limit transfer pressure while cloud ingest runs. Each host has one run lock.
+A failed cloud-placeholder scan aborts the copy. Off-site replica claims require a backup run
+started after the latest completed home copy; an older seed is not proof of newer files.
+
+The existing mounted home source can hold separate host folders without restarting the IDrive
+container. Files added after its initial scan require a later successful ingest before they
+count as off-site. Do not change source mounts or restart the running first seed just to add them.

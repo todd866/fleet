@@ -70,10 +70,12 @@ class Replicas(unittest.TestCase):
         self.assertEqual(proj["except"], ["Projects/Big"])
         self.assertTrue(proj["encrypted"] and proj["verified"] and not proj.get("offsite"))
 
-    def test_offsite_only_once_the_backup_held_the_copy_after_the_first_pass(self):
+    def test_offsite_must_cover_the_latest_pass_not_only_the_first(self):
         st = {"last_success_epoch": 200, "first_success_epoch": 100, "total_bytes": 9}
         self.assertFalse(any(r.get("offsite") for r in M.replica_rows(self.CFG, st, ["Music"], held_at=50)))
         rows = M.replica_rows(self.CFG, st, ["Music"], held_at=150)
+        self.assertFalse(any(r.get("offsite") for r in rows))
+        rows = M.replica_rows(self.CFG, st, ["Music"], held_at=250)
         self.assertEqual([(r["volume"], bool(r.get("offsite"))) for r in rows], [("Home", False), ("cloud", True)])
 
     def test_no_rows_before_a_good_pass(self):
@@ -144,3 +146,18 @@ class Skips(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class CapacitySafety(unittest.TestCase):
+    def test_receiver_rechecks_capacity_inside_disk_slot(self):
+        cfg = dict(CFG, required_free_gb=12, free_path='/Volumes/D')
+        args = M.rsync_args(cfg, Path('/tmp/ex'), 'stamp')
+        remote = args[args.index('--rsync-path') + 1]
+        self.assertIn('disk-slot', remote)
+        self.assertIn('destination reserve changed', remote)
+        self.assertIn('exit 75', remote)
+
+    def test_failed_placeholder_scan_is_not_an_empty_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp); (home/'Desktop').mkdir()
+            with self.assertRaises(RuntimeError):
+                M.dataless(home, ['Desktop'], run=lambda *a, **k: SimpleNamespace(returncode=1, stdout=''))

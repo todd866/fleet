@@ -246,7 +246,7 @@ def _backups(name, host, config, now):
             # A deliberate hold is not a broken backup: say since when and what it costs.
             rows[-1] = _row(f"backup:{name}:idrive", "warn", "backup", f"{name} idrive",
                             "held", "owner hold",
-                            f'IDrive held since {attempt["held_since"]} (owner hold); nothing new reaches IDrive until it is lifted')
+                            f'macOS IDrive held since {attempt["held_since"]} (owner hold). Keep it held; Linux ingest and home-mirror coverage are evaluated separately.')
     if host.get("idrive_ingest") is not None:
         rows.append(_idrive_ingest(name, host["idrive_ingest"], cfg, now))
     if host.get("home_mirror") is not None:
@@ -256,7 +256,7 @@ def _backups(name, host, config, now):
             f"backup:{name}:drive-mirror", f"{name} drive-mirror", host.get("drive_mirror_epoch"),
             cfg.get("drive_mirror_warn_h", 26), cfg.get("drive_mirror_fail_h", 48), now, "no stamp",
         ))
-    if "hdd_backup_epoch" in host:
+    if "hdd_backup_epoch" in host and name not in cfg.get("retired_hdd_hosts", []):
         rows.append(_stamp(
             f"backup:{name}:hdd-backup", f"{name} hdd-backup", host.get("hdd_backup_epoch"),
             cfg.get("hdd_backup_warn_h", 36), cfg.get("hdd_backup_fail_h", 168), now, "no stamp",

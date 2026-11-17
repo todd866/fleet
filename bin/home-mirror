@@ -31,10 +31,12 @@ and attaches the image, creating it (APFS, AES-256) on first use. The password g
 `password_cmd` to hdiutil on stdin; it is never printed or written.
 """
 import argparse
+import fcntl
 import json
 import os
 import pathlib
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -77,6 +79,8 @@ def dataless(home, folders, run=subprocess.run):
             continue
         done = run(["/usr/bin/find", str(root), "-flags", "+dataless", "-type", "f"],
                    capture_output=True, text=True, errors="replace", timeout=1800)
+        if getattr(done, "returncode", 0) != 0:
+            raise RuntimeError(f"placeholder scan failed for {folder}; refusing to read cloud files")
         for line in done.stdout.splitlines():
             if line.startswith(str(home) + "/"):
                 out.append(line[len(str(home)) + 1:])
@@ -87,8 +91,36 @@ def on_ac(run=subprocess.run):
     try:
         out = run(["pmset", "-g", "batt"], capture_output=True, text=True, timeout=10).stdout
     except (OSError, subprocess.SubprocessError):
+        return False
+    return "AC Power" in out
+
+
+def idle_allowed(cfg):
+    if not cfg.get("require_idle"):
         return True
-    return "AC Power" in out or "Battery Power" not in out
+    try:
+        if os.stat("/dev/console").st_uid != os.getuid():
+            return False
+        result = subprocess.run(["/usr/sbin/ioreg", "-c", "IOHIDSystem"],
+                                capture_output=True, text=True, timeout=10)
+        found = re.search(r'"HIDIdleTime"\s*=\s*(\d+)', result.stdout)
+        return bool(found and int(found.group(1)) >= int(cfg.get("idle_seconds", 300)) * 10**9)
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def guarded_copy(args, handle, cfg):
+    """End our process group cleanly if the shared laptop becomes active or loses mains."""
+    child = subprocess.Popen(args, stdout=handle, stderr=subprocess.STDOUT, start_new_session=True)
+    while True:
+        try:
+            return subprocess.CompletedProcess(args, child.wait(timeout=15))
+        except subprocess.TimeoutExpired:
+            if not idle_allowed(cfg) or (cfg.get("require_ac") and not on_ac()) or METERED.exists():
+                os.killpg(child.pid, signal.SIGTERM)
+                child.wait()
+                handle.write("\nDeferred: laptop activity, power or network changed; partial copy retained.\n")
+                return subprocess.CompletedProcess(args, 75)
 
 
 def remote_free_gb(cfg, run=subprocess.run):
@@ -103,22 +135,34 @@ def remote_free_gb(cfg, run=subprocess.run):
     parts = done.stdout.split()
     if done.returncode != 0 or len(parts) < 4 or not parts[3].isdigit():
         return None
-    return int(parts[3]) / 1e6
+    return int(parts[3]) * 1024 / 1e9
 
 
 def sh(text):
     return "'" + str(text).replace("'", "'\\''") + "'"
 
 
-def rsync_args(cfg, exclude_file, stamp, dry=False):
+def rsync_args(cfg, exclude_file, stamp, dry=False, verify=False):
     dest = cfg["dest"].rstrip("/")
     remote = (f"$HOME/.local/bin/disk-slot --label home-mirror --wait 7200 {sh(os.path.dirname(dest))} -- "
               f"{REMOTE_RSYNC}")
+    if cfg.get("required_free_gb") and not dry:
+        floor = int(float(cfg["required_free_gb"]) * 1e9 / 1024)
+        check_path = cfg.get("free_path") or os.path.dirname(dest)
+        script = (f"available=$(df -Pk {sh(check_path)} | awk 'NR==2 {{print $4}}'); "
+                  f"[ \"${{available:-0}}\" -ge {floor} ] || {{ echo 'destination reserve changed' >&2; exit 75; }}; "
+                  f'exec {REMOTE_RSYNC} "$@"')
+        remote = (f"$HOME/.local/bin/disk-slot --label home-mirror --wait 7200 {sh(os.path.dirname(dest))} -- "
+                  f"/bin/sh -c {sh(script)} home-mirror")
     args = [RSYNC, "-aHX", "--delete", "--delete-excluded", "--partial", "--stats",
             "--backup", f"--backup-dir={dest}-versions/{stamp}",
             "--exclude-from", str(exclude_file), "--rsync-path", remote,
             "-e", "ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30"]
-    if dry:
+    if cfg.get("bwlimit_kib"):
+        args.append(f"--bwlimit={int(cfg['bwlimit_kib'])}")
+    if verify:
+        args += ["--checksum", "--itemize-changes"]
+    if dry or verify:
         args.append("--dry-run")
     return args + [str(HOME) + "/", f"{cfg['hub']}:{dest}/"]
 
@@ -161,13 +205,13 @@ def replica_rows(cfg, status, entries, held_at=None):
         base = {"path": name, "bytes": status["total_bytes"], "verified": True, "except": inner,
                 "pass": status["last_success_epoch"]}
         rows.append(dict(base, volume=cfg.get("volume") or cfg["hub"], encrypted=bool(cfg.get("encrypted"))))
-        if held_at and first and held_at >= first:
+        if held_at and held_at >= status["last_success_epoch"]:
             rows.append(dict(base, volume=cfg["offsite"].get("name", "offsite"), encrypted=True,
                              offsite=True, held_at=held_at))
     return rows
 
 
-def offsite_held_at(cfg, run=subprocess.run):
+def offsite_held_at(cfg, run=subprocess.run, after_epoch=None):
     """When the hub's backup last succeeded with the source holding this copy, or None."""
     off = cfg.get("offsite") or {}
     if not off.get("status") or not off.get("source"):
@@ -175,7 +219,10 @@ def offsite_held_at(cfg, run=subprocess.run):
     try:
         done = run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", cfg["hub"],
                     f"cat {off['status']}"], capture_output=True, text=True, timeout=60)
-        held = json.loads(done.stdout).get("held") or {}
+        data = json.loads(done.stdout)
+        if after_epoch and (data.get("last_start", {}).get("at") or 0) < after_epoch:
+            return None
+        held = data.get("held") or {}
     except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
         return None
     return held.get(off["source"])
@@ -214,7 +261,20 @@ def run_once(cfg, force=False, dry=False):
     if cfg["require_ac"] and not on_ac():
         status["state"] = "skipped: on battery"
         return status
-    if cfg.get("hub_prepare"):
+    if not idle_allowed(cfg):
+        status["state"] = "skipped: shared laptop is in use"
+        return status
+    mounted = False
+    if cfg.get("hub_mount"):
+        check = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", cfg["hub"],
+                                f"/usr/sbin/diskutil info -plist {sh(cfg['hub_mount'])}"],
+                               capture_output=True, timeout=60)
+        import plistlib
+        try:
+            mounted = plistlib.loads(check.stdout).get("MountPoint") == cfg["hub_mount"]
+        except (ValueError, plistlib.InvalidFileException):
+            mounted = False
+    if cfg.get("hub_prepare") and not mounted:
         # E.g. attach the encrypted image the copy lives in (`home-mirror hub-attach` on the hub).
         try:
             done = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", cfg["hub"],
@@ -229,7 +289,7 @@ def run_once(cfg, force=False, dry=False):
     if free is None:
         status["state"] = "skipped: hub unreachable or destination missing"
         return status
-    if last is None and free < float(cfg.get("first_pass_free_gb") or 0):
+    if last is None and not cfg.get("preflight_space") and free < float(cfg.get("first_pass_free_gb") or 0):
         status["state"] = f"waiting for space: {free:.0f} GB free, first pass needs {cfg.get('first_pass_free_gb')}"
         return status
     if free < float(cfg["min_free_gb"]):
@@ -237,23 +297,46 @@ def run_once(cfg, force=False, dry=False):
         return status
     STATE.mkdir(parents=True, exist_ok=True)
     exclude_file = STATE / "exclude.txt"
-    lines = list(cfg["exclude"]) + [rsync_pattern(rel) for rel in dataless(HOME, cfg["skip_dataless"])]
+    if not dry:
+        write_status(dict(status, state="preparing: checking cloud placeholders", attempt_epoch=now))
+    try:
+        placeholders = dataless(HOME, cfg["skip_dataless"])
+    except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+        status["state"] = f"failed: {exc}"
+        return status
+    lines = list(cfg["exclude"]) + [rsync_pattern(rel) for rel in placeholders]
     exclude_file.write_text("\n".join(lines) + "\n")
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now))
+    if cfg.get("preflight_space"):
+        if not dry:
+            write_status(dict(status, state="preflight: waiting for disk and checking incremental size", attempt_epoch=now))
+        plan_log = STATE / "preflight.log"
+        with plan_log.open("w") as handle:
+            plan = guarded_copy(rsync_args(cfg, exclude_file, stamp, dry=True), handle, cfg)
+        planned = stats(plan_log.read_text(errors="replace"))
+        if plan.returncode not in (0, 24) or "bytes" not in planned:
+            status["state"] = "failed: capacity preflight (see preflight.log)"
+            return status
+        free = remote_free_gb(cfg)
+        needed = planned["bytes"] / 1e9 * 1.10 + float(cfg["min_free_gb"])
+        status.update(planned_bytes=planned["bytes"], required_free_gb=needed)
+        if free is None or free < needed:
+            status["state"] = f"waiting for space: {free} GB free, incremental pass needs {needed:.1f} GB including reserve"
+            return status
+        cfg = dict(cfg, required_free_gb=needed)
     status.update(state="running", attempt_epoch=now)
     if not dry:
         write_status(status)
     log = STATE / "rsync.log"
     with open(log, "w") as handle:
-        done = subprocess.run(["/usr/bin/caffeinate", "-is", *rsync_args(cfg, exclude_file, stamp, dry)],
-                              stdout=handle, stderr=subprocess.STDOUT)
+        done = guarded_copy(["/usr/bin/caffeinate", "-is", *rsync_args(cfg, exclude_file, stamp, dry)], handle, cfg)
     text = log.read_text(errors="replace")[-20000:]
     status.update(stats(text), rc=done.returncode, duration_s=int(time.time()) - now,
                   dataless_skipped=len(lines) - len(cfg["exclude"]))
     # 24: some files vanished while copying (a live home): the pass still counts.
     if done.returncode in (0, 24) and not dry:
-        status.update(state="ok", last_success_epoch=now)
-        status.setdefault("first_success_epoch", now)
+        status.update(state="ok", last_success_epoch=int(time.time()))
+        status.setdefault("first_success_epoch", status["last_success_epoch"])
     else:
         status["state"] = "dry run" if dry else f"failed: rsync exit {done.returncode} (see rsync.log)"
     return status
@@ -302,11 +385,18 @@ def main(argv=None):
         print(path.read_text() if path.exists() else "no status yet")
         return 0
     cfg = load_config()
+    STATE.mkdir(parents=True, exist_ok=True)
+    lock = (STATE / "run.lock").open("a")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("home-mirror: another pass is running")
+        return 0
     status = run_once(cfg, force=args.force, dry=args.dry_run)
     if not args.dry_run:
         write_status(status)
         if status.get("last_success_epoch"):
-            held = offsite_held_at(cfg)
+            held = offsite_held_at(cfg, after_epoch=status["last_success_epoch"])
             write_replicas(replica_rows(cfg, status, os.listdir(HOME), held))
     print(json.dumps(status, indent=1))
     return 0 if not str(status.get("state", "")).startswith("failed") else 1
