@@ -1,5 +1,6 @@
 """`fleet morning` writes the digest, files work, and can notify. It does not fix anything."""
 import io
+import fcntl
 import json
 import os
 import subprocess
@@ -17,6 +18,47 @@ from fleet.morning.work import file_items, work_path
 
 
 def main(argv=None, notify=None, gather=None, run=None):
+    args_list = list(sys.argv[1:] if argv is None else argv)
+    command = args_list[1:] if args_list[:1] == ["morning"] else args_list
+    if command[:1] and command[0] in ("usage", "upstream", "follow", "collect"):
+        return _main(args_list, notify=notify, gather=gather, run=run)
+    args = _parse(command)
+    if args.dry_run:
+        return _main(args_list, notify=notify, gather=gather, run=run)
+    base = Path(args.home).expanduser() if args.home else Path.home()
+    state = Path(args.state).expanduser() if args.state else base / ".local/state/fleet"
+    directory = state / "morning"
+    directory.mkdir(parents=True, exist_ok=True)
+    # Keep the lock inode: unlinking it lets a concurrent caller lock a different file.
+    with (directory / "run.lock").open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("fleet morning already running", file=sys.stderr)
+            return 75
+        now = int(args.now if args.now is not None else datetime.now().timestamp())
+        if args.reuse_within and not args.snapshot:
+            try:
+                completed = json.loads((directory / "completed.json").read_text())
+                digest = json.loads((directory / "summary.json").read_text())
+                age = now - completed["completed_at"]
+                if (0 <= age <= args.reuse_within and
+                        completed["generated"] == digest["generated"]):
+                    print("fleet morning reused a recently completed digest")
+                    return 0
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+        result = _main(args_list, notify=notify, gather=gather, run=run)
+        if result == 0:
+            digest = json.loads((directory / "summary.json").read_text())
+            _write(directory / "completed.json", json.dumps({
+                "generated": digest["generated"],
+                "completed_at": int(args.now if args.now is not None else datetime.now().timestamp()),
+            }) + "\n")
+        return result
+
+
+def _main(argv=None, notify=None, gather=None, run=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == "usage":
         from fleet.ai_usage import main as usage_main
@@ -166,6 +208,8 @@ def _parse(argv):
     parser.add_argument("--now", type=int)
     parser.add_argument("--config")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--reuse-within", type=int, default=0, metavar="SECONDS",
+                        help="reuse a successfully completed recent digest; concurrent runs exit 75")
     return parser.parse_args(argv)
 
 
