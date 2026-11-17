@@ -23,5 +23,7 @@
 	<string>REPLACE_HOME/.local/state/diskmap/launchd.stdout.log</string>
 	<key>StandardErrorPath</key>
 	<string>REPLACE_HOME/.local/state/diskmap/launchd.stderr.log</string>
+	<key>AbandonProcessGroup</key>
+	<true/>
 </dict>
 </plist>
