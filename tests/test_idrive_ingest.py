@@ -139,3 +139,67 @@ class Due(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class PriorityCycle(unittest.TestCase):
+    def test_scoped_mount_keeps_existing_cloud_path_and_masks(self):
+        base=cfg(sources=[{'name':'Archive','path':'/Volumes/Archive','mask':[{'path':'laptop/cache','why':'cache'}]}])
+        scoped=M.priority_config(base,{'paths':['/Volumes/Archive/laptop']})
+        source=M.plan(scoped,isdir=lambda p:True)[0]
+        self.assertEqual(source['name'],'Archive/laptop')
+        self.assertEqual(source['path'],'/Volumes/Archive/laptop')
+        self.assertEqual(source['masks'],['cache'])
+        args,_=M.container_args(scoped,[source])
+        self.assertIn('/Volumes/Archive/laptop:/backup/Archive/laptop:ro',args)
+
+    def test_priority_never_selects_outside_or_masked_data(self):
+        base=cfg(sources=[{'name':'A','path':'/data','mask':['skip']}])
+        for path in ['/other','/data/skip/deep']:
+            with self.assertRaises(ValueError):M.priority_config(base,{'paths':[path]})
+
+    def test_priority_then_bulk_then_next_priority_cycle(self):
+        base=cfg(sources=[{'name':'A','path':'/data'}],priority_batches=[{'name':'laptop','paths':['/data/laptop'],'every_h':24}])
+        self.assertEqual(M.cycle_choice(base,{},100000)[0],'laptop')
+        receipts={'receipts':{'laptop':{'completed_at':100000}}}
+        self.assertEqual(M.cycle_choice(base,receipts,100001)[0],'bulk')
+        self.assertEqual(M.cycle_choice(base,receipts,200000)[0],'laptop')
+
+    def test_new_verified_offload_requeues_priority_even_after_recent_success(self):
+        base=cfg(sources=[{'name':'A','path':'/data'}],priority_batches=[{'name':'laptop','paths':['/data/laptop'],'every_h':24}],
+                 _priority_requests={'/data/laptop/papers':100050})
+        ledger={'receipts':{'laptop':{'completed_at':100100,'start':{'at':100000}}}}
+        self.assertEqual(M.cycle_choice(base,ledger,100101)[0],'laptop')
+        ledger['receipts']['laptop']['start']['at']=100051
+        self.assertEqual(M.cycle_choice(base,ledger,100101)[0],'bulk')
+
+class CycleTransitions(unittest.TestCase):
+    def test_priority_success_is_not_a_full_success_when_bulk_starts(self):
+        import tempfile,json
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);(root/'data/laptop').mkdir(parents=True);state=root/'state';state.mkdir()
+            base=cfg(sources=[{'name':'A','path':str(root/'data')}],priority_batches=[{'name':'laptop','paths':[str(root/'data/laptop')]}])
+            phase=M.priority_config(base,base['priority_batches'][0]);sources=M.plan(phase);signature=M.spec_hash(phase,sources)
+            start={'at':100,'spec':signature,'sources':[sources[0]['name']],
+                   'source_paths':{sources[0]['name']:{'path':sources[0]['path'],'masks':[]}}}
+            observed={'running':False,'last_start':start,'last_success':{'epoch':110,'status':'Success','failed':0},'spec':signature}
+            (state/'cycle.json').write_text(json.dumps({'phase':'laptop','phase_config':phase,'receipts':{}}))
+            with patch.object(M,'STATE',state),patch.object(M.time,'time',return_value=100000),patch.object(M,'tick',side_effect=[observed,{'running':True}]) as tick:
+                result=M.cycle(base)
+            self.assertEqual(result['cycle']['phase'],'bulk')
+            self.assertIsNone(result['last_full_success_epoch'])
+            self.assertEqual(result['scope_receipts'][0]['paths'],[str(root/'data/laptop')])
+            self.assertEqual(tick.call_args_list[-1].args[0]['sources'],base['sources'])
+
+    def test_old_narrow_success_is_not_recorded_as_bulk(self):
+        import tempfile,json
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);(root/'data/laptop').mkdir(parents=True);state=root/'state';state.mkdir()
+            base=cfg(sources=[{'name':'A','path':str(root/'data')}],priority_batches=[{'name':'laptop','paths':[str(root/'data/laptop')]}])
+            phase=M.priority_config(base,base['priority_batches'][0]);signature=M.spec_hash(phase,M.plan(phase))
+            observed={'running':False,'last_start':{'at':100,'spec':signature,'source_paths':{'A/laptop':{'path':str(root/'data/laptop')}}},'last_success':{'epoch':110,'status':'Success','failed':0},'spec':M.spec_hash(base,M.plan(base))}
+            (state/'cycle.json').write_text(json.dumps({'phase':'bulk','phase_config':base,'receipts':{}}))
+            with patch.object(M,'STATE',state),patch.object(M.time,'time',return_value=100000),patch.object(M,'tick',side_effect=[observed,{'running':True}]):
+                result=M.cycle(base)
+            self.assertNotIn('bulk',result['cycle']['receipts'])
+            self.assertIsNone(result['last_full_success_epoch'])

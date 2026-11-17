@@ -836,6 +836,11 @@ def _idrive_ingest(name, status, cfg, now):
         return _row(key, "fail", "backup", label, "down", "check client", "; ".join(problems) + used)
     last = status.get("last_success_epoch")
     success = status.get("last_success") or {}
+    if status.get("cycle"):
+        last = status.get("last_full_success_epoch")
+        phase = status["cycle"].get("phase", "unknown")
+        used += f"; phase {phase}; priority completions do not count as a full backup"
+        success = ((status["cycle"].get("receipts", {}).get("bulk") or {}).get("success") or {})
     running = bool(status.get("running"))
     since = status.get("started_at")
     progress = status.get("progress") or {}

@@ -104,3 +104,25 @@ interrupted. With `preflight_space`, an impossible plan is reused only to defer 
 `preflight_cache_h` (default 6 hours). More destination space triggers a fresh plan; `--force`
 requests a fresh plan after substantial source reduction. A cached plan never authorizes a
 copy. This avoids repeatedly scanning millions of files while the missing archive copies wait.
+
+## Priority batches before bulk
+
+Optional `priority_batches` entries contain `name`, absolute host `paths`, and `every_h`
+(default 24). For example, a batch `laptop-offloads` can select `/Volumes/Archive/laptop`.
+`preempt_bulk_for_priority: true` permits a graceful stop of a bulk run when a priority
+batch is due. No cloud files are deleted. The same persistent client login/history volumes
+are retained; narrow read-only mounts preserve `/backup/<original-source>/<relative-path>`.
+The configured backup set stays `/backup`. Sources outside the batch return for the bulk run.
+
+A completed, zero-failure batch receives its own path-bound receipt in `cycle.json` and
+`status.json`; it does not qualify as a complete backup of all drives. A freshly verified
+offload sends `idrive-ingest request PATH VERIFIED_AT`. This makes its priority batch due
+again if the previous run began before verification, even if that run finished recently.
+The offload queue verifies the source and destination again after qualifying cloud coverage.
+A later bulk run does not erase a valid narrow receipt. Changed masks, paths, missing sources,
+failed files, and stale observations still prevent reclamation.
+
+One lock serializes ticks; phase state is persisted before changing mounts so restart resumes
+the same plan. Priority runs complete before bulk resumes. Existing uploaded paths remain in
+the account, and completed files are available to the client's incremental backup logic.
+Archive Cleanup is never part of this cycle.

@@ -38,6 +38,8 @@ the same IDrive device: two containers with one login collide.
 """
 import argparse
 import hashlib
+import fcntl
+import copy
 import json
 import os
 import pathlib
@@ -114,6 +116,10 @@ def plan(cfg, isdir=_openable, busy=lambda pattern: False, exists=os.path.exists
     for src in cfg.get("sources") or []:
         path = expand(src["path"])
         name = safe_name(src.get("name") or pathlib.Path(path).name)
+        if src.get("mount_at"):
+            name = str(src["mount_at"])
+            if name.startswith('/') or any(part in ('', '.', '..') for part in name.split('/')):
+                raise ValueError("invalid scoped mount name")
         entry = {"name": name, "path": path, "masks": [], "waiting": None, "missing": False}
         # Waiting comes first: a source that is waiting for its stamp may not exist yet.
         if src.get("after") and not exists(expand(src["after"])):
@@ -436,7 +442,7 @@ def tick(cfg, dry=False):
                           timeout=120)
         if rc == 0:
             volumes = [v for v in out.splitlines() if v.strip()]
-            audit.update(checked_at=now, volumes=volumes, unplaced=coverage(cfg, volumes),
+            audit.update(checked_at=now, volumes=volumes, unplaced=coverage(cfg.get("_coverage_config", cfg), volumes),
                          unexplained_masks=unexplained_masks(cfg))
     if (is_running and not running and success and not dry
             and audit.get("counted_for") != success["epoch"]):
@@ -524,11 +530,132 @@ def build(cfg):
     return subprocess.run(["docker", "build", "-t", cfg["image"], str(ctx)], env=env_for(cfg)).returncode
 
 
+def priority_config(cfg, batch):
+    """Narrow mounts retain exactly the original cloud pathname, never a new device."""
+    result = copy.deepcopy(cfg)
+    result['sources'] = []
+    result['priority_batches'] = []
+    result['mask_everywhere'] = []
+    for requested in batch['paths']:
+        path = expand(requested).rstrip('/')
+        matches = [s for s in cfg['sources'] if path == expand(s['path']).rstrip('/')
+                   or path.startswith(expand(s['path']).rstrip('/') + '/')]
+        if not matches:
+            raise ValueError('priority path is outside configured sources: ' + path)
+        base = max(matches, key=lambda s: len(expand(s['path'])))
+        root = expand(base['path']).rstrip('/')
+        rel = path[len(root):].strip('/')
+        source = copy.deepcopy(base)
+        source['path'] = path
+        source['mount_at'] = safe_name(base.get('name') or pathlib.Path(root).name) + ('/' + rel if rel else '')
+        source.pop('priority', None)
+        masks = []
+        for mask in list(cfg.get('mask_everywhere', [])) + list(base.get('mask', [])):
+            value = str(mask.get('path') if isinstance(mask, dict) else mask).strip('/')
+            if '..' in value.split('/'):
+                raise ValueError('invalid mask')
+            if rel and (rel == value or rel.startswith(value + '/')):
+                raise ValueError('priority path is masked: ' + path)
+            if not rel or value.startswith(rel + '/'):
+                masks.append({'path': value[len(rel):].strip('/') if rel else value,
+                              'why': 'inherited from full backup policy'})
+        source['mask'] = masks
+        result['sources'].append(source)
+    if not result['sources']:
+        raise ValueError('empty priority batch')
+    # Other volumes are intentionally deferred, not silently missing.
+    result['_coverage_config'] = cfg
+    return result
+
+
+def cycle_choice(cfg, ledger, now):
+    for batch in cfg.get('priority_batches', []):
+        receipt = ledger.get('receipts', {}).get(batch['name'], {})
+        completed = int(receipt.get('completed_at') or 0)
+        requested = max([int(stamp) for path, stamp in cfg.get('_priority_requests', {}).items()
+                         if any(path == expand(root).rstrip('/') or path.startswith(expand(root).rstrip('/') + '/')
+                                for root in batch['paths'])] or [0])
+        if (not completed or now - completed >= float(batch.get('every_h', 24)) * 3600
+                or requested > int((receipt.get('start') or {}).get('at') or 0)):
+            scoped = priority_config(cfg, batch)
+            scoped['every_h'] = 0  # the cycle receipt, not the previous bulk success, gates this batch
+            return batch['name'], scoped
+    return 'bulk', cfg
+
+
+def cycle(cfg, dry=False):
+    """Complete priority batches before bulk; retain per-scope completion receipts."""
+    STATE.mkdir(parents=True, exist_ok=True)
+    ledger_path = STATE / 'cycle.json'
+    try:
+        ledger = json.loads(ledger_path.read_text())
+    except (OSError, ValueError):
+        ledger = {'receipts': {}}
+    now = int(time.time())
+    cfg = copy.deepcopy(cfg)
+    try:
+        cfg['_priority_requests'] = json.loads((STATE / 'priority-requests.json').read_text())
+    except (OSError, ValueError):
+        cfg['_priority_requests'] = {}
+    # Observe the current phase without starting another run or altering mounts.
+    phase_cfg = ledger.get('phase_config') or cfg
+    observed = tick(phase_cfg, dry=True)
+    start = observed.get('last_start') or {}
+    success = observed.get('last_success') or {}
+    phase = ledger.get('phase', 'bulk')
+    phase_sources = [s for s in plan(phase_cfg, busy=busy(cfg)) if not s['missing'] and not s['waiting']]
+    phase_spec = spec_hash(phase_cfg, phase_sources)
+    if (not observed.get('running') and start.get('spec') == phase_spec
+            and observed.get('spec') == phase_spec and success.get('status') == 'Success'
+            and success.get('failed') == 0 and start.get('source_paths')
+            and int(success.get('epoch') or 0) >= int(start.get('at') or now) - 120):
+        ledger.setdefault('receipts', {})[phase] = {
+            'completed_at': now, 'start': start, 'success': success,
+            'paths': [r['path'] for r in start['source_paths'].values()]}
+    wanted, next_cfg = cycle_choice(cfg, ledger, now)
+    if observed.get('running'):
+        if phase == 'bulk' and wanted != 'bulk' and cfg.get('preempt_bulk_for_priority'):
+            if dry:
+                observed['actions'].append('would pause bulk for priority ' + wanted)
+                return observed
+            # Same graceful signal used by the client; no upload or cloud data is removed.
+            exec_(cfg, "pkill -INT -f '^./idrive --backup'", 30)
+            for _ in range(12):
+                if backup_age(cfg) is None:
+                    break
+                time.sleep(2)
+            if backup_age(cfg) is not None:
+                observed['problems'].append('bulk stop not yet complete; priority deferred')
+                return observed
+        else:
+            wanted, next_cfg = phase, phase_cfg
+    if dry:
+        observed['cycle'] = {'phase': phase, 'next': wanted}
+        return observed
+    # Persist the phase first, so a restart uses the same mount scope.
+    ledger.update(phase=wanted, phase_config=next_cfg)
+    tmp = ledger_path.with_suffix('.json.tmp')
+    tmp.write_text(json.dumps(ledger, indent=1) + '\n'); os.replace(tmp, ledger_path)
+    status = tick(next_cfg)
+    status['cycle'] = {'phase': wanted, 'receipts': ledger.get('receipts', {})}
+    status['scope_receipts'] = list(ledger.get('receipts', {}).values())
+    status['configured_sources'] = plan(cfg, busy=busy(cfg))
+    # A successful narrow batch is never a successful backup of the whole fleet.
+    bulk = ledger.get('receipts', {}).get('bulk', {})
+    status['last_full_success_epoch'] = (bulk.get('success') or {}).get('epoch')
+    tmp = STATE / 'status.json.tmp'
+    tmp.write_text(json.dumps(status, indent=1) + '\n'); os.replace(tmp, STATE / 'status.json')
+    return status
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="idrive-ingest", description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="cmd", required=True)
     t = sub.add_parser("tick")
     t.add_argument("--dry-run", action="store_true")
+    request = sub.add_parser("request")
+    request.add_argument("path")
+    request.add_argument("verified_at", type=int)
     sub.add_parser("plan")
     sub.add_parser("status")
     sub.add_parser("build")
@@ -537,8 +664,34 @@ def main(argv=None):
     imp.add_argument("folder")
     args = parser.parse_args(argv)
     cfg = load_config()
+    if args.cmd == "request":
+        path = expand(args.path).rstrip('/')
+        roots = [expand(p).rstrip('/') for b in cfg.get('priority_batches', []) for p in b['paths']]
+        if (args.verified_at <= 0 or args.verified_at > time.time() + 120
+                or not any(path == root or path.startswith(root + '/') for root in roots)):
+            raise ValueError('request is outside configured priority paths or has an invalid timestamp')
+        STATE.mkdir(parents=True, exist_ok=True)
+        with (STATE / 'priority-requests.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            file = STATE / 'priority-requests.json'
+            try:
+                requests = json.loads(file.read_text())
+            except (OSError, ValueError):
+                requests = {}
+            requests[path] = max(int(requests.get(path) or 0), args.verified_at)
+            tmp = file.with_suffix('.json.tmp')
+            tmp.write_text(json.dumps(requests, indent=1) + '\n'); os.replace(tmp, file)
+        print('priority request recorded')
+        return 0
     if args.cmd == "tick":
-        status = tick(cfg, dry=args.dry_run)
+        STATE.mkdir(parents=True, exist_ok=True)
+        lock = (STATE / 'run.lock').open('a')
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print('idrive-ingest: another tick is running')
+            return 0
+        status = cycle(cfg, dry=args.dry_run) if cfg.get('priority_batches') else tick(cfg, dry=args.dry_run)
         print(json.dumps(status, indent=1))
         return 1 if status["problems"] else 0
     if args.cmd == "plan":
