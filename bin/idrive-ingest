@@ -618,7 +618,8 @@ def cycle(cfg, dry=False):
         count = int(output.strip()) if rc == 0 and output.strip().isdigit() else None
         audit = {'counted_for': success.get('epoch'), 'files_on_disk': count,
                  'considered': success.get('considered')}
-        if count is not None and count == success.get('considered') and not observed.get('problems'):
+        accounted = (success.get('backed_up', -1) + success.get('present', -1))
+        if count is not None and count == success.get('considered') == accounted and not observed.get('problems'):
             audit['gap'] = 0
             ledger.setdefault('receipts', {})[phase] = {
                 'completed_at': now, 'start': start, 'success': success, 'coverage': audit,
