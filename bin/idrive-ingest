@@ -248,7 +248,7 @@ def holds(held, success, last_start):
     sources of the start this tool made for it, never for sources added later."""
     held = dict(held or {})
     at = int(last_start.get("at") or 0)
-    if success and at and at - 120 <= success["epoch"]:
+    if success and success.get("failed") == 0 and at and at - 120 <= success["epoch"]:
         for name in last_start.get("sources") or []:
             held[name] = max(int(held.get(name) or 0), success["epoch"])
     return held
