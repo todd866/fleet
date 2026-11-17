@@ -575,7 +575,9 @@ def cycle_choice(cfg, ledger, now):
         requested = max([int(stamp) for path, stamp in cfg.get('_priority_requests', {}).items()
                          if any(path == expand(root).rstrip('/') or path.startswith(expand(root).rstrip('/') + '/')
                                 for root in batch['paths'])] or [0])
-        if (not completed or now - completed >= float(batch.get('every_h', 24)) * 3600
+        expected_paths = sorted(expand(p).rstrip('/') for p in batch['paths'])
+        if (not completed or sorted(receipt.get('paths', [])) != expected_paths
+                or now - completed >= float(batch.get('every_h', 24)) * 3600
                 or requested > int((receipt.get('start') or {}).get('at') or 0)):
             scoped = priority_config(cfg, batch)
             scoped['every_h'] = 0  # the cycle receipt, not the previous bulk success, gates this batch

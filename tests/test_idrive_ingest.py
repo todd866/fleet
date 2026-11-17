@@ -159,14 +159,14 @@ class PriorityCycle(unittest.TestCase):
     def test_priority_then_bulk_then_next_priority_cycle(self):
         base=cfg(sources=[{'name':'A','path':'/data'}],priority_batches=[{'name':'laptop','paths':['/data/laptop'],'every_h':24}])
         self.assertEqual(M.cycle_choice(base,{},100000)[0],'laptop')
-        receipts={'receipts':{'laptop':{'completed_at':100000}}}
+        receipts={'receipts':{'laptop':{'completed_at':100000,'paths':['/data/laptop']}}}
         self.assertEqual(M.cycle_choice(base,receipts,100001)[0],'bulk')
         self.assertEqual(M.cycle_choice(base,receipts,200000)[0],'laptop')
 
     def test_new_verified_offload_requeues_priority_even_after_recent_success(self):
         base=cfg(sources=[{'name':'A','path':'/data'}],priority_batches=[{'name':'laptop','paths':['/data/laptop'],'every_h':24}],
                  _priority_requests={'/data/laptop/papers':100050})
-        ledger={'receipts':{'laptop':{'completed_at':100100,'start':{'at':100000}}}}
+        ledger={'receipts':{'laptop':{'completed_at':100100,'paths':['/data/laptop'],'start':{'at':100000}}}}
         self.assertEqual(M.cycle_choice(base,ledger,100101)[0],'laptop')
         ledger['receipts']['laptop']['start']['at']=100051
         self.assertEqual(M.cycle_choice(base,ledger,100101)[0],'bulk')
