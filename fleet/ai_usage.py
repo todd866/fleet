@@ -117,6 +117,15 @@ def refresh(home, now=None):
             'scope': source['scope'], 'coverage': 'observed only; missing dates unknown'}
     summary = {'schema': 1, 'generated_at': now, 'sources': sources,
                'note': 'Sources are overlapping observations, never additive across account and local scope. Missing dates/categories are unknown.'}
+    try:
+        summary['local_collector'] = json.loads((state_dir(home) / 'collector.json').read_text())
+    except (OSError,ValueError):
+        pass
+    try:
+        raw_grants=json.loads((Path(home)/'.config/fleet/ai-usage.json').read_text()).get('api_grants',[])
+        summary['api_grants']=[{k:g.get(k) for k in ('id','provider','expires_on','balance','currency','verified_at')} for g in raw_grants if isinstance(g,dict)]
+    except (OSError,ValueError,AttributeError,TypeError):
+        pass
     atomic(state_dir(home) / 'summary.json', summary)
     atomic(state_dir(home) / 'daily.json', {'schema': 1, 'daily': daily})
     shared = Path(home) / '.local/state/mac-sync'
@@ -125,7 +134,25 @@ def refresh(home, now=None):
     except (OSError, ValueError, AttributeError):
         publish = False
     if shared.is_dir() and sources and publish:
-        atomic(shared / 'fleet-ai-usage/summary.json', summary)
+        folder=shared / 'fleet-ai-usage'
+        atomic(folder / 'summary.json', summary)
+        atomic(folder / 'daily.json', {'schema':1,'daily':daily})
+        # Sync a consistent backup, never the live SQLite database.
+        database=state_dir(home)/'history.sqlite3'
+        backup=folder/'history.snapshot.sqlite3'
+        stamp=state_dir(home)/'backup-mtime'
+        previous=stamp.read_text() if stamp.exists() else ''
+        current=str(database.stat().st_mtime_ns)
+        if not backup.exists() or previous!=current:
+            with tempfile.NamedTemporaryFile(dir=folder,prefix='history.',delete=False) as handle:
+                temp=Path(handle.name)
+            try:
+                with connect(home) as origin, sqlite3.connect(temp) as target:
+                    origin.backup(target)
+                os.replace(temp,backup)
+                stamp.write_text(current)
+            finally:
+                temp.unlink(missing_ok=True)
     return summary
 
 
@@ -148,9 +175,19 @@ def main(argv=None):
     parser.add_argument('--home', default=str(Path.home()))
     sub = parser.add_subparsers(dest='action', required=True)
     imp = sub.add_parser('import'); imp.add_argument('file')
-    sub.add_parser('status'); sub.add_parser('refresh')
+    for kind in ('import-cursor','import-codex'):
+        export=sub.add_parser(kind);export.add_argument('file');export.add_argument('--captured-at',required=True)
+    sub.add_parser('status'); sub.add_parser('refresh'); sub.add_parser('collect-local')
+    seed_parser=sub.add_parser('seed-local'); seed_parser.add_argument('files',nargs='+')
     args = parser.parse_args(argv)
-    if args.action == 'import':
+    if args.action in ('import-cursor','import-codex'):
+        from fleet.ai_usage_import import cursor, codex
+        adapter=cursor if args.action=='import-cursor' else codex
+        result=ingest(args.home,adapter(args.file,args.captured_at))
+    elif args.action in ('seed-local','collect-local'):
+        from fleet.ai_usage_local import seed, collect
+        result = seed(args.home,args.files) if args.action=='seed-local' else collect(args.home)
+    elif args.action == 'import':
         result = ingest(args.home, json.loads(Path(args.file).read_text()))
     elif args.action == 'refresh':
         result = refresh(args.home)

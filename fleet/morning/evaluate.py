@@ -1185,6 +1185,10 @@ def _ai_usage(summary, now):
             end = datetime.fromisoformat(source["coverage_end"]).replace(tzinfo=timezone.utc).timestamp()
             lag = (now - end) / 86400
             stale = age > 72 or lag > 5 or age < -1
+            collector=(summary or {}).get("local_collector")
+            if isinstance(collector,dict) and source["source"] in collector.get("sources",[]):
+                check_age=(now-float(collector.get("checked_at",0)))/3600
+                stale=collector.get("status")!="ok" or check_age>72 or check_age < -1
             week = source.get("last_full_week") or {}
             total = week.get("total")
             value = f"{total / 1e6:.1f}M observed" if isinstance(total, (int, float)) else "recorded"
@@ -1195,4 +1199,15 @@ def _ai_usage(summary, now):
                 " missing rows; missing categories/dates are unknown. " + source.get("refresh", "")))
         except (ValueError, TypeError, KeyError):
             rows.append(_row("usage:invalid", "warn", "capacity", "usage history", "unread", "invalid metadata", "Repair the usage metadata import."))
+    collector=(summary or {}).get("local_collector")
+    if isinstance(collector,dict):
+        status=collector.get("status")
+        if status not in ("ok","disabled"):
+            rows.append(_row("usage:collector", "warn", "capacity", "usage collector", str(status), "local metadata", "Bounded collection incomplete; prior history is preserved, some new records may have been added. Check fleet usage collect-local."))
+    for grant in (summary or {}).get("api_grants",[]):
+        if not isinstance(grant,dict):continue
+        try:
+            days=(date.fromisoformat(grant["expires_on"])-datetime.fromtimestamp(now,timezone.utc).date()).days
+            rows.append(_row("api-grant:"+str(grant.get("id","unknown")), "warn" if days<=7 else "pass", "capacity", "API credit "+str(grant.get("provider") or "unconfirmed"), "balance unverified" if grant.get("balance") is None else str(grant["balance"])+" "+str(grant.get("currency") or ""), "expires "+grant["expires_on"], "Optional API grant, separate from subscription allowance and token usage; no balance inferred from expiry."))
+        except (KeyError,ValueError,TypeError):continue
     return rows

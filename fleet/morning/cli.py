@@ -104,6 +104,12 @@ def _collect(argv, gather=None, run=None):
     config = load_config(args.config) if args.config else _default_config()
     now = int(args.now if args.now is not None else datetime.now().timestamp())
     here = args.here or local_host_id(base)
+    # Optional bounded producer runs before the snapshot; digest collection remains read-only.
+    try:
+        from fleet.ai_usage_local import collect as collect_usage
+        collect_usage(base)
+    except Exception as exc:
+        print(f'usage collector: {type(exc).__name__}; snapshot continues', file=sys.stderr)
     try:
         document = collect_local(config, here=here, now=now, home=base, run=run, gather=gather)
         write_snapshot(snapshot_dir(base), document)
