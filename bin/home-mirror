@@ -112,15 +112,21 @@ def idle_allowed(cfg):
 def guarded_copy(args, handle, cfg):
     """End our process group cleanly if the shared laptop becomes active or loses mains."""
     child = subprocess.Popen(args, stdout=handle, stderr=subprocess.STDOUT, start_new_session=True)
-    while True:
-        try:
-            return subprocess.CompletedProcess(args, child.wait(timeout=15))
-        except subprocess.TimeoutExpired:
-            if not idle_allowed(cfg) or (cfg.get("require_ac") and not on_ac()) or METERED.exists():
+    try:
+        while True:
+            try:
+                return subprocess.CompletedProcess(args, child.wait(timeout=15))
+            except subprocess.TimeoutExpired:
+                if not idle_allowed(cfg) or (cfg.get("require_ac") and not on_ac()) or METERED.exists():
+                    handle.write("\nDeferred: laptop activity, power or network changed; partial copy retained.\n")
+                    return subprocess.CompletedProcess(args, 75)
+    finally:
+        if child.poll() is None:
+            try:
                 os.killpg(child.pid, signal.SIGTERM)
-                child.wait()
-                handle.write("\nDeferred: laptop activity, power or network changed; partial copy retained.\n")
-                return subprocess.CompletedProcess(args, 75)
+            except ProcessLookupError:
+                pass
+            child.wait()
 
 
 def remote_free_gb(cfg, run=subprocess.run):
@@ -384,6 +390,10 @@ def main(argv=None):
         path = STATE / "status.json"
         print(path.read_text() if path.exists() else "no status yet")
         return 0
+    def stopped(signum, frame):
+        raise SystemExit(128 + signum)
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, stopped)
     cfg = load_config()
     STATE.mkdir(parents=True, exist_ok=True)
     lock = (STATE / "run.lock").open("a")
