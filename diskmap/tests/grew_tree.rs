@@ -180,3 +180,22 @@ fn prune_repairs_a_map_that_still_holds_deleted_directories_once() {
     assert_eq!(prune_missing(&root, &db, 1_700_000_300, EVENT_MIN_BYTES, 1).unwrap(), 0);
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn deep_new_directory_event_discovers_missing_parents() {
+    let dir = scratch("new-parents");
+    let root = dir.join("volume");
+    fs::create_dir(&root).unwrap();
+    let db = dir.join("index.db");
+    map_volume(&root, &db, 100, 100, 1, || false).unwrap();
+    fs::create_dir_all(root.join("new/middle/leaf")).unwrap();
+    fs::write(root.join("new/middle/leaf/data"), vec![1u8; 4096]).unwrap();
+    enqueue(&db, "new/middle/leaf", true).unwrap();
+    let done = map_volume(&root, &db, 200, 100, 1, || false).unwrap();
+    assert!(done.complete);
+    let connection = open_readonly(&db).unwrap();
+    assert_eq!(diskmap::dir(&connection, "new/middle/leaf").unwrap().unwrap().total_bytes, 4096);
+    assert_eq!(diskmap::dir(&connection, "").unwrap().unwrap().total_bytes, 4096);
+    drop(connection);
+    fs::remove_dir_all(dir).unwrap();
+}

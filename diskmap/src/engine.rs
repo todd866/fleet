@@ -234,6 +234,17 @@ fn scan_one(
     baseline: bool,
 ) -> Result<(), String> {
     let parent = parent_of(path);
+    // A replayed event may name a deep directory created since the baseline.
+    // Discover its missing parents from the nearest known ancestor first;
+    // propagating totals through absent parent rows would abort every retry.
+    let mut ancestor = parent.clone();
+    while !ancestor.is_empty() && store::dir(db, &ancestor)?.is_none() {
+        ancestor = parent_of(&ancestor);
+    }
+    if ancestor != parent {
+        store::pending_push(db, &ancestor, true)?;
+        return Ok(());
+    }
     let abs = abs_path(root, path);
     let entries = match darwin::read_dir_entries(&abs) {
         Ok(v) => v,

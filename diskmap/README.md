@@ -194,3 +194,7 @@ never save its first cursor. Rescan requests are queued before the cursor advanc
 failed queue write is retried on the next pass. After upgrading an affected installation,
 verify that database `meta.fsevent_id` becomes populated and changed directories refresh;
 a fresh summary timestamp alone does not prove current directory measurements.
+
+Replayed changes below previously unseen parents rescan from the nearest mapped ancestor.
+This discovers the missing directory chain before updating totals, rather than stopping
+the worker on a missing-parent error.
