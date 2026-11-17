@@ -256,7 +256,11 @@ def holds(held, success, last_start):
 
 def due(now, success, every_h, spec, last_start, started_recently):
     """Start a backup now? When none has succeeded, the last success is old, or the sources changed."""
-    if started_recently:
+    completed_other_scope = bool(
+        spec and last_start and last_start.get("spec") and spec != last_start["spec"]
+        and success and success.get("status") == "Success" and success.get("failed") == 0
+        and last_start.get("at") and success.get("epoch", 0) >= int(last_start["at"]) - 120)
+    if started_recently and not completed_other_scope:
         return False
     if success is None:
         return True

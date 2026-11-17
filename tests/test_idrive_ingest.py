@@ -138,6 +138,14 @@ class Due(unittest.TestCase):
         self.assertTrue(M.due(self.NOW, fresh, 24, "s2", {"spec": "s1"}, False))
         self.assertFalse(M.due(self.NOW, None, 24, "s1", {}, True), "never twice within the hour")
 
+    def test_completed_scope_can_handoff_without_retry_cooldown(self):
+        start={"at":self.NOW-300,"spec":"first"}
+        success={"epoch":self.NOW-299,"status":"Success","failed":0}
+        self.assertTrue(M.due(self.NOW,success,0,"second",start,True))
+        self.assertFalse(M.due(self.NOW,success,0,"first",start,True))
+        self.assertFalse(M.due(self.NOW,dict(success,failed=1),0,"second",start,True))
+        self.assertFalse(M.due(self.NOW,dict(success,epoch=self.NOW-1000),0,"second",start,True))
+
 
 if __name__ == "__main__":
     unittest.main()
