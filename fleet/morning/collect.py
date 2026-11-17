@@ -33,7 +33,7 @@ def collect(config, *, here, now, state=None, run=None, home=None, gather=None, 
     folder = Path(snapshots) if snapshots else snapshot_dir(home)
     live = collect_local(config, here=here, now=now, home=home, run=run, gather=gather)
     merged = merge_snapshots(read_snapshots(folder), live)
-    merged["placement"] = _placement(home, {})
+    merged["placement"] = _placement(home, merged.get("hosts") or {}, here)
     merged["coverage"] = _coverage(home, {})
     merged["capacity"] = _capacity(home, config, now, run)
     merged["board"] = _board(home, run)
@@ -232,8 +232,8 @@ def _host_snapshot(name, raw, registry_host, config, health, now, registered=Non
             idrive = int(latest["observed_mtime"])
     if "idrive" in raw or name in (backups.get("idrive_hosts") or []) or idrive is not None or _has_kind(health_host, "idrive"):
         row["idrive"] = raw.get("idrive") if "idrive" in raw else (None if idrive is None else {"last_epoch": idrive})
-    for key in ("idrive_ingest", "home_mirror", "offload_queue"):
-        if isinstance(raw.get(key), dict):
+    for key in ("idrive_ingest", "home_mirror", "offload_queue", "placement"):
+        if isinstance(raw.get(key), dict) and raw[key]:
             row[key] = raw[key]
     if name in (backups.get("mirror_hosts") or []):
         row["drive_mirror_epoch"] = raw.get("drive_mirror_epoch")
@@ -568,14 +568,31 @@ def _glancebar(document):
     }
 
 
-def _placement(home, probed):
+def _placement(home, hosts, here=None):
+    """The newest placement status: this Mac's own file or one a Mac's snapshot carried.
+
+    `placement status` runs hourly on the Mac that holds the peer caches; its snapshot brings
+    the result to the Mac that writes the digest. `source` names the Mac it came from.
+    """
+    found = []
     local = _read_json(home / ".local/state/placement/status.json")
     if isinstance(local, dict) and local:
-        return local
-    for raw in probed.values():
-        if isinstance(raw.get("placement"), dict) and raw["placement"]:
-            return raw["placement"]
-    return None
+        found.append((str(here or ""), local))
+    for name, reading in (hosts or {}).items():
+        doc = (reading or {}).get("placement") if isinstance(reading, dict) else None
+        if isinstance(doc, dict) and doc:
+            found.append((str(name), doc))
+    if not found:
+        return None
+
+    def generated(item):
+        try:
+            return int(item[1].get("generated") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    source, doc = max(found, key=generated)
+    return {**doc, "source": source}
 
 
 def _upstream(home):

@@ -58,7 +58,7 @@ def evaluate(snapshot, config, now):
     rows.extend(_ai_usage(snapshot.get("ai_usage"), now))
     rows.extend(_agents(snapshot.get("board"), now))
     rows.extend(_projects(snapshot.get("projects") or [], _reported_jobs(snapshot.get("hosts") or {}), prefixes))
-    rows.extend(_placement(snapshot.get("placement"), rows))
+    rows.extend(_placement(snapshot.get("placement"), rows, now))
     rows.extend(_coverage(snapshot.get("coverage"), now))
     rows.extend(_agentkit(snapshot.get("agentkit")))
     rows.extend(_job_reviews(snapshot.get("job_reviews"), now))
@@ -733,11 +733,36 @@ def _projects(projects, reported=frozenset(), prefixes=("com.example.",)):
     return rows
 
 
-def _placement(placement, existing):
+PLACEMENT_STALE_S = 3 * 3600
+_PERSONAL_CODES = {"personal-copies", "offsite"}
+
+
+def _placement(placement, existing, now=None):
+    """Placement gaps, condensed: one row per data set naming every gap (and the hosts where a
+    gap is host-specific), and one row for all personal sets that only lack their encrypted
+    second copy and off-site copy. A status row gives the result's age; past 3 h it is stale."""
     if not placement:
         return []
     covered = {row.name.split(" ", 1)[0] for row in existing if row.area == "disk"}
     rows = []
+    try:
+        generated = int(placement.get("generated") or 0)
+    except (TypeError, ValueError):
+        generated = 0
+    source = str(placement.get("source") or "")
+    if now is not None:
+        age = (int(now) - generated) / 3600 if generated else None
+        where = f" from {source}" if source else ""
+        if age is None:
+            rows.append(_row("place:status", "warn", "place", "placement", "stale", "no time",
+                             f"placement status{where} has no generated time"))
+        elif age * 3600 > PLACEMENT_STALE_S:
+            rows.append(_row("place:status", "warn", "place", "placement", "stale", _hours(age),
+                             f"placement status{where} is {_num(age)} h old (stale past 3 h); "
+                             "the gaps below are as of then"))
+        else:
+            rows.append(_row("place:status", "pass", "place", "placement", "fresh", _hours(max(age, 0)),
+                             f"placement status{where}, {_num(max(age, 0))} h old"))
     for host in placement.get("hosts") or []:
         state = host.get("state")
         ident = str(host.get("id") or "")
@@ -750,13 +775,56 @@ def _placement(placement, existing):
             _gb(free) if isinstance(free, (int, float)) else "—", state,
             f"{ident} {free} GB {state}",
         ))
+    sets = {}
     for viol in placement.get("violations") or []:
         if not isinstance(viol, dict):
             continue
         name = str(viol.get("dataset") or viol.get("host") or "placement")
-        detail = str(viol.get("detail") or viol.get("code") or "")
-        rows.append(_row(f"place:{name}", "fail", "place", name, "gap", detail[:24] or "gap", detail or name))
+        sets.setdefault(name, []).append(viol)
+    personal = [name for name, viols in sets.items() if _personal_only(viols)]
+    if len(personal) < 2:
+        personal = []
+    if personal:
+        rows.append(_row(
+            "place:personal", "fail", "place", f"{len(personal)} personal sets", "gap",
+            "no encrypted second copy, no offsite",
+            "no encrypted second copy, no offsite: " + ", ".join(personal),
+        ))
+    for name, viols in sets.items():
+        if name in personal:
+            continue
+        gaps = _gap_labels(viols)
+        rows.append(_row(f"place:{name}", "fail", "place", name, "gap", gaps, f"{name}: {gaps}"))
     return rows
+
+
+def _personal_only(viols):
+    codes = {str(v.get("code") or "") for v in viols}
+    if not codes or not codes <= _PERSONAL_CODES:
+        return False
+    return all(str(v.get("detail") or "").startswith("0 ") for v in viols if v.get("code") == "personal-copies")
+
+
+def _gap_labels(viols):
+    """`master empty on hub, not placed on hub,shared`: one label per kind of gap, in first-seen
+    order; host-specific gaps name their hosts."""
+    labels = {}
+    for viol in viols:
+        code = str(viol.get("code") or "")
+        detail = str(viol.get("detail") or code or "gap")
+        host = str(viol.get("host") or "")
+        if code == "offsite":
+            label, specific = "no offsite", False
+        elif code == "personal-copies":
+            label, specific = detail, False
+        elif code == "misplaced" and detail == "archive":
+            label, specific = "archive held", True
+        else:
+            label, specific = detail, code in ("master", "misplaced")
+        hosts = labels.setdefault(label, [])
+        if specific and host and host not in hosts:
+            hosts.append(host)
+    return ", ".join(f"{label} on {','.join(hosts)}" if hosts else label for label, hosts in labels.items())
 
 
 def _coverage(coverage, now):
