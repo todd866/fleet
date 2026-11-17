@@ -129,6 +129,39 @@ def guarded_copy(args, handle, cfg):
             child.wait()
 
 
+def priority_busy(cfg, run=subprocess.run):
+    """Yield new attempts to an already-running hub archive batch; never stop a copy."""
+    lock = cfg.get('hub_priority_lock')
+    if not lock:
+        return False
+    try:
+        check = run(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', cfg['hub'],
+                     '/usr/bin/lockf -t 0 ' + sh(lock) + ' /usr/bin/true'],
+                    capture_output=True, timeout=30)
+        return check.returncode != 0
+    except (OSError, subprocess.SubprocessError):
+        return True
+
+
+def cached_capacity(cfg, free, now):
+    """Only defer from a recent plan. Never authorize a copy using cached capacity."""
+    log = STATE / 'preflight.log'
+    try:
+        age = now - log.stat().st_mtime
+        if age < 0 or age > float(cfg.get('preflight_cache_h', 6)) * 3600:
+            return None
+        planned = stats(log.read_text(errors='replace'))
+        if 'bytes' not in planned:
+            return None
+        needed = planned['bytes'] / 1e9 * 1.10 + float(cfg['min_free_gb'])
+        if free < needed:
+            return dict(planned_bytes=planned['bytes'], required_free_gb=needed,
+                        state=f'waiting for space: {free:.1f} GB free, recent plan needs {needed:.1f} GB including reserve')
+    except (OSError, ValueError, TypeError):
+        pass
+    return None
+
+
 def remote_free_gb(cfg, run=subprocess.run):
     # `free_path`: where free space is really measured. Inside a sparse disk image the image's own
     # size shows as free; the drive that holds the image is what fills up.
@@ -270,6 +303,9 @@ def run_once(cfg, force=False, dry=False):
     if not idle_allowed(cfg):
         status["state"] = "skipped: shared laptop is in use"
         return status
+    if priority_busy(cfg):
+        status['state'] = 'deferred: hub archive verification has priority (or hub check unavailable)'
+        return status
     mounted = False
     if cfg.get("hub_mount"):
         check = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", cfg["hub"],
@@ -301,7 +337,15 @@ def run_once(cfg, force=False, dry=False):
     if free < float(cfg["min_free_gb"]):
         status["state"] = f"skipped: {free:.0f} GB free at the destination (floor {cfg['min_free_gb']})"
         return status
+    if cfg.get('preflight_space') and not force and not dry:
+        cached = cached_capacity(cfg, free, now)
+        if cached:
+            status.update(cached)
+            return status
     STATE.mkdir(parents=True, exist_ok=True)
+    status.update(attempt_epoch=now)
+    for old_result in ('rc', 'duration_s'):
+        status.pop(old_result, None)
     exclude_file = STATE / "exclude.txt"
     if not dry:
         write_status(dict(status, state="preparing: checking cloud placeholders", attempt_epoch=now))

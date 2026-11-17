@@ -161,3 +161,22 @@ class CapacitySafety(unittest.TestCase):
             home = Path(tmp); (home/'Desktop').mkdir()
             with self.assertRaises(RuntimeError):
                 M.dataless(home, ['Desktop'], run=lambda *a, **k: SimpleNamespace(returncode=1, stdout=''))
+
+
+class BackupScheduling(unittest.TestCase):
+    def test_recent_impossible_plan_only_defers_and_expires(self):
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            state=Path(tmp);log=state/'preflight.log'
+            log.write_text('Total transferred file size: 900,000,000,000 bytes\n')
+            os.utime(log,(1000,1000))
+            with patch.object(M,'STATE',state):
+                self.assertIn('waiting for space',M.cached_capacity(dict(CFG,min_free_gb=150),500,1100)['state'])
+                self.assertIsNone(M.cached_capacity(dict(CFG,min_free_gb=150),1200,1100))
+                self.assertIsNone(M.cached_capacity(dict(CFG,min_free_gb=150),500,30000))
+
+    def test_busy_or_unknown_hub_priority_lock_defers_new_copy(self):
+        cfg=dict(CFG,hub_priority_lock='/state/archive/run.lock')
+        self.assertFalse(M.priority_busy(CFG,run=lambda *a,**kw: self.fail('unexpected call')))
+        self.assertTrue(M.priority_busy(cfg,run=lambda *a,**kw: SimpleNamespace(returncode=75)))
+        self.assertFalse(M.priority_busy(cfg,run=lambda *a,**kw: SimpleNamespace(returncode=0)))

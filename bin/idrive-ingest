@@ -423,7 +423,8 @@ def tick(cfg, dry=False):
                                         f'cd {CLIENT}/bin && script -qec "./idrive --backup" /dev/null >> {LOGFILE} 2>&1'])
                 if rc == 0:
                     started_at, running = now, True
-                    last_start = {"at": now, "spec": have_spec, "sources": [s["name"] for s in active]}
+                    last_start = {"at": now, "spec": have_spec, "sources": [s["name"] for s in active],
+                                  "source_paths": {s["name"]: {"path": s["path"], "masks": s["masks"]} for s in active}}
                     actions.append("started backup")
                 else:
                     problems.append(f"backup start failed: {err.strip()[-200:]}")

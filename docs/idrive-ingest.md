@@ -97,3 +97,10 @@ started after the latest completed home copy; an older seed is not proof of newe
 The existing mounted home source can hold separate host folders without restarting the IDrive
 container. Files added after its initial scan require a later successful ingest before they
 count as off-site. Do not change source mounts or restart the running first seed just to add them.
+
+New home-copy attempts may set `hub_priority_lock` to the hub archive batch's existing lock.
+A held lock (or an unavailable check) defers the new attempt; an already-running copy is not
+interrupted. With `preflight_space`, an impossible plan is reused only to defer for up to
+`preflight_cache_h` (default 6 hours). More destination space triggers a fresh plan; `--force`
+requests a fresh plan after substantial source reduction. A cached plan never authorizes a
+copy. This avoids repeatedly scanning millions of files while the missing archive copies wait.
