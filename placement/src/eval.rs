@@ -332,7 +332,8 @@ fn child_name(root: &str, path: &str) -> Option<String> {
     let path = norm_path(path);
     let rest = path.strip_prefix(&root)?.strip_prefix('/')?;
     let name = rest.split('/').next().unwrap_or("");
-    if name.is_empty() {
+    // A dot entry (Syncthing's .stversions and .stfolder, Finder's files) is not a data set.
+    if name.is_empty() || name.starts_with('.') {
         None
     } else {
         Some(name.to_string())

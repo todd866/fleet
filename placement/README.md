@@ -14,7 +14,7 @@ Install: `cargo install --path placement` (binary name `placement`). Put it on `
 |---|---|
 | `placement plan` | Dry run. One row per action: host, keep / move / sync / ignore / clear / refuse, bytes, reason. |
 | `placement apply` | This Mac only. Copy, verify size and SHA-256, move the source to Trash, write `name.OFFLOADED.txt` and a ledger row. Exit 75 if focus-guard is active or a volume `.writer` lock is live. |
-| `placement status` | One row per host (free, floor, band) and one row per data gap. Writes `~/.local/state/placement/status.json`. |
+| `placement status` | One row per host (free, floor, band) and one row per data gap. Writes `~/.local/state/placement/status.json`. Other Macs' drives and free space come from diskmap's peer caches (`diskmap peers`); this Mac's own files win for its host, and `peers` in the JSON gives each cache's age. |
 | `placement init --from-drive-registry` | Write site config from `drives.json` and `datasets.json`. |
 
 ```text
@@ -67,7 +67,7 @@ Copy `~/.cargo/bin/placement` to `~/.local/bin/placement` on each Mac. Do not sc
 1. On one Mac, with `~/.config/fleet/drives.json` and a data-set file present: `placement init --from-drive-registry --out ~/.config/fleet/placement.toml`. Read it. Copy that file to the other Macs (it is site config, not a secret, and it does not belong in git).
 2. diskmap should already be writing `summary.json`. Last access is `access.json` in the same directory, or `newest_mtime` on a `where.json` row.
 3. `placement plan` on each Mac (`--host primary`, `hub`, or `shared`, or your own ids). The rows are the change. Nothing moves.
-4. `placement status` writes the JSON fleet-health and mac-registry read. Optional: the launchd template, which runs `status` only.
+4. `placement status` writes the JSON fleet-health and mac-registry read. Schedule it hourly on the Mac that runs fleet morning's placement row with `docs/launchd/com.example.placement-status.plist`, which runs `diskmap peers` first so a master on another Mac's drive is seen.
 5. When the plan is acceptable and the machine is idle: `placement apply --host <id>`. Personal rows stay put until two encrypted copies are verified. Syncthing then honours the `.stignore` apply wrote into each sync folder. Do not add `(?d)` by hand.
 6. Confirmed replicas land in `replicas.json`. The next status stops calling an empty directory a copy.
 

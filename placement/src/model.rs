@@ -313,6 +313,18 @@ pub struct Observation {
     pub present: Vec<Present>,
     pub access: Vec<Access>,
     pub replicas: Vec<Replica>,
+    /// Peer caches read (`diskmap peers`): whose rows these are and how old.
+    pub peers: Vec<PeerSeen>,
+}
+
+/// One peer's cached where rows: `measured` is when the peer last mapped them, `fetched`
+/// when this Mac copied them. Both are Unix seconds; 0 when unknown.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PeerSeen {
+    pub host: String,
+    pub rows: usize,
+    pub measured: i64,
+    pub fetched: i64,
 }
 
 #[derive(Debug, Clone)]

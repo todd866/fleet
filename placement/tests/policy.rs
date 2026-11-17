@@ -155,6 +155,7 @@ fn obs(
         present: present_rows,
         access: access_rows,
         replicas,
+        peers: vec![],
     }
 }
 
@@ -1134,4 +1135,90 @@ fn only_child(dir: &Path) -> PathBuf {
         .collect();
     assert_eq!(kids.len(), 1, "{kids:?}");
     kids.pop().unwrap()
+}
+
+/// The hub's drives are only in the hub's own where.json. This Mac sees them through
+/// diskmap's peer cache; without it a re-obtainable master on a hub drive reads as empty.
+fn write_peer_fixture(dir: &Path, with_peer: bool) {
+    fs::write(
+        dir.join("summary.json"),
+        r#"{"generated":1,"locations":[{"kind":"volume","host":"primary","name":"internal","physical_drive":"internal","free_bytes":250000000000}]}"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.join("where.json"),
+        r#"{"matches":[{"host":"primary","location":"internal","home_path":"Games/Demo","bytes":4000000000}]}"#,
+    )
+    .unwrap();
+    if !with_peer {
+        return;
+    }
+    fs::create_dir_all(dir.join("peers")).unwrap();
+    fs::write(
+        dir.join("peers/hub.where.json"),
+        format!(
+            r#"{{"generated":{g},"fetched":{f},"min_bytes":0,"matches":[
+              {{"host":"hub","location":"media","path":"Games/Demo","home_path":null,"bytes":4000000000,"as_of":{g},"kind":"volume"}},
+              {{"host":"hub","location":"internal","path":"Users/u/Games/.stversions","home_path":"Games/.stversions","bytes":400000000,"as_of":{g},"kind":"volume"}},
+              {{"host":"primary","location":"internal","path":"Users/u/Games/Stale","home_path":"Games/Stale","bytes":9000000000,"as_of":{g},"kind":"volume"}}
+            ]}}"#,
+            g = NOW - 3600,
+            f = NOW - 60
+        ),
+    )
+    .unwrap();
+    fs::write(
+        dir.join("peers/hub.json"),
+        r#"{"generated":1,"locations":[{"kind":"volume","host":"hub","name":"internal","physical_drive":"internal","free_bytes":80000000000},
+           {"kind":"volume","host":"primary","name":"internal","physical_drive":"internal","free_bytes":1}]}"#,
+    )
+    .unwrap();
+}
+
+fn master_gaps(plan: &Plan) -> Vec<String> {
+    plan.violations
+        .iter()
+        .filter(|v| v.code == "master" || v.code == "misplaced")
+        .map(|v| format!("{}:{}:{}", v.host, v.dataset, v.detail))
+        .collect()
+}
+
+#[test]
+fn a_master_on_a_peers_drive_is_seen_through_the_peer_cache() {
+    let mut policy = games_policy();
+    policy.hosts[1].band_low_gb = None;
+    let lone = Tmp::new();
+    write_peer_fixture(lone.path(), false);
+    let seen = load_observation(lone.path(), None, NOW);
+    let plan = evaluate(&policy, &seen);
+    assert!(
+        master_gaps(&plan).contains(&"hub:games/Demo:master empty".to_string()),
+        "without the cache the hub drive is invisible: {:?}",
+        master_gaps(&plan)
+    );
+
+    let tmp = Tmp::new();
+    write_peer_fixture(tmp.path(), true);
+    let seen = load_observation(tmp.path(), None, NOW);
+    let plan = evaluate(&policy, &seen);
+    assert!(master_gaps(&plan).is_empty(), "{:?}", master_gaps(&plan));
+    assert_eq!(free_bytes(&seen, "hub"), Some(80_000_000_000), "peer summary gives the hub's free space");
+    assert_eq!(free_bytes(&seen, "primary"), Some(250_000_000_000), "local summary wins for this Mac");
+    assert!(
+        !seen.present.iter().any(|p| p.path == "Games/Stale"),
+        "a peer's copy of this Mac's rows never overrides this Mac's own"
+    );
+    assert_eq!(
+        seen.peers,
+        vec![PeerSeen {
+            host: "hub".into(),
+            rows: 2,
+            measured: NOW - 3600,
+            fetched: NOW - 60
+        }]
+    );
+    assert!(
+        !expand_units(&policy, &seen).iter().any(|u| u.path.contains(".stversions")),
+        "Syncthing's version store is not a data set"
+    );
 }

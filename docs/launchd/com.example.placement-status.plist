@@ -6,11 +6,12 @@
 	<string>com.example.placement-status</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>REPLACE_HOME/.local/bin/placement</string>
-		<string>status</string>
+		<string>/bin/sh</string>
+		<string>-c</string>
+		<string>REPLACE_HOME/.local/bin/diskmap peers; exec REPLACE_HOME/.local/bin/placement status</string>
 	</array>
 	<key>StartInterval</key>
-	<integer>1800</integer>
+	<integer>3600</integer>
 	<key>RunAtLoad</key>
 	<true/>
 	<key>ProcessType</key>

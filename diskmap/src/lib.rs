@@ -7,6 +7,7 @@ mod cloud;
 mod darwin;
 mod engine;
 mod logic;
+mod peers;
 mod sqlite;
 mod store;
 mod summary;
@@ -39,6 +40,8 @@ pub use summary::{
     fleet_lines, format_bytes_cell, format_fleet, format_top, FleetLine, Grower, Location, MapStatus,
     Summary, TopEntry, TopMap, TrendBytes,
 };
+pub use peers::{read_where, store_summary, store_where, summary_path, where_path, PeerWhere};
+pub use summary::{WhereFile, WhereHit};
 pub use tick::{grew_report, GrewHit, GrewReport, Roots};
 
 pub fn run(args: Vec<String>) -> i32 {

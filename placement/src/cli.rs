@@ -186,7 +186,8 @@ fn cmd_status(args: &[String]) -> i32 {
     let now = unix_now();
     let obs = observation(&flags);
     let plan = evaluate(&policy, &obs);
-    let doc = status_file(&plan, now);
+    let mut doc = status_file(&plan, now);
+    doc.peers = obs.peers.clone();
     let out = flags.out.unwrap_or_else(default_status_path);
     if let Some(parent) = out.parent() {
         if !parent.as_os_str().is_empty() {
@@ -211,6 +212,7 @@ fn cmd_status(args: &[String]) -> i32 {
         print!("{json}");
     } else {
         print!("{}", format_status(&plan));
+        print!("{}", crate::status::format_peers(&obs.peers, now));
     }
     0
 }

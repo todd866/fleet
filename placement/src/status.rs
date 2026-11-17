@@ -1,7 +1,7 @@
 //! Instrument text and the JSON document fleet-health and mac-registry read.
 
 use crate::eval::fmt_bytes;
-use crate::model::{Action, BudgetState, GB, HostBudget, Plan, Violation};
+use crate::model::{Action, BudgetState, GB, HostBudget, PeerSeen, Plan, Violation};
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
@@ -22,6 +22,8 @@ pub struct StatusFile {
     pub ok: bool,
     pub hosts: Vec<StatusHost>,
     pub violations: Vec<Violation>,
+    /// Other Macs' rows came from these caches; their ages say how current the gaps are.
+    pub peers: Vec<PeerSeen>,
 }
 
 pub fn status_file(plan: &Plan, generated: i64) -> StatusFile {
@@ -53,6 +55,7 @@ pub fn status_file(plan: &Plan, generated: i64) -> StatusFile {
         ok,
         hosts,
         violations: plan.violations.clone(),
+        peers: Vec::new(),
     }
 }
 
@@ -93,6 +96,32 @@ pub fn format_status(plan: &Plan) -> String {
         text.push_str(&render(&data, &[false, false, false, false]));
     }
     text
+}
+
+/// One line: which peer caches fed the view and how old each is (measured on the peer).
+pub fn format_peers(peers: &[PeerSeen], now: i64) -> String {
+    if peers.is_empty() {
+        return String::new();
+    }
+    let parts: Vec<String> = peers
+        .iter()
+        .map(|p| format!("{} {} rows {} old", p.host, p.rows, fmt_age(now, p.measured)))
+        .collect();
+    format!("\n   peers  {}\n", parts.join(" · "))
+}
+
+fn fmt_age(now: i64, then: i64) -> String {
+    if then <= 0 {
+        return "—".into();
+    }
+    let s = (now - then).max(0);
+    if s < 90 * 60 {
+        format!("{}m", s / 60)
+    } else if s < 48 * 3600 {
+        format!("{}h", s / 3600)
+    } else {
+        format!("{}d", s / 86_400)
+    }
 }
 
 fn host_row(budget: &HostBudget) -> [String; 6] {

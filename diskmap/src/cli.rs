@@ -24,6 +24,7 @@ pub fn run(args: Vec<String>) -> i32 {
         "top" => cmd_top(&rest),
         "history" => cmd_history(&rest),
         "where" => cmd_where(&rest),
+        "peers" => cmd_peers(),
         "json" => cmd_json(),
         "tick" => cmd_tick(),
         "walk" => cmd_walk(),
@@ -51,7 +52,7 @@ pub fn run(args: Vec<String>) -> i32 {
 }
 
 fn usage() -> &'static str {
-    "diskmap fleet | grew [--host H|all] [--since 24h] | top [path] | history <path> [--host H] | where <name|glob> [--json] | json | tick"
+    "diskmap fleet | grew [--host H|all] [--since 24h] | top [path] | history <path> [--host H] | where <name|glob> [--json] | peers | json | tick"
 }
 
 fn cmd_tick() -> i32 {
@@ -145,33 +146,90 @@ fn load_or_build(roots: &Roots) -> Result<Summary, String> {
 }
 
 fn fetch_peer(roots: &Roots, peer: &str) -> Result<Summary, String> {
-    let cache = roots.state.join("peers").join(format!("{peer}.json"));
-    let out = Command::new("ssh")
-        .args([
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=5",
-            peer,
-            "diskmap json",
-        ])
-        .output()
-        .map_err(|e| e.to_string())?;
-    if out.status.success() {
-        if let Ok(summary) = serde_json::from_slice::<Summary>(&out.stdout) {
-            if let Some(parent) = cache.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-            let _ = fs::write(&cache, &out.stdout);
+    if let Ok(out) = ssh_output(peer, "diskmap json") {
+        if let Ok(summary) = crate::peers::store_summary(&roots.state, peer, &out) {
             return Ok(summary);
         }
     }
-    if let Ok(text) = fs::read_to_string(&cache) {
+    if let Ok(text) = fs::read_to_string(crate::peers::summary_path(&roots.state, peer)) {
         if let Ok(summary) = serde_json::from_str(&text) {
             return Ok(summary);
         }
     }
     Err("unreachable".into())
+}
+
+/// `diskmap peers`: refresh this Mac's cache of every peer's summary and where rows
+/// (`peers/<peer>.json`, `peers/<peer>.where.json`). A peer that does not answer keeps its
+/// last cache; the line says how old it is. Never fails because a peer is away.
+fn cmd_peers() -> i32 {
+    let roots = Roots::from_env();
+    let (cfg, me) = tick::load(&roots);
+    let now = tick::unix_now();
+    for peer in &cfg.peers {
+        if peer == &me.id || peer == &me.local_host_name {
+            continue;
+        }
+        let summary = match fetch_peer(&roots, peer) {
+            Ok(s) => format!("summary {}", logic::fmt_age(now, s.generated)),
+            Err(err) => format!("summary {err}"),
+        };
+        let fresh = ssh_output(peer, "diskmap where '*' --json --remote-ask")
+            .and_then(|out| crate::peers::store_where(&roots.state, peer, &out, now));
+        let rows = match fresh {
+            Ok(doc) => format!("where {} rows, measured {} ago", doc.matches.len(), logic::fmt_age(now, doc.generated)),
+            Err(err) => match crate::peers::read_where(&roots.state, peer) {
+                Some(doc) => format!(
+                    "where kept cache ({err}): {} rows, fetched {} ago",
+                    doc.matches.len(),
+                    logic::fmt_age(now, doc.fetched)
+                ),
+                None => format!("where none ({err})"),
+            },
+        };
+        println!("{peer:<4}  {summary}  {rows}");
+    }
+    0
+}
+
+/// Run one command on a peer. Gives up after 60 s, so a peer whose disk has hung cannot
+/// hold up the reader that runs after this (placement status).
+fn ssh_output(peer: &str, command: &str) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let mut child = Command::new("ssh")
+        .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", peer, command])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let mut stdout = child.stdout.take().ok_or("no stdout")?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("timed out".into());
+            }
+            Err(err) => return Err(err.to_string()),
+        }
+    };
+    let out = reader.join().unwrap_or_default();
+    if status.success() {
+        Ok(out)
+    } else {
+        Err("unreachable".into())
+    }
 }
 
 fn cmd_grew(args: &[String]) -> i32 {

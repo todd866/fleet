@@ -15,6 +15,7 @@ Install: `cargo install --path diskmap` (binary name `diskmap`). Put it on `PATH
 | `diskmap top [path]` | Largest directories directly inside `path` (volume root when omitted). |
 | `diskmap history <path> [--host H]` | Daily totals for that directory, including days that have already shipped to the archive. |
 | `diskmap where <name\|glob>` | Which Macs, drives, or cloud locations hold a matching directory of at least 100 MB. `--json` prints the rows. |
+| `diskmap peers` | Refresh this Mac's cache of every peer's summary and `where` rows (`peers/<peer>.json`, `peers/<peer>.where.json`). A peer that does not answer within 60 s keeps its last cache; the line prints its age. Run hourly before `placement status`. |
 | `diskmap json` | Print the summary document. Also refreshes `summary.json`. |
 | `diskmap tick` | One launchd pass: keep the initial-walk worker alive, and once that walk has finished fold in FSEvents, write the summary, alert, ship history. |
 
@@ -88,6 +89,7 @@ All under `~/.local/state/diskmap/` unless `DISKMAP_STATE` is set.
 | `spool/` | Events and history waiting while the archive volume is unplugged. |
 | `walk.lock` | Held by the initial-walk worker. A dead worker releases it; the next tick starts another. |
 | `peers/<host>.json` | Last summary fetched from a peer. |
+| `peers/<host>.where.json` | Last `where` rows fetched from a peer: `generated` (newest row, measured there), `fetched` (copied here), `matches`. Replaced only by a good answer. |
 
 `total_bytes` is allocated local bytes (a directory plus its children). Until the walk finishes, a partial directory's total is a lower bound and `summary.json` carries `map` (`dirs`, `percent`, `done`) on that volume. Dataless bytes are the logical size that is not on disk, including the undownloaded part of a partial iCloud file. The first walk records a baseline and a snapshot of each directory's total when that directory first becomes complete. It does not emit growth events. Later rescans do. Before any `history` row exists, `grew` compares the current map with that snapshot and, when nothing has changed, prints `no history yet (map since HH:MM)`.
 
