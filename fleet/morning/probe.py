@@ -62,6 +62,7 @@ def _gather():
         "idrive_ingest": _json(HOME / ".local/state/idrive-ingest/status.json"),
         # A laptop's copy of its home on the hub (home-mirror), where this Mac pushes one.
         "home_mirror": _json(HOME / ".local/state/home-mirror/status.json"),
+        "offload_queue": _json(HOME / str(_site().get("offload_status_path") or ".local/state/offload/status.json")),
         "icloud": _icloud(),
         "cool_c": _cool_target(),
         "queue": _queue(),

@@ -249,6 +249,8 @@ def _backups(name, host, config, now):
                             f'macOS IDrive held since {attempt["held_since"]} (owner hold). Keep it held; Linux ingest and home-mirror coverage are evaluated separately.')
     if host.get("idrive_ingest") is not None:
         rows.append(_idrive_ingest(name, host["idrive_ingest"], cfg, now))
+    if host.get("offload_queue") is not None:
+        rows.append(_offload_queue(name, host["offload_queue"], now))
     if host.get("home_mirror") is not None:
         rows.append(_home_mirror(name, host["home_mirror"], cfg, now))
     if "drive_mirror_epoch" in host:
@@ -1145,3 +1147,21 @@ def _zone(name):
         return ZoneInfo(name)
     except Exception:
         return timezone.utc
+
+
+def _offload_queue(name, status, now):
+    candidates = status.get("candidates") or []
+    age = now - int(status.get("checked_at") or 0)
+    ready = float(status.get("ready_bytes") or 0) / 1e9
+    waiting = float(status.get("waiting_bytes") or 0) / 1e9
+    blocked = [r for r in candidates if r.get("state") not in
+               ("waiting-idrive", "ready-for-review", "trashed", "verification-deferred")]
+    stale = age > 3 * 3600 or age < -120
+    level = "warn" if candidates or stale else "pass"
+    detail = "; ".join(str(r.get("source", r.get("name", ""))) + ": " + str(r.get("state")) for r in candidates)
+    if stale:
+        detail = "queue check stale; " + detail
+    return _row(f"backup:{name}:offload", level, "backup", f"{name} offload",
+                "stale" if stale else f"{ready:.1f} GB review",
+                f"{waiting:.1f} GB waiting" + (f"; {len(blocked)} blocked" if blocked else ""),
+                detail + "; no automatic deletion; final checks required before removal")
