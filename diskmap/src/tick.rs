@@ -178,9 +178,11 @@ fn fold_events(vol: &Mounted, db_path: &Path) {
     if let Ok((events, max_id, fs_uuid)) =
         darwin::replay_events(&vol.mount, vol.dev, stored_event_id(db_path), Duration::from_millis(250))
     {
-        let _ = remember_fs(db_path, max_id, &fs_uuid);
         let scans = logic::coalesce(&events);
-        let _ = engine::apply_scans(db_path, &scans);
+        // Never advance the replay cursor past events we failed to queue.
+        if engine::apply_scans(db_path, &scans).is_ok() {
+            let _ = remember_fs(db_path, max_id, &fs_uuid);
+        }
     }
 }
 
@@ -374,7 +376,10 @@ fn stored_event_id(db_path: &Path) -> u64 {
         .ok()
         .flatten()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(u64::MAX)
+        // A short-lived polling stream must replay history on first use.
+        // "Since now" returned no cursor and skipped its run loop, so every
+        // subsequent tick missed changes again indefinitely.
+        .unwrap_or(0)
 }
 
 fn remember_fs(db_path: &Path, id: u64, uuid: &str) -> Result<(), String> {
@@ -967,6 +972,20 @@ mod tests {
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn missing_or_invalid_event_cursor_replays_history() {
+        let dir = scratch();
+        let path = dir.join("index.db");
+        let db = store::open(&path).unwrap();
+        assert_eq!(stored_event_id(&path), 0);
+        store::meta_set(&db, "fsevent_id", "invalid").unwrap();
+        assert_eq!(stored_event_id(&path), 0);
+        store::meta_set(&db, "fsevent_id", "12345").unwrap();
+        assert_eq!(stored_event_id(&path), 12345);
+        drop(db);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -185,3 +185,12 @@ See `docs/setup.md` for the install lines.
 ## Safety
 
 The walker opens directories read-only. It never unlinks, renames, or writes outside `~/.local/state/diskmap` and the encrypted archive. Dataless files are measured, not downloaded. No credentials are read; IDrive's plist is parsed only for path strings, and account folder names are not printed. There is no network except the SSH `diskmap` already uses for fleet peers, the same path fleet-health uses.
+
+### Change-log cursor recovery
+
+A missing or invalid FSEvents cursor replays retained history from event zero. A polling
+stream cannot initialize with “since now”: it would discard changes between ticks and
+never save its first cursor. Rescan requests are queued before the cursor advances, so a
+failed queue write is retried on the next pass. After upgrading an affected installation,
+verify that database `meta.fsevent_id` becomes populated and changed directories refresh;
+a fresh summary timestamp alone does not prove current directory measurements.
