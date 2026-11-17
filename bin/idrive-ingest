@@ -10,6 +10,7 @@ volume is also a source, caches, the VM's own disk) are blanked with an empty tm
   idrive-ingest tick [--dry-run]   keep VM and container up; back up once a day; write status.json
   idrive-ingest plan               the sources and masks this Mac would use now
   idrive-ingest status             status.json, summarised
+  idrive-ingest request PATH TIME  queue cloud confirmation after local verification
   idrive-ingest build              build the client image in the VM (fetches the installer)
   idrive-ingest login              the owner signs in to IDrive inside the container (interactive)
   idrive-ingest import-login DIR   copy an existing client config (a signed-in idriveIt folder) in
@@ -30,6 +31,11 @@ compete with a migration for the same disk. A change to the sources
 takes effect between runs, and counts as a reason to run again at once; a source marked
 `"priority": true` that becomes available stops a running backup so the next run includes it
 (files already uploaded are not sent again).
+
+With `scope_verified_requests: true`, a verified folder inside `priority_batches` gets a
+narrow confirmation pass before broad archive batches. Its original /backup cloud path and
+masks are preserved. Exact configured batches keep their names; active priority uploads finish
+uninterrupted. Only a successful, file-count-checked receipt can clear a verification request.
 
 State: ~/.local/state/idrive-ingest/ (status.json, tick.log, login-backup.tar). The client's own
 config (login, history) lives in the Docker volume `idrive-config` inside the VM; the tick copies
@@ -544,6 +550,8 @@ def priority_config(cfg, batch):
     result['mask_everywhere'] = []
     for requested in batch['paths']:
         path = expand(requested).rstrip('/')
+        if not path.startswith('/') or '..' in pathlib.Path(path).parts:
+            raise ValueError('invalid priority path')
         matches = [s for s in cfg['sources'] if path == expand(s['path']).rstrip('/')
                    or path.startswith(expand(s['path']).rstrip('/') + '/')]
         if not matches:
@@ -575,6 +583,26 @@ def priority_config(cfg, batch):
 
 
 def cycle_choice(cfg, ledger, now):
+    # New verified folders get their own completion receipt, rather than waiting
+    # for an entire archive drive to finish. Exact configured batches keep their
+    # existing order and names, including an already-running phase.
+    if cfg.get('scope_verified_requests'):
+        batches = cfg.get('priority_batches', [])
+        roots = [expand(p).rstrip('/') for b in batches for p in b['paths']]
+        exact = {expand(b['paths'][0]).rstrip('/') for b in batches if len(b['paths']) == 1}
+        for path, stamp in sorted(cfg.get('_priority_requests', {}).items(), key=lambda item: int(item[1])):
+            if path in exact or not any(path == root or path.startswith(root + '/') for root in roots):
+                continue
+            if int(stamp) <= 0 or int(stamp) > now + 120:
+                continue
+            name = 'verified-offload-' + hashlib.sha256(path.encode()).hexdigest()[:16]
+            receipt = ledger.get('receipts', {}).get(name, {})
+            if (receipt.get('completed_at') and receipt.get('paths') == [path]
+                    and int((receipt.get('start') or {}).get('at') or 0) >= int(stamp)):
+                continue
+            scoped = priority_config(cfg, {'paths': [path]})
+            scoped['every_h'] = 0
+            return name, scoped
     for batch in cfg.get('priority_batches', []):
         receipt = ledger.get('receipts', {}).get(batch['name'], {})
         completed = int(receipt.get('completed_at') or 0)
@@ -690,7 +718,8 @@ def main(argv=None):
     if args.cmd == "request":
         path = expand(args.path).rstrip('/')
         roots = [expand(p).rstrip('/') for b in cfg.get('priority_batches', []) for p in b['paths']]
-        if (args.verified_at <= 0 or args.verified_at > time.time() + 120
+        if (not path.startswith('/') or '..' in pathlib.Path(path).parts
+                or args.verified_at <= 0 or args.verified_at > time.time() + 120
                 or not any(path == root or path.startswith(root + '/') for root in roots)):
             raise ValueError('request is outside configured priority paths or has an invalid timestamp')
         STATE.mkdir(parents=True, exist_ok=True)

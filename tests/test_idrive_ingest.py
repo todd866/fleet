@@ -172,7 +172,7 @@ class PriorityCycle(unittest.TestCase):
 
     def test_priority_never_selects_outside_or_masked_data(self):
         base=cfg(sources=[{'name':'A','path':'/data','mask':['skip']}])
-        for path in ['/other','/data/skip/deep']:
+        for path in ['/other','/data/skip/deep','/data/../outside']:
             with self.assertRaises(ValueError):M.priority_config(base,{'paths':[path]})
 
     def test_priority_then_bulk_then_next_priority_cycle(self):
@@ -189,6 +189,34 @@ class PriorityCycle(unittest.TestCase):
         self.assertEqual(M.cycle_choice(base,ledger,100101)[0],'laptop')
         ledger['receipts']['laptop']['start']['at']=100051
         self.assertEqual(M.cycle_choice(base,ledger,100101)[0],'bulk')
+
+    def test_new_folder_gets_narrow_confirmation_before_broad_archive(self):
+        base=cfg(sources=[{'name':'A','path':'/data'}],
+                 priority_batches=[{'name':'archive','paths':['/data/laptop']}],
+                 scope_verified_requests=True,_priority_requests={'/data/laptop/new-folder':100050})
+        name,scoped=M.cycle_choice(base,{},100100)
+        self.assertTrue(name.startswith('verified-offload-'))
+        self.assertEqual(scoped['sources'][0]['path'],'/data/laptop/new-folder')
+        self.assertEqual(scoped['sources'][0]['mount_at'],'A/laptop/new-folder')
+        ledger={'receipts':{name:{'completed_at':100100,'paths':['/data/laptop/new-folder'],
+                                  'start':{'at':100060}}}}
+        self.assertEqual(M.cycle_choice(base,ledger,100101)[0],'archive')
+        base['_priority_requests']['/data/laptop/new-folder']=100102
+        self.assertEqual(M.cycle_choice(base,ledger,100103)[0],name)
+
+    def test_exact_configured_request_keeps_existing_phase(self):
+        base=cfg(sources=[{'name':'A','path':'/data'}],
+                 priority_batches=[{'name':'papers','paths':['/data/laptop/papers']},
+                                   {'name':'archive','paths':['/data/laptop']}],
+                 scope_verified_requests=True,_priority_requests={'/data/laptop/papers':100050})
+        self.assertEqual(M.cycle_choice(base,{},100100)[0],'papers')
+
+    def test_generated_request_cannot_escape_or_unmask_sources(self):
+        base=cfg(sources=[{'name':'A','path':'/data','mask':['laptop/private']}],
+                 priority_batches=[{'name':'archive','paths':['/data/laptop']}],scope_verified_requests=True)
+        for path in ['/data/laptop/../../other','/data/laptop/private/files']:
+            base['_priority_requests']={path:100050}
+            with self.assertRaises(ValueError):M.cycle_choice(base,{},100100)
 
 class CycleTransitions(unittest.TestCase):
     def test_priority_success_is_not_a_full_success_when_bulk_starts(self):
