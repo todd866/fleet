@@ -39,6 +39,8 @@ def collect(config, *, here, now, state=None, run=None, home=None, gather=None, 
     merged["board"] = _board(home, run)
     merged["agentkit"] = _agentkit(run)
     merged["upstream"] = _upstream(home)
+    from fleet.ai_usage import read_summary
+    merged["ai_usage"] = read_summary(home)
     merged.update(_hub_context(home, config))
     merged["job_reviews"] = job_reviews(
         Path(config.get("registry") or Path(home) / ".local/state/mac-sync/registry"))

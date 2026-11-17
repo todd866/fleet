@@ -55,6 +55,7 @@ def evaluate(snapshot, config, now):
         rows.extend(_thermal(name, host, config, now))
         rows.extend(_mail(name, host, config, now))
     rows.extend(_capacity(snapshot.get("capacity"), config, now, tz))
+    rows.extend(_ai_usage(snapshot.get("ai_usage"), now))
     rows.extend(_agents(snapshot.get("board"), now))
     rows.extend(_projects(snapshot.get("projects") or [], _reported_jobs(snapshot.get("hosts") or {}), prefixes))
     rows.extend(_placement(snapshot.get("placement"), rows))
@@ -1170,3 +1171,28 @@ def _offload_queue(name, status, now):
                 "stale" if stale else f"{ready:.1f} GB review",
                 f"{waiting:.1f} GB waiting" + (f"; {len(blocked)} blocked" if blocked else ""),
                 detail + "; no automatic deletion; final checks required before removal")
+
+
+def _ai_usage(summary, now):
+    """Usage history freshness is separate from remaining quota/capacity."""
+    rows = []
+    for source in (summary or {}).get("sources", []):
+        if not isinstance(source, dict):
+            rows.append(_row("usage:invalid", "warn", "capacity", "usage history", "unread", "invalid metadata", "Repair the usage metadata import."))
+            continue
+        try:
+            age = (now - float(source["captured_at"])) / 3600
+            end = datetime.fromisoformat(source["coverage_end"]).replace(tzinfo=timezone.utc).timestamp()
+            lag = (now - end) / 86400
+            stale = age > 72 or lag > 5 or age < -1
+            week = source.get("last_full_week") or {}
+            total = week.get("total")
+            value = f"{total / 1e6:.1f}M observed" if isinstance(total, (int, float)) else "recorded"
+            rows.append(_row("usage:" + source["source"], "warn" if stale else "pass", "capacity",
+                "usage " + source["provider"] + " " + source["scope"],
+                "refresh due" if stale else value, "through " + source["coverage_end"],
+                "Token history, not remaining quota. " + str(week.get("start", "")) + " week: " + str(week.get("observed_days", 0)) + " observed dates, source scope " + source["scope"] + ". " + str(source.get("missing_rows", 0)) +
+                " missing rows; missing categories/dates are unknown. " + source.get("refresh", "")))
+        except (ValueError, TypeError, KeyError):
+            rows.append(_row("usage:invalid", "warn", "capacity", "usage history", "unread", "invalid metadata", "Repair the usage metadata import."))
+    return rows
