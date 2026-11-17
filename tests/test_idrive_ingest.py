@@ -209,6 +209,24 @@ class CycleTransitions(unittest.TestCase):
             self.assertEqual(result['scope_receipts'][0]['paths'],[str(root/'data/laptop')])
             self.assertEqual(tick.call_args_list[-1].args[0]['sources'],base['sources'])
 
+    def test_dry_completion_exposes_proof_without_starting_next_scope(self):
+        import tempfile,json
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);(root/'data/laptop').mkdir(parents=True);state=root/'state';state.mkdir()
+            base=cfg(sources=[{'name':'A','path':str(root/'data')}],priority_batches=[{'name':'laptop','paths':[str(root/'data/laptop')]}])
+            phase=M.priority_config(base,base['priority_batches'][0]);sources=M.plan(phase);signature=M.spec_hash(phase,sources)
+            start={'at':100,'spec':signature,'sources':[sources[0]['name']],
+                   'source_paths':{sources[0]['name']:{'path':sources[0]['path'],'masks':[]}}}
+            observed={'running':False,'last_start':start,'last_success':{'epoch':110,'status':'Success','failed':0,'considered':1,'backed_up':1,'present':0},'spec':signature}
+            (state/'cycle.json').write_text(json.dumps({'phase':'laptop','phase_config':phase,'receipts':{}}))
+            with patch.object(M,'STATE',state),patch.object(M.time,'time',return_value=100000),patch.object(M,'tick',side_effect=[observed,{'running':True}]) as tick,patch.object(M,'exec_',return_value=(0,'1','')):
+                result=M.cycle(base,dry=True)
+            self.assertEqual(result['cycle']['next'],'bulk')
+            self.assertEqual(result['scope_receipts'][0]['paths'],[str(root/'data/laptop')])
+            self.assertEqual(tick.call_count,1)
+            self.assertEqual(json.loads((state/'cycle.json').read_text())['receipts'],{})
+
     def test_skipped_file_prevents_priority_completion(self):
         import tempfile,json
         from unittest.mock import patch

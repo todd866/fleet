@@ -651,6 +651,8 @@ def cycle(cfg, dry=False):
             wanted, next_cfg = phase, phase_cfg
     if dry:
         observed['cycle'] = {'phase': phase, 'next': wanted}
+        observed['scope_receipts'] = list(ledger.get('receipts', {}).values())
+        observed['configured_sources'] = plan(cfg, busy=busy(cfg))
         return observed
     # Persist the phase first, so a restart uses the same mount scope.
     ledger.update(phase=wanted, phase_config=next_cfg)
