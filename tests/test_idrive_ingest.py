@@ -138,6 +138,15 @@ class Due(unittest.TestCase):
         self.assertTrue(M.due(self.NOW, fresh, 24, "s2", {"spec": "s1"}, False))
         self.assertFalse(M.due(self.NOW, None, 24, "s1", {}, True), "never twice within the hour")
 
+    def test_unavailable_process_check_is_not_an_idle_client(self):
+        from unittest.mock import patch
+        with patch.object(M,'exec_',return_value=(127,'','unavailable')):
+            with self.assertRaises(RuntimeError):M.backup_age({})
+        with patch.object(M,'exec_',return_value=(0,'','')):
+            self.assertIsNone(M.backup_age({}))
+        with patch.object(M,'exec_',return_value=(0,'12\n34\n','')):
+            self.assertEqual(M.backup_age({}),34)
+
     def test_completed_scope_can_handoff_without_retry_cooldown(self):
         start={"at":self.NOW-300,"spec":"first"}
         success={"epoch":self.NOW-299,"status":"Success","failed":0}

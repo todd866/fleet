@@ -301,7 +301,9 @@ def exec_(cfg, script, timeout=60):
 def backup_age(cfg):
     """Seconds the running backup has been going, or None."""
     rc, out, _ = exec_(cfg, "for p in $(pgrep -f '^./idrive --backup'); do ps -o etimes= -p $p; done", 30)
-    ages = [int(x) for x in out.split() if x.isdigit()] if rc == 0 else []
+    if rc != 0:
+        raise RuntimeError("cannot determine whether IDrive is running; leave the client untouched")
+    ages = [int(x) for x in out.split() if x.isdigit()]
     return max(ages) if ages else None
 
 
