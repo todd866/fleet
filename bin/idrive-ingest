@@ -605,15 +605,26 @@ def cycle(cfg, dry=False):
     start = observed.get('last_start') or {}
     success = observed.get('last_success') or {}
     phase = ledger.get('phase', 'bulk')
+    cycle_problems = []
     phase_sources = [s for s in plan(phase_cfg, busy=busy(cfg)) if not s['missing'] and not s['waiting']]
     phase_spec = spec_hash(phase_cfg, phase_sources)
     if (not observed.get('running') and start.get('spec') == phase_spec
             and observed.get('spec') == phase_spec and success.get('status') == 'Success'
             and success.get('failed') == 0 and start.get('source_paths')
             and int(success.get('epoch') or 0) >= int(start.get('at') or now) - 120):
-        ledger.setdefault('receipts', {})[phase] = {
-            'completed_at': now, 'start': start, 'success': success,
-            'paths': [r['path'] for r in start['source_paths'].values()]}
+        # Count the completed scope BEFORE replacing its mounts. A dry observation
+        # cannot inherit another scope's audit or silently omit this check.
+        rc, output, _error = exec_(cfg, "bash -o pipefail -c 'find /backup -type f -printf . | wc -c'", 7200)
+        count = int(output.strip()) if rc == 0 and output.strip().isdigit() else None
+        audit = {'counted_for': success.get('epoch'), 'files_on_disk': count,
+                 'considered': success.get('considered')}
+        if count is not None and count == success.get('considered') and not observed.get('problems'):
+            audit['gap'] = 0
+            ledger.setdefault('receipts', {})[phase] = {
+                'completed_at': now, 'start': start, 'success': success, 'coverage': audit,
+                'paths': [r['path'] for r in start['source_paths'].values()]}
+        else:
+            cycle_problems.append('completed scope file-count verification failed; no completion receipt')
     wanted, next_cfg = cycle_choice(cfg, ledger, now)
     if observed.get('running'):
         if phase == 'bulk' and wanted != 'bulk' and cfg.get('preempt_bulk_for_priority'):
@@ -639,6 +650,7 @@ def cycle(cfg, dry=False):
     tmp = ledger_path.with_suffix('.json.tmp')
     tmp.write_text(json.dumps(ledger, indent=1) + '\n'); os.replace(tmp, ledger_path)
     status = tick(next_cfg)
+    status.setdefault('problems', []).extend(cycle_problems)
     status['cycle'] = {'phase': wanted, 'receipts': ledger.get('receipts', {})}
     status['scope_receipts'] = list(ledger.get('receipts', {}).values())
     status['configured_sources'] = plan(cfg, busy=busy(cfg))

@@ -183,14 +183,32 @@ class CycleTransitions(unittest.TestCase):
             phase=M.priority_config(base,base['priority_batches'][0]);sources=M.plan(phase);signature=M.spec_hash(phase,sources)
             start={'at':100,'spec':signature,'sources':[sources[0]['name']],
                    'source_paths':{sources[0]['name']:{'path':sources[0]['path'],'masks':[]}}}
-            observed={'running':False,'last_start':start,'last_success':{'epoch':110,'status':'Success','failed':0},'spec':signature}
+            observed={'running':False,'last_start':start,'last_success':{'epoch':110,'status':'Success','failed':0,'considered':1},'spec':signature}
             (state/'cycle.json').write_text(json.dumps({'phase':'laptop','phase_config':phase,'receipts':{}}))
-            with patch.object(M,'STATE',state),patch.object(M.time,'time',return_value=100000),patch.object(M,'tick',side_effect=[observed,{'running':True}]) as tick:
+            with patch.object(M,'STATE',state),patch.object(M.time,'time',return_value=100000),patch.object(M,'tick',side_effect=[observed,{'running':True}]) as tick,patch.object(M,'exec_',return_value=(0,'1','')):
                 result=M.cycle(base)
             self.assertEqual(result['cycle']['phase'],'bulk')
             self.assertIsNone(result['last_full_success_epoch'])
             self.assertEqual(result['scope_receipts'][0]['paths'],[str(root/'data/laptop')])
             self.assertEqual(tick.call_args_list[-1].args[0]['sources'],base['sources'])
+
+    def test_skipped_file_prevents_priority_completion(self):
+        import tempfile,json
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);(root/'data/laptop').mkdir(parents=True);state=root/'state';state.mkdir()
+            base=cfg(sources=[{'name':'A','path':str(root/'data')}],priority_batches=[{'name':'laptop','paths':[str(root/'data/laptop')]}])
+            phase=M.priority_config(base,base['priority_batches'][0]);sources=M.plan(phase);signature=M.spec_hash(phase,sources)
+            start={'at':100,'spec':signature,'sources':[sources[0]['name']],
+                   'source_paths':{sources[0]['name']:{'path':sources[0]['path'],'masks':[]}}}
+            observed={'running':False,'last_start':start,'last_success':{'epoch':110,'status':'Success','failed':0,'considered':1},'spec':signature}
+            (state/'cycle.json').write_text(json.dumps({'phase':'laptop','phase_config':phase,'receipts':{}}))
+            with patch.object(M,'STATE',state),patch.object(M.time,'time',return_value=100000),patch.object(M,'tick',side_effect=[observed,{'running':True}]) as tick,patch.object(M,'exec_',return_value=(0,'2','')):
+                result=M.cycle(base)
+            self.assertEqual(result['cycle']['phase'],'laptop')
+            self.assertIsNone(result['last_full_success_epoch'])
+            self.assertEqual(result['scope_receipts'],[])
+            self.assertIn('file-count verification failed', result['problems'][0])
 
     def test_old_narrow_success_is_not_recorded_as_bulk(self):
         import tempfile,json
