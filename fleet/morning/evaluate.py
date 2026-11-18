@@ -1257,12 +1257,14 @@ def _offload_autopilot(name, pilot, now):
     picks = pilot.get("picks") or []
     in_flight = sum(float(flow.get(k) or 0) for k in ("queued", "waiting", "ready")) / 1e9
     short = gb("shortfall_bytes")
-    level = "warn" if stale or pilot.get("error") or (short > 0 and not picks) or flow.get("blocked") else "pass"
+    uncovered = short > gb("cold_bytes") + 0.5
+    level = "warn" if stale or pilot.get("error") or uncovered or flow.get("blocked") else "pass"
     nxt = "; ".join(f'{p["path"]} {float(p["bytes"]) / 1e9:.1f} GB {p.get("class", "?")}' for p in picks[:10])
     detail = (f"target {target:.0f} GB empty; counting the Bin and items in flight {gb('effective_free_bytes'):.0f} GB; "
               f"short {short:.0f} GB; cold and eligible {gb('cold_bytes'):.1f} GB; "
               + (f"next pick: {nxt}" if nxt else "nothing to pick") + "."
-              + (" No eligible cold data covers the shortfall: widen the scan or decide on warm data." if short > 0 and not picks else "")
+              + (f" Cold data cannot cover the shortfall ({short - gb('cold_bytes'):.0f} GB more needed): the rest is warm"
+                 " (used in the last 30 days) and needs the owner's call, or a wider scan." if uncovered else "")
               + (f" Blocked {float(flow.get('blocked') or 0) / 1e9:.1f} GB." if flow.get("blocked") else "")
               + (f" {pilot['error']}." if pilot.get("error") else ""))
     rows = [_row(f"storage:{name}:cold", level, "disk", f"{name} cold data",
