@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """fleet-install: build, sign and install this workspace's binaries so macOS privacy grants stick.
 
-  fleet-install [--remote] [--host H] [--no-build] TOOL...   build (cargo --release), sign, install
-  fleet-install resign TOOL...      sign the copy already in the install folder (no rebuild)
+  fleet-install [--no-build] [--dirty] TOOL...   build here (cargo --release), sign, install
   fleet-install check               exit 1 if any installed fleet binary lacks the stable signature
   fleet-install dr TOOL...          print each installed binary's designated requirement
-  fleet-install tcc [--mark]        Full Disk Access state of every fleet binary (system TCC.db);
-                                    --mark switches tcc-run to fleet-run once fleet-run holds it
+  fleet-install tcc                 Full Disk Access state of every fleet binary (system TCC.db)
   fleet-install tools               list the workspace's binaries
 
 Why: macOS privacy controls (TCC) remember a command-line binary by its designated requirement
@@ -18,8 +16,11 @@ inside the file, so the Macs without the certificate get signed copies too.
 
 Rules this tool keeps:
 - It refuses to install an unsigned (ad-hoc) build into the install folder; that copy would sync
-  to every Mac and drop their grants. Build on a Mac without the certificate with
-  `--remote` from the Mac that has it, or pass --allow-adhoc for a deliberate exception.
+  to every Mac and drop their grants. Run it on the Mac that holds the certificate, or pass
+  --allow-adhoc for a deliberate exception.
+- It signs only what it built itself, on this Mac, from a clean checkout (--dirty overrides):
+  nothing built elsewhere is ever signed, so the certificate cannot vouch for a worker's output.
+  It cannot re-sign an installed file for the same reason.
 - It never signs the installed file in place (running copies would be killed): it signs a copy
   outside the synced folder and renames it over the old one.
 
@@ -46,7 +47,6 @@ from fleet import site  # noqa: E402
 
 DEFAULT_PREFIX = "org.example.fleet"
 TCC_DB = Path("/Library/Application Support/com.apple.TCC/TCC.db")
-FLEET_RUN_MARKER = Path.home() / ".local/state/fleet/tcc/fleet-run-granted"
 
 
 def settings() -> dict:
@@ -221,7 +221,7 @@ def resolve_identity(cfg: dict, allow_adhoc: bool) -> str | None:
         return ""
     want = cfg["identity"] or "a Developer ID Application identity"
     print(f"fleet-install: {want} is not on this Mac. Run fleet-install on the Mac that holds it "
-          "(with --remote to build on a worker), or pass --allow-adhoc.", file=sys.stderr)
+          "or pass --allow-adhoc.", file=sys.stderr)
     return None
 
 
@@ -235,17 +235,22 @@ def cmd_install(a, cfg) -> int:
     if identity is None:
         return 3
     pkgs = sorted({tools[t] for t in a.tools})
+    dirty = run(["git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=no"]).stdout.strip()
+    if dirty and not a.dirty:
+        print("fleet-install: the checkout has uncommitted changes; commit them (or pass --dirty)", file=sys.stderr)
+        return 3
+    if a.no_build and not a.dirty:
+        print("fleet-install: --no-build signs whatever is in target/release; pass --dirty too to accept that", file=sys.stderr)
+        return 3
     if not a.no_build:
-        build = ["cargo", "build", "--release"] + [x for p in pkgs for x in ("-p", p)]
-        if a.remote:
-            cmd = ["remote-run"] + (["--host", a.host] if a.host else [])
-            for t in a.tools:
-                cmd += ["--pull", f"target/release/{t}"]
-            cmd += ["--"] + build
-        else:
-            cmd = build
+        # Always built here: a remote build would ask the certificate to vouch for a worker's output.
+        cmd = ["cargo", "build", "--release", "--locked"] + [x for p in pkgs for x in ("-p", p)]
+        slot = shutil.which("heavy-slot")
+        if slot:
+            cmd = [slot, "--"] + cmd
         print("$", " ".join(cmd), flush=True)
-        if subprocess.run(cmd, cwd=ROOT).returncode != 0:
+        env = dict(os.environ, HEAVY_SLOT_LABEL="fleet-install")
+        if subprocess.run(cmd, cwd=ROOT, env=env).returncode != 0:
             return 1
     rc = 0
     for t in a.tools:
@@ -255,21 +260,6 @@ def cmd_install(a, cfg) -> int:
             rc = 1
             continue
         rc = max(rc, sign_and_install(src, t, cfg, identity, a.allow_adhoc))
-    return rc
-
-
-def cmd_resign(a, cfg) -> int:
-    identity = resolve_identity(cfg, False)
-    if identity is None:
-        return 3
-    rc = 0
-    for t in a.tools:
-        dest = cfg["install_dir"] / t
-        if not dest.is_file() or not is_macho(dest):
-            print(f"fleet-install: {dest} is not an installed binary", file=sys.stderr)
-            rc = 1
-            continue
-        rc = max(rc, sign_and_install(dest, t, cfg, identity, False))
     return rc
 
 
@@ -285,7 +275,7 @@ def cmd_check(a, cfg) -> int:
         print(f"{'ok ' if ok else 'BAD'} {t:<20} {why}")
         bad += not ok
     if bad:
-        print(f"{bad} binary(ies) without the stable signature: run `fleet-install resign TOOL` on the Mac with the certificate")
+        print(f"{bad} binary(ies) without the stable signature: run `fleet-install TOOL` on the Mac with the certificate")
     return 1 if bad else 0
 
 
@@ -314,7 +304,6 @@ def cmd_tcc(a, cfg) -> int:
         return 2
     by_client = {r[0]: r for r in rows}
     state = {0: "off", 2: "ON", 3: "limited"}
-    granted = set()
     for t in sorted(workspace_tools()):
         p = cfg["install_dir"] / t
         if not p.is_file():
@@ -324,44 +313,25 @@ def cmd_tcc(a, cfg) -> int:
             print(f"{t:<20} no row (never asked)")
         else:
             print(f"{t:<20} Full Disk Access {state.get(r[1], r[1])}  (reason {r[2]}, row written {r[3]})")
-            if r[1] == 2:
-                granted.add(t)
-    if a.mark:
-        # tcc-run hands its jobs to fleet-run only on a Mac where fleet-run holds the grant;
-        # the marker is per Mac (this folder is not synced).
-        marker = FLEET_RUN_MARKER
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        if "fleet-run" in granted:
-            marker.write_text("fleet-run holds Full Disk Access on this Mac; tcc-run uses it\n")
-            print(f"marked: {marker}")
-        elif marker.exists():
-            marker.rename(marker.with_suffix(".revoked"))
-            print(f"fleet-run has no grant here: {marker} moved aside; tcc-run stays on zsh")
-        else:
-            print("fleet-run has no grant here; tcc-run stays on zsh")
     return 0
 
 
 def main(argv: list[str]) -> int:
     cfg = settings()
-    sub = {"resign", "check", "dr", "tcc", "tools"}
+    sub = {"check", "dr", "tcc", "tools"}
     if argv and argv[0] in sub:
         p = argparse.ArgumentParser(prog=f"fleet-install {argv[0]}")
-        if argv[0] in ("resign", "dr"):
+        if argv[0] == "dr":
             p.add_argument("tools", nargs="+")
-        if argv[0] == "tcc":
-            p.add_argument("--mark", action="store_true",
-                           help="let tcc-run use fleet-run on this Mac if fleet-run holds the grant")
         a = p.parse_args(argv[1:])
         if argv[0] == "tools":
             for t, pkg in sorted(workspace_tools().items()):
                 print(f"{t}\t{pkg}")
             return 0
-        return {"resign": cmd_resign, "check": cmd_check, "dr": cmd_dr, "tcc": cmd_tcc}[argv[0]](a, cfg)
+        return {"check": cmd_check, "dr": cmd_dr, "tcc": cmd_tcc}[argv[0]](a, cfg)
     p = argparse.ArgumentParser(prog="fleet-install", description=__doc__.split("\n\n")[0])
-    p.add_argument("--remote", action="store_true", help="build on a worker with remote-run, sign here")
-    p.add_argument("--host", help="worker for --remote")
-    p.add_argument("--no-build", action="store_true", help="install what is already in target/release")
+    p.add_argument("--no-build", action="store_true", help="install what is already in target/release (needs --dirty)")
+    p.add_argument("--dirty", action="store_true", help="allow uncommitted changes / an unverified target/release")
     p.add_argument("--allow-adhoc", action="store_true", help="install unsigned when no identity is here")
     p.add_argument("tools", nargs="+")
     return cmd_install(p.parse_args(argv), cfg)
