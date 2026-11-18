@@ -8,7 +8,7 @@
 	<array>
 		<string>/bin/sh</string>
 		<string>-c</string>
-		<string>REPLACE_HOME/.local/bin/diskmap peers; exec REPLACE_HOME/.local/bin/placement status</string>
+		<string>REPLACE_HOME/.local/bin/diskmap peers; REPLACE_HOME/.local/bin/idrive-map --quiet || true; exec REPLACE_HOME/.local/bin/placement status</string>
 	</array>
 	<key>StartInterval</key>
 	<integer>3600</integer>
