@@ -38,6 +38,9 @@ pub struct DiskConfig {
     pub alert_sustain_secs: i64,
     pub alert_cooldown_secs: i64,
     pub drives_json: Option<String>,
+    /// Extra temp, cache or churn trees (volume-relative patterns, see
+    /// `churn_root`), mapped as one opaque total instead of row by row.
+    pub churn_trees: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -82,6 +85,7 @@ pub fn default_config() -> DiskConfig {
         alert_sustain_secs: ALERT_SUSTAIN_SECS,
         alert_cooldown_secs: ALERT_COOLDOWN_SECS,
         drives_json: None,
+        churn_trees: Vec::new(),
     }
 }
 
@@ -98,6 +102,7 @@ struct ConfigFile {
     alert_sustain_secs: Option<i64>,
     alert_cooldown_secs: Option<i64>,
     drives_json: Option<String>,
+    churn_trees: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -153,6 +158,9 @@ pub fn load_config(text: Option<&str>) -> Result<DiskConfig, String> {
     }
     if let Some(v) = parsed.drives_json.filter(|s| !s.is_empty()) {
         cfg.drives_json = Some(v);
+    }
+    if let Some(v) = parsed.churn_trees {
+        cfg.churn_trees = v.into_iter().map(|p| norm_rel(&p)).filter(|p| !p.is_empty()).collect();
     }
     Ok(cfg)
 }
@@ -349,7 +357,7 @@ pub fn coalesce(events: &[RawEvent]) -> Vec<ScanReq> {
     out
 }
 
-fn scan_path(req: &ScanReq) -> &str {
+pub fn scan_path(req: &ScanReq) -> &str {
     match req {
         ScanReq::Dir(p) | ScanReq::Subtree(p) => p,
     }
@@ -1040,26 +1048,213 @@ pub fn pause_walk(focus_active: bool, thermal_serious: bool, force: bool) -> boo
     focus_active || thermal_serious
 }
 
-/// How fast the background worker drains queued rescans after the baseline.
+/// How the background worker may spend CPU.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DrainPace {
+    /// `DISKMAP_FORCE=1` only: no budget.
     Full,
-    /// The owner is at the Mac: small batches with rests between them.
-    Gentle,
+    /// At most this many percent of one core, averaged (CPU of the worker and
+    /// the checks it runs, against wall time).
+    Budget(u32),
     Paused,
 }
 
-/// Owner focus slows the drain but never stops it (a map that only updates
-/// while nobody is looking goes days stale); serious heat stops it.
-pub fn drain_pace(focus_active: bool, thermal_serious: bool, force: bool) -> DrainPace {
+/// Rescans after the baseline: 10% of one core, always. A map that only
+/// updates while nobody is looking goes stale, so owner focus does not stop
+/// them; serious heat does.
+pub const DRAIN_BUDGET_PCT: u32 = 10;
+/// The first walk of a volume, while nobody is at the Mac (focus pauses it).
+pub const BASELINE_BUDGET_PCT: u32 = 25;
+
+pub fn drain_pace(thermal_serious: bool, force: bool) -> DrainPace {
     if force {
         DrainPace::Full
     } else if thermal_serious {
         DrainPace::Paused
-    } else if focus_active {
-        DrainPace::Gentle
     } else {
+        DrainPace::Budget(DRAIN_BUDGET_PCT)
+    }
+}
+
+pub fn baseline_pace(focus_active: bool, thermal_serious: bool, force: bool) -> DrainPace {
+    if force {
         DrainPace::Full
+    } else if pause_walk(focus_active, thermal_serious, false) {
+        DrainPace::Paused
+    } else {
+        DrainPace::Budget(BASELINE_BUDGET_PCT)
+    }
+}
+
+/// How long to rest so that `cpu` spent over `wall` averages `pct` percent of
+/// one core: the work already done paid for at the budget rate, less the time
+/// already passed.
+pub fn budget_sleep(cpu: std::time::Duration, wall: std::time::Duration, pct: u32) -> std::time::Duration {
+    if pct == 0 || pct >= 100 {
+        return std::time::Duration::ZERO;
+    }
+    let owed = cpu.as_secs_f64() * 100.0 / f64::from(pct);
+    let rest = owed - wall.as_secs_f64();
+    if rest > 0.0 {
+        std::time::Duration::from_secs_f64(rest)
+    } else {
+        std::time::Duration::ZERO
+    }
+}
+
+/// Temp, cache and build-output trees that churn all day. Each is mapped as
+/// one opaque total (no rows beneath it), rescanned at most every
+/// `CHURN_EVERY_SECS`. Volume-relative; `*` is one path component; a leading
+/// `**/` matches at any depth.
+pub const CHURN_TREES: &[&str] = &[
+    "private/var/folders/*/*",
+    "private/tmp",
+    "private/var/tmp",
+    "Library/Caches",
+    "Users/*/Library/Caches",
+    "Users/*/.cursor/projects",
+    "**/.next",
+    "**/node_modules/.cache",
+    "**/.git/objects",
+    "**/DerivedData",
+];
+pub const CHURN_EVERY_SECS: i64 = 3600;
+/// A tree that gets at least this many rescans in one replay is bursty: its
+/// rescans wait until it has been quiet for `QUIET_SECS` (or `MAX_HOLD_SECS`).
+pub const BURST_MIN: usize = 256;
+/// Bursty trees are at least this many components deep (never the volume root
+/// or a home folder as a whole).
+pub const BURST_MIN_DEPTH: usize = 3;
+pub const QUIET_SECS: i64 = 600;
+pub const MAX_HOLD_SECS: i64 = 7200;
+
+/// The churn tree `path` lies in (or is), shallowest match first.
+pub fn churn_root(path: &str, extra: &[String]) -> Option<String> {
+    let comps: Vec<&str> = if path.is_empty() { Vec::new() } else { path.split('/').collect() };
+    let mut best: Option<usize> = None;
+    let patterns = CHURN_TREES.iter().copied().chain(extra.iter().map(String::as_str));
+    for pattern in patterns {
+        let (anywhere, pat) = match pattern.strip_prefix("**/") {
+            Some(rest) => (true, rest),
+            None => (false, pattern),
+        };
+        let pc: Vec<&str> = pat.split('/').filter(|c| !c.is_empty()).collect();
+        if pc.is_empty() || pc.len() > comps.len() {
+            continue;
+        }
+        let starts: Vec<usize> = if anywhere { (0..=comps.len() - pc.len()).collect() } else { vec![0] };
+        for i in starts {
+            if pc.iter().zip(&comps[i..]).all(|(p, c)| glob_match(p, c)) {
+                let len = i + pc.len();
+                if best.is_none_or(|b| len < b) {
+                    best = Some(len);
+                }
+                break;
+            }
+        }
+    }
+    best.map(|len| comps[..len].join("/"))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HoldKind {
+    /// A churn tree: one opaque rescan of the root, at most hourly.
+    Churn,
+    /// A bursty tree: its rescans wait until it goes quiet; later rescans
+    /// beneath it join the hold.
+    Burst,
+    /// A whole-subtree rescan (MUST_SCAN_SUBDIRS): repeated ones coalesce and
+    /// run once the tree goes quiet.
+    Deep,
+}
+
+impl HoldKind {
+    pub fn code(&self) -> i64 {
+        match self {
+            HoldKind::Churn => 1,
+            HoldKind::Burst => 0,
+            HoldKind::Deep => 2,
+        }
+    }
+    pub fn from_code(code: i64) -> Self {
+        match code {
+            1 => HoldKind::Churn,
+            2 => HoldKind::Deep,
+            _ => HoldKind::Burst,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScanPlan {
+    /// Queue now.
+    pub now: Vec<ScanReq>,
+    /// (hold root, kind, request) to park until the hold is due.
+    pub held: Vec<(String, HoldKind, ScanReq)>,
+}
+
+/// Route one replay's rescans: churn trees to their root's hourly hold,
+/// anything under an open burst hold into it, whole-subtree rescans into a
+/// deep hold, and a new burst (`BURST_MIN` rescans under one directory at
+/// least `BURST_MIN_DEPTH` deep; the deepest such) into a new burst hold.
+pub fn plan_scans(reqs: &[ScanReq], burst_holds: &[String], extra_churn: &[String]) -> ScanPlan {
+    let mut plan = ScanPlan::default();
+    let mut rest: Vec<ScanReq> = Vec::new();
+    for req in reqs {
+        let path = scan_path(req);
+        if let Some(root) = churn_root(path, extra_churn) {
+            plan.held.push((root.clone(), HoldKind::Churn, ScanReq::Dir(root)));
+        } else if let Some(hold) = burst_holds.iter().find(|h| path == h.as_str() || is_under(path, h)) {
+            plan.held.push((hold.clone(), HoldKind::Burst, req.clone()));
+        } else if let ScanReq::Subtree(p) = req {
+            plan.held.push((p.clone(), HoldKind::Deep, req.clone()));
+        } else {
+            rest.push(req.clone());
+        }
+    }
+    loop {
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for req in &rest {
+            let path = scan_path(req);
+            let mut end = path.len();
+            loop {
+                let anc = &path[..end];
+                if anc.split('/').count() >= BURST_MIN_DEPTH {
+                    *counts.entry(anc).or_default() += 1;
+                }
+                match anc.rfind('/') {
+                    Some(i) => end = i,
+                    None => break,
+                }
+            }
+        }
+        let hot = counts
+            .into_iter()
+            .filter(|(_, n)| *n >= BURST_MIN)
+            .max_by(|a, b| a.0.split('/').count().cmp(&b.0.split('/').count()).then(b.0.cmp(a.0)))
+            .map(|(p, _)| p.to_string());
+        let Some(hot) = hot else { break };
+        let (inside, outside): (Vec<ScanReq>, Vec<ScanReq>) = rest
+            .into_iter()
+            .partition(|r| scan_path(r) == hot || is_under(scan_path(r), &hot));
+        for req in inside {
+            plan.held.push((hot.clone(), HoldKind::Burst, req));
+        }
+        rest = outside;
+    }
+    plan.now = rest;
+    plan.held.dedup();
+    plan
+}
+
+/// Whether a hold is due for release. `root_scanned` is when a churn root was
+/// last scanned (0: never).
+pub fn hold_due(kind: &HoldKind, first_event: i64, last_event: i64, root_scanned: i64, now: i64) -> bool {
+    match kind {
+        HoldKind::Churn => root_scanned <= 0 || now - root_scanned >= CHURN_EVERY_SECS,
+        HoldKind::Burst | HoldKind::Deep => {
+            now - last_event >= QUIET_SECS || now - first_event >= MAX_HOLD_SECS
+        }
     }
 }
 

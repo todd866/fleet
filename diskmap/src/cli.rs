@@ -68,7 +68,8 @@ fn cmd_tick() -> i32 {
 
 fn cmd_walk() -> i32 {
     let roots = Roots::from_env();
-    let lock = match tick::hold_walk_lock(&roots.state.join("walk.lock")) {
+    // One worker per Mac. The walk lock itself is taken per slice.
+    let lock = match tick::hold_walk_lock(&roots.state.join("worker.lock")) {
         Ok(Some(file)) => file,
         Ok(None) => return 0,
         Err(err) => {
@@ -77,9 +78,9 @@ fn cmd_walk() -> i32 {
         }
     };
     crate::darwin::be_gentle();
-    unsafe {
-        libc::setpriority(libc::PRIO_PROCESS, 0, 10);
-    }
+    // Set here, not by the launcher, so no way of starting the worker loses it.
+    let (nice, bg) = crate::darwin::worker_priority();
+    eprintln!("diskmap: worker {} nice {nice} darwin-bg {bg}", std::process::id());
     let result = tick::walk_worker(&roots);
     drop(lock);
     match result {

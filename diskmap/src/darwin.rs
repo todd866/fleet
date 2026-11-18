@@ -156,6 +156,41 @@ pub fn be_gentle() {
     }
 }
 
+/// The walk worker's own priority, set by the worker itself so it holds whoever
+/// launches it (launchd, the tick, a shell): nice 20 and the Darwin background
+/// band (CPU on efficiency cores, throttled disk and network). Returns the
+/// (nice, darwin_bg) values read back.
+pub fn worker_priority() -> (i32, bool) {
+    unsafe {
+        libc::setpriority(libc::PRIO_PROCESS, 0, 20);
+        libc::setpriority(libc::PRIO_DARWIN_PROCESS, 0, libc::PRIO_DARWIN_BG);
+    }
+    read_priority()
+}
+
+pub fn read_priority() -> (i32, bool) {
+    unsafe {
+        *libc::__error() = 0;
+        let nice = libc::getpriority(libc::PRIO_PROCESS, 0);
+        let bg = libc::getpriority(libc::PRIO_DARWIN_PROCESS, 0);
+        (nice, bg > 0)
+    }
+}
+
+/// CPU time used by this process and its reaped children (the focus-guard
+/// checks), user plus system.
+pub fn cpu_time() -> Duration {
+    fn of(who: c_int) -> Duration {
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        if unsafe { libc::getrusage(who, &mut ru) } != 0 {
+            return Duration::ZERO;
+        }
+        let tv = |t: libc::timeval| Duration::from_secs(t.tv_sec as u64) + Duration::from_micros(t.tv_usec as u64);
+        tv(ru.ru_utime) + tv(ru.ru_stime)
+    }
+    of(libc::RUSAGE_SELF) + of(libc::RUSAGE_CHILDREN)
+}
+
 pub fn read_dir_entries(path: &Path) -> Result<Vec<Entry>, String> {
     match read_dir_bulk(path) {
         Ok(entries) => Ok(entries),

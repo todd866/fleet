@@ -53,7 +53,7 @@ pub fn map_volume(
 ) -> Result<MapStats, String> {
     let db = store::open(db_path)?;
     in_txn(&db, || {
-        run_walk(&db, root, now, event_min, |n| {
+        run_walk(&db, root, now, event_min, &[], |n| {
             if n >= budget {
                 Pace::Limit
             } else if yield_now() {
@@ -73,6 +73,22 @@ pub fn walk_one_batch(
     now: i64,
     event_min: i64,
     batch: usize,
+    pause: impl FnMut(usize) -> bool,
+) -> Result<MapStats, String> {
+    walk_slice(root, db_path, now, event_min, batch, BATCH_MAX, &[], pause)
+}
+
+/// One committed slice: at most `batch` directories or `max_wall` of work,
+/// whichever comes first. `churn` adds churn-tree patterns to the defaults.
+#[allow(clippy::too_many_arguments)]
+pub fn walk_slice(
+    root: &Path,
+    db_path: &Path,
+    now: i64,
+    event_min: i64,
+    batch: usize,
+    max_wall: Duration,
+    churn: &[String],
     mut pause: impl FnMut(usize) -> bool,
 ) -> Result<MapStats, String> {
     if pause(0) {
@@ -84,10 +100,10 @@ pub fn walk_one_batch(
     let db = store::open(db_path)?;
     let started = Instant::now();
     in_txn(&db, || {
-        run_walk(&db, root, now, event_min, |n| {
+        run_walk(&db, root, now, event_min, churn, |n| {
             if pause(n) {
                 Pace::Yield
-            } else if n >= batch || (n > 0 && started.elapsed() >= BATCH_MAX) {
+            } else if n >= batch || (n > 0 && started.elapsed() >= max_wall) {
                 Pace::Limit
             } else {
                 Pace::Go
@@ -148,9 +164,10 @@ fn run_walk(
     root: &Path,
     now: i64,
     event_min: i64,
+    churn: &[String],
     mut pace: impl FnMut(usize) -> Pace,
 ) -> Result<MapStats, String> {
-    let baseline = prepare_queue(db, now)?;
+    let baseline = prepare_queue(db, now, churn)?;
     let mut scanned = 0usize;
     let mut yielded = false;
     while store::pending_len(db)? > 0 {
@@ -165,7 +182,7 @@ fn run_walk(
         let Some(item) = store::pending_pop(db)? else {
             break;
         };
-        scan_one(root, db, &item.0, item.1, now, event_min, baseline)?;
+        scan_one(root, db, &item.0, item.1, now, event_min, baseline, churn)?;
         scanned += 1;
     }
     let complete = close_batch(db, baseline)?;
@@ -176,10 +193,13 @@ fn run_walk(
     })
 }
 
-fn prepare_queue(db: &Db, now: i64) -> Result<bool, String> {
+fn prepare_queue(db: &Db, now: i64, churn: &[String]) -> Result<bool, String> {
     import_legacy(db)?;
     store::backfill_partial(db)?;
     let baseline = store::meta_get(db, "baseline")?.as_deref() == Some("1");
+    if baseline {
+        migrate_churn_backlog(db, now, churn)?;
+    }
     if store::pending_len(db)? == 0 && !baseline {
         store::pending_push(db, "", true)?;
         if store::meta_get(db, "walk_started")?.is_none() {
@@ -224,6 +244,7 @@ fn close_batch(db: &Db, was_baseline: bool) -> Result<bool, String> {
     Ok(empty && baseline)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scan_one(
     root: &Path,
     db: &Db,
@@ -232,7 +253,12 @@ fn scan_one(
     now: i64,
     event_min: i64,
     baseline: bool,
+    churn: &[String],
 ) -> Result<(), String> {
+    // A churn tree is one opaque total, measured outside the walk.
+    if let Some(tree) = logic::churn_root(path, churn) {
+        return route_churn(db, &tree, now);
+    }
     let parent = parent_of(path);
     // A replayed event may name a deep directory created since the baseline.
     // Discover its missing parents from the nearest known ancestor first;
@@ -278,7 +304,11 @@ fn scan_one(
         store::ensure_dir(db, &child, path)?;
         let scanned = store::dir(db, &child)?.map(|d| d.scanned_at).unwrap_or(0);
         if deep || scanned == 0 {
-            store::pending_push(db, &child, deep)?;
+            if logic::churn_root(&child, churn).is_some() {
+                route_churn(db, &child, now)?;
+            } else {
+                store::pending_push(db, &child, deep)?;
+            }
         }
     }
     store::note_change(db, baseline, &touched, now, event_min)?;
@@ -419,14 +449,216 @@ pub fn enqueue(db_path: &Path, path: &str, deep: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Queue rescans as they are, with no holds (tests and one-off repairs).
 pub fn apply_scans(db_path: &Path, scans: &[ScanReq]) -> Result<(), String> {
-    for scan in scans {
-        match scan {
-            ScanReq::Dir(path) => enqueue(db_path, path, false)?,
-            ScanReq::Subtree(path) => enqueue(db_path, path, true)?,
+    let db = store::open(db_path)?;
+    import_legacy(&db)?;
+    in_txn(&db, || {
+        for scan in scans {
+            match scan {
+                ScanReq::Dir(path) => store::pending_push(&db, &logic::norm_rel(path), false)?,
+                ScanReq::Subtree(path) => store::pending_push(&db, &logic::norm_rel(path), true)?,
+            }
+        }
+        Ok(())
+    })
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PlanStats {
+    pub queued: usize,
+    pub held: usize,
+    pub released: usize,
+}
+
+/// Fold one replay's rescans through the holds (`logic::plan_scans`) and
+/// release every hold that is due, in one transaction on one connection.
+pub fn apply_plan(db_path: &Path, scans: &[ScanReq], now: i64, churn: &[String]) -> Result<PlanStats, String> {
+    let db = store::open(db_path)?;
+    import_legacy(&db)?;
+    in_txn(&db, || {
+        let bursts: Vec<String> = store::holds(&db)?
+            .into_iter()
+            .filter(|h| logic::HoldKind::from_code(h.1) == logic::HoldKind::Burst)
+            .map(|h| h.0)
+            .collect();
+        let plan = logic::plan_scans(scans, &bursts, churn);
+        let mut stats = PlanStats {
+            queued: plan.now.len(),
+            held: plan.held.len(),
+            released: 0,
+        };
+        for scan in &plan.now {
+            match scan {
+                ScanReq::Dir(path) => store::pending_push(&db, path, false)?,
+                ScanReq::Subtree(path) => store::pending_push(&db, path, true)?,
+            }
+        }
+        for (root, kind, req) in &plan.held {
+            let deep = matches!(req, ScanReq::Subtree(_));
+            store::hold_push(&db, root, kind.code(), logic::scan_path(req), deep, now)?;
+        }
+        stats.released = release_due(&db, now)?;
+        Ok(stats)
+    })
+}
+
+/// Move every due hold's rescans into the queue (a churn tree into the opaque
+/// queue). Returns how many rescans were released.
+fn release_due(db: &Db, now: i64) -> Result<usize, String> {
+    let mut released = 0;
+    for (root, code, first, last) in store::holds(db)? {
+        let kind = logic::HoldKind::from_code(code);
+        let scanned = store::dir(db, &root)?.map(|d| d.scanned_at).unwrap_or(0);
+        if !logic::hold_due(&kind, first, last, scanned, now) {
+            continue;
+        }
+        let rows = store::hold_take(db, &root)?;
+        if kind == logic::HoldKind::Churn {
+            store::opaque_push(db, &root)?;
+            released += 1;
+            continue;
+        }
+        for (path, deep) in rows {
+            store::pending_push(db, &path, deep)?;
+            released += 1;
         }
     }
+    Ok(released)
+}
+
+/// A churn tree wants a rescan: straight to the opaque queue when its hourly
+/// slot is free, otherwise into its hold.
+fn route_churn(db: &Db, tree: &str, now: i64) -> Result<(), String> {
+    let kind = logic::HoldKind::Churn;
+    let scanned = store::dir(db, tree)?.map(|d| d.scanned_at).unwrap_or(0);
+    if logic::hold_due(&kind, now, now, scanned, now) {
+        store::opaque_push(db, tree)
+    } else {
+        store::hold_push(db, tree, kind.code(), tree, false, now)
+    }
+}
+
+const CHURN_MIGRATED_KEY: &str = "churn_v1";
+
+/// Maps made before churn trees were opaque carry queued rescans inside them
+/// (tens of thousands under the per-user temp folder). Collapse each tree's
+/// queue to one request for its root.
+fn migrate_churn_backlog(db: &Db, now: i64, churn: &[String]) -> Result<(), String> {
+    if store::meta_get(db, CHURN_MIGRATED_KEY)?.is_some() {
+        return Ok(());
+    }
+    let mut roots: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (path, _) in store::pending_all(db)? {
+        if let Some(tree) = logic::churn_root(&path, churn) {
+            store::pending_remove(db, &path)?;
+            roots.insert(tree);
+        }
+    }
+    for tree in &roots {
+        route_churn(db, tree, now)?;
+    }
+    store::meta_set(db, CHURN_MIGRATED_KEY, &now.to_string())?;
     Ok(())
+}
+
+pub fn opaque_next(db_path: &Path) -> Result<Option<String>, String> {
+    let db = store::open(db_path)?;
+    store::opaque_next(&db)
+}
+
+pub fn hold_count(db_path: &Path) -> Result<i64, String> {
+    let db = store::open(db_path)?;
+    Ok(store::holds(&db)?.len() as i64)
+}
+
+pub fn opaque_len(db_path: &Path) -> Result<i64, String> {
+    let db = store::open(db_path)?;
+    store::opaque_len(&db)
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OpaqueTotal {
+    pub own_bytes: u64,
+    pub own_dataless: u64,
+    pub files: u64,
+    pub newest: i64,
+    pub dirs: u64,
+}
+
+/// Size of a whole tree without storing a row per directory. Filesystem only:
+/// no database, so it runs outside the walk lock. `rest` is called every 64
+/// directories (the CPU budget). Does not cross mount points or symlinks.
+pub fn opaque_measure(abs: &Path, mut rest: impl FnMut()) -> OpaqueTotal {
+    let mut total = OpaqueTotal::default();
+    let mut stack = vec![abs.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = darwin::read_dir_entries(&dir) else { continue };
+        let refs: Vec<(&str, FileAttr)> = entries.iter().map(|e| (e.name.as_str(), file_attr(e))).collect();
+        let account = logic::account_entries(&refs);
+        total.own_bytes = total.own_bytes.saturating_add(account.own_bytes);
+        total.own_dataless = total.own_dataless.saturating_add(account.own_dataless);
+        total.files += account.files;
+        total.newest = total.newest.max(account.newest);
+        total.dirs += 1;
+        for name in account.subdirs {
+            stack.push(dir.join(name));
+        }
+        if total.dirs % 64 == 0 {
+            rest();
+        }
+    }
+    total
+}
+
+/// Record a churn tree as one row holding its whole size, dropping any rows
+/// beneath it. Ancestors move by the net change only.
+pub fn apply_opaque(db_path: &Path, rel: &str, total: &OpaqueTotal, now: i64, event_min: i64) -> Result<(), String> {
+    let db = store::open(db_path)?;
+    in_txn(&db, || {
+        store::opaque_done(&db, rel)?;
+        let parent = parent_of(rel);
+        if rel.is_empty() || store::dir(&db, &parent)?.is_none() {
+            // Its parent is not mapped yet: map the nearest known ancestor,
+            // which routes this tree here again.
+            let mut ancestor = parent.clone();
+            while !ancestor.is_empty() && store::dir(&db, &ancestor)?.is_none() {
+                ancestor = parent_of(&ancestor);
+            }
+            return store::pending_push(&db, &ancestor, true);
+        }
+        let baseline = store::meta_get(&db, "baseline")?.as_deref() == Some("1");
+        store::ensure_dir(&db, rel, &parent)?;
+        let mut before = Vec::new();
+        let mut cur = rel.to_string();
+        for _ in 0..256 {
+            let Some(row) = store::dir(&db, &cur)? else { break };
+            before.push((cur.clone(), row.total_bytes, row.scanned_at));
+            if cur.is_empty() || row.parent == cur {
+                break;
+            }
+            cur = row.parent;
+        }
+        drop_missing_children(&db, rel, &[])?;
+        apply_own(
+            &db,
+            rel,
+            &parent,
+            total.own_bytes as i64,
+            total.own_dataless as i64,
+            total.files as i64,
+            total.newest,
+            now,
+        )?;
+        let mut touched = Vec::new();
+        for (path, old, scanned) in before {
+            let new = store::dir(&db, &path)?.map(|d| d.total_bytes).unwrap_or(old);
+            touched.push((path, old, new, scanned));
+        }
+        store::note_change(&db, baseline, &touched, now, event_min)?;
+        store::refresh_partial(&db, rel)?;
+        Ok(())
+    })
 }
 
 pub fn parent_of(path: &str) -> String {

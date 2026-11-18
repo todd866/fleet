@@ -244,17 +244,20 @@ fn walk_pauses_for_focus_or_serious_heat() {
     assert!(!pause_walk(false, false, false));
 }
 
-// 14 Nov 2026: the map was five days stale. Rescans queued by FSEvents were
-// drained only on the 60 s tick, 200 directories at a time, and never while the
-// owner was at the Mac, so 246 GB of new build folders were invisible.
-// The owner using the Mac slows the drain; only serious heat stops it.
+// 14 Nov 2026: the map was five days stale because rescans drained only while
+// nobody was at the Mac. 18 Nov 2026: the opposite fault, a drain at full
+// speed for 27 hours. Rescans now always run on a 10% budget, focus or not;
+// only serious heat stops them, and only DISKMAP_FORCE lifts the budget.
 #[test]
-fn rescan_queue_slows_for_focus_and_stops_only_for_heat() {
-    assert_eq!(drain_pace(false, false, false), DrainPace::Full);
-    assert_eq!(drain_pace(true, false, false), DrainPace::Gentle);
-    assert_eq!(drain_pace(true, true, false), DrainPace::Paused);
-    assert_eq!(drain_pace(false, true, false), DrainPace::Paused);
-    assert_eq!(drain_pace(true, true, true), DrainPace::Full);
+fn rescan_queue_keeps_a_budget_and_stops_only_for_heat() {
+    assert_eq!(drain_pace(false, false), DrainPace::Budget(10));
+    assert_eq!(drain_pace(true, false), DrainPace::Paused);
+    assert_eq!(drain_pace(true, true), DrainPace::Full);
+    assert_eq!(drain_pace(false, true), DrainPace::Full);
+    assert_eq!(baseline_pace(false, false, false), DrainPace::Budget(BASELINE_BUDGET_PCT));
+    assert_eq!(baseline_pace(true, false, false), DrainPace::Paused);
+    assert_eq!(baseline_pace(false, true, false), DrainPace::Paused);
+    assert_eq!(baseline_pace(true, true, true), DrainPace::Full);
 }
 
 #[test]

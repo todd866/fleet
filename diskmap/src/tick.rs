@@ -101,13 +101,20 @@ fn log_walker_skip(logged: &mut bool) {
     SKIP_LOGS.with(|logs| logs.borrow_mut().push(msg.to_string()));
 }
 
+/// How long the tick waits for the worker to finish its current slice (a
+/// slice is at most `SLICE_WALL`, so this is ample).
+const TICK_LOCK_WAIT: Duration = Duration::from_secs(5);
+
 pub fn tick(roots: &Roots) -> Result<Summary, String> {
     darwin::be_gentle();
     let now = unix_now();
     let (cfg, host) = load(roots);
     let drives = load_drives(roots, &cfg);
     let mounted = darwin::list_volumes().unwrap_or_default();
-    let walker = walk_lock_held(&roots.state.join("walk.lock"))?;
+    // The worker takes the walk lock one short slice at a time, so the tick
+    // waits for the current slice instead of skipping its writes.
+    let lock = wait_walk_lock(&roots.state.join("walk.lock"), TICK_LOCK_WAIT)?;
+    let walker = lock.is_none();
     let mut logged = false;
     if walker {
         log_walker_skip(&mut logged);
@@ -115,9 +122,6 @@ pub fn tick(roots: &Roots) -> Result<Summary, String> {
         // Replaying FSEvents only queues rescans, so it runs even while the
         // owner is at the Mac; the background worker drains the queue.
         refresh_events(roots, &cfg, &mounted);
-        if let Err(err) = ensure_walk_worker(roots, &mounted) {
-            eprintln!("diskmap: {err}");
-        }
         for vol in &mounted {
             let db_path = db_file(roots, &vol.uuid);
             if let Err(err) = engine::remember_volume(
@@ -152,6 +156,11 @@ pub fn tick(roots: &Roots) -> Result<Summary, String> {
             }
         }
     }
+    drop(lock);
+    // Last, so the worker never races this tick's own writes.
+    if let Err(err) = ensure_walk_worker(roots, &mounted) {
+        eprintln!("diskmap: {err}");
+    }
     Ok(summary)
 }
 
@@ -165,7 +174,7 @@ fn refresh_events(roots: &Roots, cfg: &DiskConfig, mounted: &[Mounted]) {
         if !baseline_done(&db_path) {
             continue;
         }
-        fold_events(vol, &db_path);
+        fold_events(vol, &db_path, &cfg.churn_trees);
         if engine::queue_len(&db_path).unwrap_or(0) == 0 {
             let _ = snapshot_if_due(&db_path, cfg.history_min_bytes);
         }
@@ -174,13 +183,14 @@ fn refresh_events(roots: &Roots, cfg: &DiskConfig, mounted: &[Mounted]) {
 
 /// Replay FSEvents since the stored id into the rescan queue. Cheap: it reads
 /// the event log and queues directories; scanning happens in the worker.
-fn fold_events(vol: &Mounted, db_path: &Path) {
+fn fold_events(vol: &Mounted, db_path: &Path, churn: &[String]) {
     if let Ok((events, max_id, fs_uuid)) =
         darwin::replay_events(&vol.mount, vol.dev, stored_event_id(db_path), Duration::from_millis(250))
     {
         let scans = logic::coalesce(&events);
         // Never advance the replay cursor past events we failed to queue.
-        if engine::apply_scans(db_path, &scans).is_ok() {
+        // Holds are released here too, so this runs even with no new events.
+        if engine::apply_plan(db_path, &scans, unix_now(), churn).is_ok() {
             let _ = remember_fs(db_path, max_id, &fs_uuid);
         }
     }
@@ -218,14 +228,14 @@ pub fn ensure_walk_worker(roots: &Roots, mounted: &[Mounted]) -> Result<(), Stri
         .iter()
         .map(|vol| {
             let db_path = db_file(roots, &vol.uuid);
-            (baseline_done(&db_path), engine::queue_len(&db_path).unwrap_or(0))
+            let queued = engine::queue_len(&db_path).unwrap_or(0) + engine::opaque_len(&db_path).unwrap_or(0);
+            (baseline_done(&db_path), queued)
         })
         .collect();
     if !logic::needs_worker(&volumes) {
         return Ok(());
     }
-    let lock_path = roots.state.join("walk.lock");
-    if walk_lock_held(&lock_path)? {
+    if walk_lock_held(&roots.state.join("worker.lock"))? {
         return Ok(());
     }
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -233,10 +243,23 @@ pub fn ensure_walk_worker(roots: &Roots, mounted: &[Mounted]) -> Result<(), Stri
         .arg("walk")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(worker_log(roots))
         .spawn()
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// The worker's log, `walk.log` in the state folder, kept under 1 MB (one
+/// previous file, `walk.log.1`).
+fn worker_log(roots: &Roots) -> std::process::Stdio {
+    let path = roots.state.join("walk.log");
+    if fs::metadata(&path).map(|m| m.len() > 1_000_000).unwrap_or(false) {
+        let _ = fs::rename(&path, roots.state.join("walk.log.1"));
+    }
+    match OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(file) => file.into(),
+        Err(_) => std::process::Stdio::null(),
+    }
 }
 
 fn walk_lock_held(path: &Path) -> Result<bool, String> {
@@ -246,6 +269,20 @@ fn walk_lock_held(path: &Path) -> Result<bool, String> {
             Ok(false)
         }
         None => Ok(true),
+    }
+}
+
+/// Take the walk lock, waiting up to `wait` for its holder to let go.
+pub fn wait_walk_lock(path: &Path, wait: Duration) -> Result<Option<File>, String> {
+    let started = Instant::now();
+    loop {
+        if let Some(file) = hold_walk_lock(path)? {
+            return Ok(Some(file));
+        }
+        if started.elapsed() >= wait {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -270,56 +307,191 @@ pub fn hold_walk_lock(path: &Path) -> Result<Option<File>, String> {
     Ok(Some(file))
 }
 
+/// Work done under the walk lock in one go; then the lock is let go and the
+/// worker rests to keep its CPU budget.
+const SLICE_DIRS: usize = 400;
+const SLICE_WALL: Duration = Duration::from_millis(400);
+/// The worker exits after this long and the tick starts a fresh one (so a new
+/// binary takes over within the hour).
+const WORKER_LIFETIME: Duration = Duration::from_secs(30 * 60);
+/// How often the heat and focus checks run (focus spawns focus-guard).
+const PACE_CHECK_EVERY: Duration = Duration::from_secs(20);
+/// Accounting window for the CPU budget.
+const BUDGET_WINDOW: Duration = Duration::from_secs(60);
+/// Longest single rest, so the worker still notices heat and exits on time.
+const MAX_REST: Duration = Duration::from_secs(30);
+const LOCK_WAIT: Duration = Duration::from_secs(30);
+const FOLD_EVERY: Duration = Duration::from_secs(30);
+
+/// Keeps the worker within a CPU budget: after each slice it rests long
+/// enough that CPU (its own and its children's) over wall time stays at the
+/// budget, averaged over a window.
+struct Pacer {
+    cpu0: Duration,
+    wall0: Instant,
+    checked: Option<Instant>,
+    thermal: bool,
+    force: bool,
+    focus: Option<bool>,
+}
+
+impl Pacer {
+    fn new() -> Self {
+        Pacer {
+            cpu0: darwin::cpu_time(),
+            wall0: Instant::now(),
+            checked: None,
+            thermal: false,
+            force: false,
+            focus: None,
+        }
+    }
+
+    fn refresh(&mut self, roots: &Roots) {
+        if self.checked.is_some_and(|t| t.elapsed() < PACE_CHECK_EVERY) {
+            return;
+        }
+        self.force = std::env::var("DISKMAP_FORCE").ok().as_deref() == Some("1");
+        self.thermal = latest_analytics_line(roots)
+            .map(|line| darwin::thermal_blocks_walk(&line, unix_now()))
+            .unwrap_or(false);
+        self.focus = None;
+        self.checked = Some(Instant::now());
+    }
+
+    fn drain(&mut self, roots: &Roots) -> logic::DrainPace {
+        self.refresh(roots);
+        logic::drain_pace(self.thermal, self.force)
+    }
+
+    /// Focus is only asked for when a first walk is what is left to do.
+    fn baseline(&mut self, roots: &Roots) -> logic::DrainPace {
+        self.refresh(roots);
+        let focus = *self.focus.get_or_insert_with(darwin::focus_active);
+        logic::baseline_pace(focus, self.thermal, self.force)
+    }
+
+    /// Rest so the window's CPU over wall time stays within `pace`.
+    fn rest(&mut self, pace: logic::DrainPace) {
+        let pct = match pace {
+            logic::DrainPace::Full => return,
+            logic::DrainPace::Paused => {
+                std::thread::sleep(Duration::from_secs(5));
+                return;
+            }
+            logic::DrainPace::Budget(pct) => pct,
+        };
+        let cpu = darwin::cpu_time().saturating_sub(self.cpu0);
+        let wall = self.wall0.elapsed();
+        let rest = logic::budget_sleep(cpu, wall, pct).min(MAX_REST);
+        if !rest.is_zero() {
+            std::thread::sleep(rest);
+        }
+        // Start a new window once the old one is paid for and long enough.
+        if self.wall0.elapsed() >= BUDGET_WINDOW
+            && logic::budget_sleep(darwin::cpu_time().saturating_sub(self.cpu0), self.wall0.elapsed(), pct).is_zero()
+        {
+            self.cpu0 = darwin::cpu_time();
+            self.wall0 = Instant::now();
+        }
+    }
+}
+
+/// `diskmap walk`: the background worker. One per Mac (`worker.lock`, held by
+/// the caller). It takes the walk lock one short slice at a time, so the tick
+/// can always write, and keeps to its CPU budget between slices.
 pub fn walk_worker(roots: &Roots) -> Result<(), String> {
-    let mut checked = Instant::now() - Duration::from_secs(60);
-    let mut folded = Instant::now() - Duration::from_secs(60);
-    let mut paused = false;
-    loop {
-        // Only serious heat stops the whole worker. Owner focus pauses the
-        // initial walk (via `walk_paused`) and slows the rescan drain.
-        if drain_pace_now(roots) == logic::DrainPace::Paused {
-            std::thread::sleep(Duration::from_secs(5));
-            continue;
-        }
+    let born = Instant::now();
+    let mut pacer = Pacer::new();
+    let mut folded: Option<Instant> = None;
+    let lock_path = roots.state.join("walk.lock");
+    let log_every = Duration::from_secs(60);
+    let mut logged = Instant::now();
+    while born.elapsed() < WORKER_LIFETIME {
         let mounted = darwin::list_volumes().unwrap_or_default();
-        let now = unix_now();
         let (cfg, _) = load(roots);
-        let mut remaining = false;
-        let fold_due = folded.elapsed() >= Duration::from_secs(30);
+        let fold_due = folded.is_none_or(|t| t.elapsed() >= FOLD_EVERY);
         if fold_due {
-            folded = Instant::now();
+            folded = Some(Instant::now());
         }
+        let mut remaining = false;
         for vol in &mounted {
             let db_path = db_file(roots, &vol.uuid);
             if baseline_done(&db_path) {
-                // The tick cannot fold events while this worker holds the
-                // walk lock, so the worker does it, then drains the queue.
+                let pace = pacer.drain(roots);
+                if pace == logic::DrainPace::Paused {
+                    remaining = true;
+                    pacer.rest(pace);
+                    continue;
+                }
                 if fold_due {
+                    let Some(_lock) = wait_walk_lock(&lock_path, LOCK_WAIT)? else {
+                        return Ok(());
+                    };
+                    let now = unix_now();
                     // Once per map: drop rows for directories deleted before scans did that.
                     if let Err(err) = engine::prune_missing(&vol.mount, &db_path, now, cfg.event_min_bytes, PRUNE_MIN_BYTES) {
                         eprintln!("diskmap: prune {}: {err}", vol.name);
                     }
-                    fold_events(vol, &db_path);
+                    fold_events(vol, &db_path, &cfg.churn_trees);
                 }
-                if engine::queue_len(&db_path).unwrap_or(0) == 0 {
-                    let _ = snapshot_if_due(&db_path, cfg.history_min_bytes);
+                // Churn trees first: measured with no lock held, then stored.
+                if let Some(tree) = engine::opaque_next(&db_path)? {
+                    remaining = true;
+                    let abs = if tree.is_empty() { vol.mount.clone() } else { vol.mount.join(&tree) };
+                    let total = engine::opaque_measure(&abs, || pacer.rest(pace));
+                    let Some(_lock) = wait_walk_lock(&lock_path, LOCK_WAIT)? else {
+                        return Ok(());
+                    };
+                    engine::apply_opaque(&db_path, &tree, &total, unix_now(), cfg.event_min_bytes)?;
+                    drop(_lock);
+                    pacer.rest(pace);
                     continue;
                 }
-                let pace = drain_pace_now(roots);
-                if pace == logic::DrainPace::Paused {
-                    remaining = true;
-                    std::thread::sleep(Duration::from_secs(5));
+                let queued = engine::queue_len(&db_path).unwrap_or(0);
+                if logged.elapsed() >= log_every && queued > 0 {
+                    eprintln!("diskmap: worker {}: {queued} queued", vol.name);
+                    logged = Instant::now();
+                }
+                if queued == 0 {
+                    // Held rescans are released by the tick's fold, which
+                    // starts a worker again when they reach the queue.
+                    if let Some(_lock) = wait_walk_lock(&lock_path, LOCK_WAIT)? {
+                        let _ = snapshot_if_due(&db_path, cfg.history_min_bytes);
+                    }
                     continue;
                 }
                 remaining = true;
-                let batch = if pace == logic::DrainPace::Gentle { 500 } else { engine::WALK_BATCH };
-                engine::walk_one_batch(&vol.mount, &db_path, now, cfg.event_min_bytes, batch, |_| false)?;
-                if pace == logic::DrainPace::Gentle {
-                    std::thread::sleep(Duration::from_secs(2));
+                {
+                    let Some(_lock) = wait_walk_lock(&lock_path, LOCK_WAIT)? else {
+                        return Ok(());
+                    };
+                    engine::walk_slice(
+                        &vol.mount,
+                        &db_path,
+                        unix_now(),
+                        cfg.event_min_bytes,
+                        SLICE_DIRS,
+                        SLICE_WALL,
+                        &cfg.churn_trees,
+                        |_| false,
+                    )?;
                 }
+                pacer.rest(pace);
                 continue;
             }
             remaining = true;
+            let pace = pacer.baseline(roots);
+            if pace == logic::DrainPace::Paused {
+                pacer.rest(pace);
+                break;
+            }
+            let Some(_lock) = wait_walk_lock(&lock_path, LOCK_WAIT)? else {
+                // Another holder (an older worker that keeps the lock for its
+                // whole life): leave; the tick tries again in a minute.
+                return Ok(());
+            };
+            let now = unix_now();
             let _ = engine::remember_volume(
                 &db_path,
                 &vol.uuid,
@@ -329,46 +501,24 @@ pub fn walk_worker(roots: &Roots) -> Result<(), String> {
                 vol.free_bytes,
                 now,
             );
-            let stats = engine::walk_one_batch(
+            engine::walk_slice(
                 &vol.mount,
                 &db_path,
                 now,
                 cfg.event_min_bytes,
-                engine::WALK_BATCH,
-                |_| {
-                    if checked.elapsed() >= Duration::from_secs(5) {
-                        paused = walk_paused(roots);
-                        checked = Instant::now();
-                    }
-                    paused
-                },
+                SLICE_DIRS,
+                SLICE_WALL,
+                &cfg.churn_trees,
+                |_| false,
             )?;
-            if stats.yielded {
-                std::thread::sleep(Duration::from_secs(5));
-                break;
-            }
+            drop(_lock);
+            pacer.rest(pace);
         }
         if !remaining {
             return Ok(());
         }
     }
-}
-
-fn drain_pace_now(roots: &Roots) -> logic::DrainPace {
-    let force = std::env::var("DISKMAP_FORCE").ok().as_deref() == Some("1");
-    let thermal = latest_analytics_line(roots)
-        .map(|line| darwin::thermal_blocks_walk(&line, unix_now()))
-        .unwrap_or(false);
-    logic::drain_pace(darwin::focus_active(), thermal, force)
-}
-
-fn walk_paused(roots: &Roots) -> bool {
-    let force = std::env::var("DISKMAP_FORCE").ok().as_deref() == Some("1");
-    let now = unix_now();
-    let thermal = latest_analytics_line(roots)
-        .map(|line| darwin::thermal_blocks_walk(&line, now))
-        .unwrap_or(false);
-    logic::pause_walk(darwin::focus_active(), thermal, force)
+    Ok(())
 }
 
 fn stored_event_id(db_path: &Path) -> u64 {

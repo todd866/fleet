@@ -89,7 +89,117 @@ pub fn open(path: &Path) -> Result<Db, String> {
     if !column_exists(&db, "snap_bytes")? {
         db.exec("ALTER TABLE dirs ADD COLUMN snap_bytes INTEGER")?;
     }
+    // `child_unfinished` runs for every ancestor of every scanned directory.
+    // Through `dirs_parent` alone it reads every child of a wide parent (47k
+    // under one image folder): about 30 ms CPU per scan. This index holds only
+    // the unfinished rows, so the check is one lookup.
+    db.exec(
+        "CREATE INDEX IF NOT EXISTS dirs_unfinished ON dirs(parent) WHERE scanned_at = 0 OR partial != 0;
+        CREATE TABLE IF NOT EXISTS hold (
+            root TEXT PRIMARY KEY,
+            kind INTEGER NOT NULL,
+            first_event INTEGER NOT NULL,
+            last_event INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS deferred (
+            path TEXT PRIMARY KEY,
+            deep INTEGER NOT NULL,
+            root TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS deferred_root ON deferred(root);
+        CREATE TABLE IF NOT EXISTS opaque (
+            path TEXT PRIMARY KEY
+        );",
+    )?;
     Ok(db)
+}
+
+/// Park a rescan under a hold, opening the hold or extending it to `now`.
+pub fn hold_push(db: &Db, root: &str, kind: i64, path: &str, deep: bool, now: i64) -> Result<(), String> {
+    let stmt = db.prepare(
+        "INSERT INTO hold(root, kind, first_event, last_event) VALUES(?1, ?2, ?3, ?3)
+         ON CONFLICT(root) DO UPDATE SET last_event = MAX(hold.last_event, excluded.last_event)",
+    )?;
+    stmt.bind_text(1, root)?;
+    stmt.bind_i64(2, kind)?;
+    stmt.bind_i64(3, now)?;
+    stmt.step()?;
+    let stmt = db.prepare(
+        "INSERT INTO deferred(path, deep, root) VALUES(?1, ?2, ?3)
+         ON CONFLICT(path) DO UPDATE SET deep = MAX(deferred.deep, excluded.deep)",
+    )?;
+    stmt.bind_text(1, path)?;
+    stmt.bind_i64(2, i64::from(deep))?;
+    stmt.bind_text(3, root)?;
+    stmt.step()?;
+    Ok(())
+}
+
+/// Open holds: (root, kind, first_event, last_event).
+pub fn holds(db: &Db) -> Result<Vec<(String, i64, i64, i64)>, String> {
+    let stmt = db.prepare("SELECT root, kind, first_event, last_event FROM hold ORDER BY root")?;
+    let mut out = Vec::new();
+    while stmt.step()? {
+        out.push((stmt.text(0), stmt.i64(1), stmt.i64(2), stmt.i64(3)));
+    }
+    Ok(out)
+}
+
+/// Close a hold and return its parked rescans (path, deep).
+pub fn hold_take(db: &Db, root: &str) -> Result<Vec<(String, bool)>, String> {
+    let stmt = db.prepare("SELECT path, deep FROM deferred WHERE root = ?1")?;
+    stmt.bind_text(1, root)?;
+    let mut out = Vec::new();
+    while stmt.step()? {
+        out.push((stmt.text(0), stmt.i64(1) != 0));
+    }
+    for sql in ["DELETE FROM deferred WHERE root = ?1", "DELETE FROM hold WHERE root = ?1"] {
+        let stmt = db.prepare(sql)?;
+        stmt.bind_text(1, root)?;
+        stmt.step()?;
+    }
+    Ok(out)
+}
+
+pub fn opaque_push(db: &Db, path: &str) -> Result<(), String> {
+    let stmt = db.prepare("INSERT INTO opaque(path) VALUES(?1) ON CONFLICT(path) DO NOTHING")?;
+    stmt.bind_text(1, path)?;
+    stmt.step()?;
+    Ok(())
+}
+
+pub fn opaque_next(db: &Db) -> Result<Option<String>, String> {
+    let stmt = db.prepare("SELECT path FROM opaque ORDER BY path LIMIT 1")?;
+    Ok(if stmt.step()? { Some(stmt.text(0)) } else { None })
+}
+
+pub fn opaque_done(db: &Db, path: &str) -> Result<(), String> {
+    let stmt = db.prepare("DELETE FROM opaque WHERE path = ?1")?;
+    stmt.bind_text(1, path)?;
+    stmt.step()?;
+    Ok(())
+}
+
+pub fn opaque_len(db: &Db) -> Result<i64, String> {
+    let stmt = db.prepare("SELECT COUNT(*) FROM opaque")?;
+    stmt.step()?;
+    Ok(stmt.i64(0))
+}
+
+pub fn pending_all(db: &Db) -> Result<Vec<(String, bool)>, String> {
+    let stmt = db.prepare("SELECT path, deep FROM pending")?;
+    let mut out = Vec::new();
+    while stmt.step()? {
+        out.push((stmt.text(0), stmt.i64(1) != 0));
+    }
+    Ok(out)
+}
+
+pub fn pending_remove(db: &Db, path: &str) -> Result<(), String> {
+    let stmt = db.prepare("DELETE FROM pending WHERE path = ?1")?;
+    stmt.bind_text(1, path)?;
+    stmt.step()?;
+    Ok(())
 }
 
 fn column_exists(db: &Db, name: &str) -> Result<bool, String> {

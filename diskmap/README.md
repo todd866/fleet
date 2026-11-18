@@ -38,9 +38,13 @@ Column heads are the only labels. `1h`/`24h`/`7d` are the change in free space (
 `diskmap tick` (launchd, every minute):
 
 1. Drops to background QoS and `IOPOL_THROTTLE`, and turns off materialising dataless iCloud files, so a scan cannot download a placeholder.
-2. If the initial walk is not finished, `tick` starts `diskmap walk` when `walk.lock` is free. That process holds the lock, stays at background QoS and `IOPOL_THROTTLE`, and keeps walking with `getattrlistbulk` until the volume is mapped. It commits about 10,000 directories at a time, so `top` and the summary see growing totals. It pauses while `focus-guard active` exits 0 or the newest `machine-log` line (under 3 minutes old) has `thermal` of `serious` or `critical`, then resumes. The cursor is the pending table in the volume database, so sleep and restart continue from the last commit. A target for an idle, cool Mac is a full map of a ~2 TB / ~5M-file volume within 2 hours.
+2. When a volume is unmapped or has queued rescans, `tick` (as its last step) starts `diskmap walk` unless `worker.lock` is held. The worker sets its own priority (nice 20, `PRIO_DARWIN_BG`, background QoS, `IOPOL_THROTTLE`), so it stays in the background however it is started. It works in slices of at most 400 directories or 0.4 s, each a committed transaction under `walk.lock`, then lets the lock go and rests to keep a CPU budget: its own and its children's CPU over wall time, averaged over a minute. Rescans after the baseline get 10% of one core, focus or not; the first walk of a volume gets 25% and stops while `focus-guard active` exits 0. Either stops when the newest `machine-log` line (under 3 minutes old) has `thermal` of `serious` or `critical`. `DISKMAP_FORCE=1` lifts the budget. Focus and heat are checked every 20 s. The worker exits when nothing is queued, or after 30 minutes (the next tick starts a fresh one). The cursor is the pending table in the volume database, so sleep and restart continue from the last commit.
 3. `tick` itself no longer slices the initial walk. If `focus-guard active` exits 0, or the newest `machine-log` line is thermally hot (`thermal` not `nominal`, or `chipC` above 60), the FSEvents pass waits. The summary is still refreshed from what is already mapped.
-4. After the first full walk, FSEvents since the saved event id (device UUID from `FSEventsCopyUUIDForDevice`, so the cursor survives sleep and moving a drive) are coalesced. `MustScanSubDirs` rescans that subtree only. A size change of at least 50 MB is an `events` row. Totals are summed up to the volume root as directories complete; a directory that still has an unscanned descendant is a partial lower bound (`≥ 12 GB (walking)` in `top`).
+4. After the first full walk, FSEvents since the saved event id (device UUID from `FSEventsCopyUUIDForDevice`, so the cursor survives sleep and moving a drive) are coalesced, then routed:
+   - **Churn trees** (temp, cache and build output: `private/var/folders/*/*`, `private/tmp`, `private/var/tmp`, `Library/Caches`, `Users/*/Library/Caches`, `Users/*/.cursor/projects`, and at any depth `.next`, `node_modules/.cache`, `.git/objects`, `DerivedData`, plus `churn_trees` in the config) are one opaque row holding the whole tree's size, with no rows beneath it. The worker measures it with no lock held and rescans it at most hourly.
+   - **Bursty trees**: 256 or more rescans in one replay under one directory at least three levels deep (the deepest such) are held until that tree has been quiet for 10 minutes, or at most 2 hours. Later rescans inside it join the hold. Then each named directory is rescanned once.
+   - **`MustScanSubDirs`** subtree rescans are held the same way, so repeated ones run once.
+   - Everything else is queued at once. A size change of at least 50 MB is an `events` row. Totals are summed up to the volume root as directories complete; a directory that still has an unscanned descendant is a partial lower bound (`≥ 12 GB (walking)` in `top`).
 5. Once a day, after the initial walk has finished, directories of at least 100 MB are written to `history`. A partial map is not stored as that day's history.
 6. iCloud Drive, Desktop & Documents, and the Photos library are summarised as local bytes versus dataless bytes. Photos splits originals (`originals/` or `Masters/`) from derivatives. IDrive is read from its local logs under `~/Library/Application Support/IDriveforMac` (last success, selected paths). No login and no network call.
 7. Alerts: free space from `machine-log` falling more than 15 GB/h across 30 minutes, or under the host floor. A notification names the top grower and the rate, at most once an hour per cause. The same record is appended to `alerts.jsonl` and copied into `summary.json` for fleet-health.
@@ -68,13 +72,16 @@ Volumes in one APFS container (the registry flag `shared_container`) are one phy
   "hot_days": 30,
   "alert_gb_per_hour": 15,
   "alert_sustain_secs": 1800,
-  "alert_cooldown_secs": 3600
+  "alert_cooldown_secs": 3600,
+  "churn_trees": []
 }
 ```
 
 `hosts` keys are `LocalHostName` (`scutil --get LocalHostName`). A name that is not listed uses that name as its id and has no free-space floor (the rate alert still applies). `peers` are SSH host aliases, the same ones as `~/.ssh/config`. Empty means this Mac only.
 
 `drives_json` defaults to `~/.config/fleet/drives.json` when that file exists.
+
+`churn_trees` adds volume-relative patterns to the built-in churn trees (`*` is one path component; a leading `**/` matches at any depth), for example `"Users/*/Downloads/torrents"`.
 
 ## State
 
@@ -87,7 +94,9 @@ All under `~/.local/state/diskmap/` unless `DISKMAP_STATE` is set.
 | `where.json` | Directories of at least 100 MB, for `diskmap where` and `coverage.py`. |
 | `alerts.jsonl` | One JSON alert per line. |
 | `spool/` | Events and history waiting while the archive volume is unplugged. |
-| `walk.lock` | Held by the initial-walk worker. A dead worker releases it; the next tick starts another. |
+| `worker.lock` | Held by the walk worker for its life: one per Mac. A dead worker releases it; the next tick starts another. |
+| `walk.lock` | Held for one database slice at a time (the worker's, or the tick's writes; the tick waits up to 5 s for it). |
+| `walk.log` | The worker's log: its priority at start and the queue length each minute. Kept under 1 MB. |
 | `peers/<host>.json` | Last summary fetched from a peer. |
 | `peers/<host>.where.json` | Last `where` rows fetched from a peer: `generated` (newest row, measured there), `fetched` (copied here), `matches`. Replaced only by a good answer. |
 
