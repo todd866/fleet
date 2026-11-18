@@ -423,6 +423,7 @@ fn without_full_disk_access_gated_trees_are_not_opened_and_keep_their_size() {
         "Users/someone/Library/Mobile Documents/com~apple~CloudDocs",
         "Users/someone/Library/Caches/com.apple.TV",
         "Users/someone/.Trash",
+        "Users/someone/Library/CloudStorage/OneDrive-Example",
     ] {
         assert!(consent_root(gated_rel).is_some(), "{gated_rel}");
     }

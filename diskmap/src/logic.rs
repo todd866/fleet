@@ -1188,6 +1188,8 @@ pub const CONSENT_TREES: &[&str] = &[
     "Users/*/Library/Group Containers",
     "Users/*/Library/Daemon Containers",
     "Users/*/Library/Mobile Documents",
+    // File Provider domains (OneDrive, Google Drive, Dropbox).
+    "Users/*/Library/CloudStorage",
     "Users/*/Library/Caches/com.apple.TV",
     "Users/*/Library/Caches/com.apple.Music",
     "Users/*/Library/Caches/com.apple.Safari",

@@ -263,8 +263,12 @@ pub fn prune_now(roots: &Roots) -> Result<Vec<(String, usize)>, String> {
     };
     let (cfg, _) = load(roots);
     let now = unix_now();
+    // Same gate as the walker: a run from a shell must not look inside a
+    // privacy-gated tree either when diskmap itself lacks access.
+    let access = access::current(&roots.state, now);
+    access::apply(&roots.state, &access);
     let mut out = Vec::new();
-    for vol in darwin::list_volumes().unwrap_or_default() {
+    for vol in walkable(&darwin::list_volumes().unwrap_or_default(), access.full_disk) {
         let db_path = db_file(roots, &vol.uuid);
         if !baseline_done(&db_path) {
             continue;
