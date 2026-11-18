@@ -719,6 +719,10 @@ fn access_summary(roots: &Roots, mounted: &[Mounted], access: &access::AccessSta
     if !access.full_disk {
         let learned = access::load_learned(&roots.state);
         for vol in mounted {
+            if vol.name == "Recovery" {
+                // The boot disk's recovery system: nothing of the owner's.
+                continue;
+            }
             if !is_boot(vol) {
                 unmeasured.push(summary::Unmeasured {
                     path: vol.mount.to_string_lossy().into_owned(),
@@ -734,8 +738,10 @@ fn access_summary(roots: &Roots, mounted: &[Mounted], access: &access::AccessSta
                     if logic::consent_root(&rel).is_some() || rows.iter().any(|(p, _)| rel.starts_with(&format!("{p}/"))) {
                         continue;
                     }
-                    let bytes = store::dir(&db, &rel).ok().flatten().map(|r| r.total_bytes).unwrap_or(0);
-                    rows.push((rel, bytes));
+                    // Only folders the map holds a size for: refusals inside a
+                    // churn tree (system temp folders) are part of its total.
+                    let Some(row) = store::dir(&db, &rel).ok().flatten() else { continue };
+                    rows.push((rel, row.total_bytes));
                 }
             }
             rows.sort();
