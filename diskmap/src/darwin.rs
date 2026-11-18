@@ -209,8 +209,9 @@ pub fn set_skip(paths: Vec<PathBuf>) {
     }
 }
 
+/// A stuck folder covers everything beneath it.
 pub fn skipped(path: &Path) -> bool {
-    SKIP.lock().map(|g| g.iter().any(|p| p == path)).unwrap_or(false)
+    SKIP.lock().map(|g| g.iter().any(|p| path.starts_with(p))).unwrap_or(false)
 }
 
 pub fn read_dir_entries(path: &Path) -> Result<Vec<Entry>, String> {

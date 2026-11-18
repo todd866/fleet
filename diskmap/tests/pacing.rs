@@ -8,6 +8,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// The skip list is process-wide; tests that set it take turns.
+static SKIP_LIST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn scratch(name: &str) -> PathBuf {
     let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
     let path = std::env::temp_dir().join(format!("diskmap-{name}-{n}-{}", std::process::id()));
@@ -303,6 +306,7 @@ fn the_unfinished_child_check_uses_the_partial_index() {
 /// rather than dropping to zero.
 #[test]
 fn a_directory_that_blocked_a_worker_is_skipped_and_keeps_its_size() {
+    let _turn = SKIP_LIST.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = scratch("skip");
     let root = tmp.join("tree");
     let db = tmp.join("state/vol.db");
@@ -321,5 +325,51 @@ fn a_directory_that_blocked_a_worker_is_skipped_and_keeps_its_size() {
     set_skip(Vec::new());
     assert_eq!(queue_len(&db).unwrap(), 0);
     assert_eq!(dir(&open_db(&db).unwrap(), "held").unwrap().unwrap().total_bytes, before);
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+/// The Photos library blocks every open from a binary without a grant; the
+/// walker never opens it, and a folder recorded as stuck covers its subtree.
+#[test]
+fn protected_trees_are_never_opened_and_stuck_folders_cover_their_subtree() {
+    let _turn = SKIP_LIST.lock().unwrap_or_else(|e| e.into_inner());
+    assert_eq!(
+        protected_root("Users/someone/Pictures/Photos Library.photoslibrary/resources/derivatives/C").as_deref(),
+        Some("Users/someone/Pictures/Photos Library.photoslibrary")
+    );
+    assert_eq!(protected_root("Users/someone/Pictures/holiday"), None);
+    let tmp = scratch("subtree-skip");
+    fs::create_dir_all(tmp.join("a/b/c")).unwrap();
+    set_skip(vec![tmp.join("a")]);
+    assert!(skipped(&tmp.join("a/b/c")));
+    assert!(!skipped(&tmp.join("ab")));
+    assert!(read_dir_entries(&tmp.join("a/b")).is_err());
+    set_skip(Vec::new());
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+/// A churn tree whose root cannot be read keeps its recorded size instead of
+/// dropping to zero.
+#[test]
+fn an_unreadable_churn_root_keeps_its_size() {
+    let _turn = SKIP_LIST.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = scratch("opaque-skip");
+    let root = tmp.join("tree");
+    let db = tmp.join("state/vol.db");
+    let objects = root.join("app/.git/objects/aa");
+    fs::create_dir_all(&objects).unwrap();
+    fs::write(objects.join("o"), vec![1u8; 8192]).unwrap();
+    let t = 1_700_000_000;
+    baseline(&root, &db, t);
+    let first = opaque_measure(&root.join("app/.git/objects"), || {});
+    apply_opaque(&db, "app/.git/objects", &first, t + 1, 0).unwrap();
+    let size = dir(&open_db(&db).unwrap(), "app/.git/objects").unwrap().unwrap().total_bytes;
+    assert!(size >= 8192);
+    set_skip(vec![root.join("app/.git/objects")]);
+    let blocked = opaque_measure(&root.join("app/.git/objects"), || {});
+    set_skip(Vec::new());
+    assert_eq!(blocked.dirs, 0);
+    apply_opaque(&db, "app/.git/objects", &blocked, t + 2, 0).unwrap();
+    assert_eq!(dir(&open_db(&db).unwrap(), "app/.git/objects").unwrap().unwrap().total_bytes, size);
     let _ = fs::remove_dir_all(&tmp);
 }

@@ -1135,9 +1135,23 @@ pub const MAX_HOLD_SECS: i64 = 7200;
 
 /// The churn tree `path` lies in (or is), shallowest match first.
 pub fn churn_root(path: &str, extra: &[String]) -> Option<String> {
+    tree_root(path, CHURN_TREES.iter().copied().chain(extra.iter().map(String::as_str)))
+}
+
+/// Folders macOS guards per app (Photos): a launchd-started binary without
+/// a grant blocks in open(2) on every folder inside (18 Nov 2026). The walker
+/// never opens them; their rows keep their last sizes. Same pattern syntax as
+/// `CHURN_TREES`.
+pub const PROTECTED_TREES: &[&str] = &["**/*.photoslibrary"];
+
+pub fn protected_root(path: &str) -> Option<String> {
+    tree_root(path, PROTECTED_TREES.iter().copied())
+}
+
+/// The shallowest prefix of `path` that a pattern matches.
+fn tree_root<'a>(path: &str, patterns: impl Iterator<Item = &'a str>) -> Option<String> {
     let comps: Vec<&str> = if path.is_empty() { Vec::new() } else { path.split('/').collect() };
     let mut best: Option<usize> = None;
-    let patterns = CHURN_TREES.iter().copied().chain(extra.iter().map(String::as_str));
     for pattern in patterns {
         let (anywhere, pat) = match pattern.strip_prefix("**/") {
             Some(rest) => (true, rest),

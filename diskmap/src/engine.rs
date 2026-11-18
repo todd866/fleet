@@ -272,7 +272,7 @@ fn scan_one(
         return Ok(());
     }
     let abs = abs_path(root, path);
-    if darwin::skipped(&abs) {
+    if darwin::skipped(&abs) || logic::protected_root(path).is_some() {
         // It blocked a worker before: keep what the map has for it.
         return Ok(());
     }
@@ -615,7 +615,10 @@ impl OpaqueWalk {
     pub fn step(&mut self, max_wall: Duration) -> bool {
         let started = Instant::now();
         while let Some(dir) = self.stack.pop() {
-            if let Ok(entries) = darwin::read_dir_entries(&dir) {
+            let Ok(entries) = darwin::read_dir_entries(&dir) else {
+                continue;
+            };
+            {
                 let refs: Vec<(&str, FileAttr)> = entries.iter().map(|e| (e.name.as_str(), file_attr(e))).collect();
                 let account = logic::account_entries(&refs);
                 let total = &mut self.total;
@@ -665,6 +668,10 @@ pub fn apply_opaque(db_path: &Path, rel: &str, total: &OpaqueTotal, now: i64, ev
     let db = store::open(db_path)?;
     in_txn(&db, || {
         store::opaque_done(&db, rel)?;
+        if total.dirs == 0 {
+            // The root itself could not be read (skipped): keep the old size.
+            return Ok(());
+        }
         let parent = parent_of(rel);
         if rel.is_empty() || store::dir(&db, &parent)?.is_none() {
             // Its parent is not mapped yet: map the nearest known ancestor,

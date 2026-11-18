@@ -24,7 +24,7 @@ pub use logic::{
     account_entries, archive_allowed, coalesce, collapse_grew, confirm_success, default_config,
     floor_breach, gate_alerts, glob_match, grew_status_line, group_drives, load_config, map_percent,
     parse_backup_summary, parse_drives, parse_local_mdy, parse_log_records, parse_since, pause_walk,
-    drain_pace, needs_worker, DrainPace, baseline_pace, budget_sleep, churn_root, hold_due, plan_scans, HoldKind,
+    drain_pace, needs_worker, DrainPace, baseline_pace, budget_sleep, churn_root, hold_due, plan_scans, protected_root, HoldKind,
     ScanPlan, BASELINE_BUDGET_PCT, BURST_MIN, BURST_MIN_DEPTH, CHURN_EVERY_SECS, CHURN_TREES, DRAIN_BUDGET_PCT,
     MAX_HOLD_SECS, QUIET_SECS,
     photos_kind, plist_path_strings, resolve_host, samples_from_jsonl, split_bytes, sustained_drop,
