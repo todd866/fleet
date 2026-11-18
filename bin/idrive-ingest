@@ -402,6 +402,12 @@ def tick(cfg, dry=False):
             run(cfg, ["docker", "rm", "-f", NAME], timeout=120)
             rc, _o, err = run(cfg, args, timeout=300)
             actions.append("recreated container" if rc == 0 else f"container create failed: {err.strip()[-300:]}")
+            if rc != 0 and "Conflict" in err:
+                # The old container could not be removed: after the 18 Nov 2026 reboot the VM's share of a slow
+                # USB drive hung, the container stuck in "Created", and every tick failed this way for 6 hours.
+                # No backup is running here, so stop the VM; the next tick starts it fresh and recreates.
+                run(cfg, ["limactl", "stop", "-f", cfg["vm"]], timeout=300)
+                actions.append("stopped VM to clear a stuck container")
             is_running, have_spec = container(cfg)
             if rc == 0:
                 mounted = [s["name"] for s in active]
