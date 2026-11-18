@@ -1148,6 +1148,20 @@ pub fn protected_root(path: &str) -> Option<String> {
     tree_root(path, PROTECTED_TREES.iter().copied())
 }
 
+/// What to record when `dir` blocked a worker: the folder itself, or its
+/// parent once a sibling has blocked too (a privacy-protected area such as
+/// Desktop then costs two stalls, not one per child). Never above a folder
+/// three components deep, so a home folder is not skipped as a whole.
+pub fn stuck_entry(dir: &std::path::Path, known: &[std::path::PathBuf]) -> std::path::PathBuf {
+    let Some(parent) = dir.parent() else { return dir.to_path_buf() };
+    let sibling = known.iter().any(|k| k.parent() == Some(parent) && k != dir);
+    if sibling && parent.components().count() > 6 {
+        parent.to_path_buf()
+    } else {
+        dir.to_path_buf()
+    }
+}
+
 /// The shallowest prefix of `path` that a pattern matches.
 fn tree_root<'a>(path: &str, patterns: impl Iterator<Item = &'a str>) -> Option<String> {
     let comps: Vec<&str> = if path.is_empty() { Vec::new() } else { path.split('/').collect() };

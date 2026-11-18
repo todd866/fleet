@@ -608,9 +608,20 @@ fn start_watchdog(roots: &Roots) {
         if held < STUCK_AFTER {
             continue;
         }
-        eprintln!("diskmap: stuck {}s reading {}; skipping it for a week", held.as_secs(), dir.display());
+        let known: Vec<PathBuf> = fs::read_to_string(&path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.split_once('\t').map(|(_, p)| PathBuf::from(p)))
+            .collect();
+        let skip = logic::stuck_entry(&dir, &known);
+        eprintln!(
+            "diskmap: stuck {}s reading {}; skipping {} for a week",
+            held.as_secs(),
+            dir.display(),
+            skip.display()
+        );
         if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
-            let _ = writeln!(file, "{}\t{}", unix_now(), dir.display());
+            let _ = writeln!(file, "{}\t{}", unix_now(), skip.display());
         }
         std::process::exit(3);
     });

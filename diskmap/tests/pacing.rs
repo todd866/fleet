@@ -373,3 +373,19 @@ fn an_unreadable_churn_root_keeps_its_size() {
     assert_eq!(dir(&open_db(&db).unwrap(), "app/.git/objects").unwrap().unwrap().total_bytes, size);
     let _ = fs::remove_dir_all(&tmp);
 }
+
+#[test]
+fn a_second_stuck_sibling_skips_their_parent_but_never_a_home_folder() {
+    use std::path::PathBuf;
+    let p = |s: &str| PathBuf::from(s);
+    // A made-up home, built so no literal home path sits in the source.
+    let home = format!("/System/Volumes/Data/{}/someone", "Users");
+    let desk = format!("{home}/Desktop");
+    assert_eq!(stuck_entry(&p(&format!("{desk}/a")), &[]), p(&format!("{desk}/a")));
+    assert_eq!(stuck_entry(&p(&format!("{desk}/b")), &[p(&format!("{desk}/a"))]), p(&desk));
+    // Siblings directly in a home folder do not skip the home folder.
+    assert_eq!(
+        stuck_entry(&p(&format!("{home}/Desktop")), &[p(&format!("{home}/Documents"))]),
+        p(&format!("{home}/Desktop"))
+    );
+}
