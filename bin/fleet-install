@@ -244,7 +244,8 @@ def cmd_install(a, cfg) -> int:
         return 3
     if not a.no_build:
         # Always built here: a remote build would ask the certificate to vouch for a worker's output.
-        cmd = ["cargo", "build", "--release", "--locked"] + [x for p in pkgs for x in ("-p", p)]
+        cargo = shutil.which("cargo") or str(Path.home() / ".cargo/bin/cargo")
+        cmd = [cargo, "build", "--release", "--locked"] + [x for p in pkgs for x in ("-p", p)]
         slot = shutil.which("heavy-slot")
         if slot:
             cmd = [slot, "--"] + cmd
