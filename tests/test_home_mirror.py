@@ -105,12 +105,24 @@ class HubAttach(unittest.TestCase):
                 mounted.append(True)
             out = b"secret\n" if args[0] == "/bin/zsh" else b""
             return SimpleNamespace(returncode=0, stdout=out, stderr=b"")
-        rc = M.hub_attach(self.cfg, run=run, ismount=lambda p: bool(mounted), exists=lambda p: False)
+        rc = M.hub_attach(self.cfg, run=run, ismount=lambda p: bool(mounted), exists=lambda p: False, stdin=b"")
         self.assertEqual(rc, 0)
         create, attach = calls[1], calls[2]
         self.assertIn("AES-256", create[0])
         self.assertEqual((create[1], attach[1]), (b"secret", b"secret"))
         self.assertTrue(all("secret" not in " ".join(args) for args, _ in calls))
+
+    def test_a_piped_password_wins_and_password_cmd_is_not_run(self):
+        calls, mounted = [], []
+        def run(args, **kw):
+            calls.append((args, kw.get("input")))
+            if args[:2] == ["/usr/bin/hdiutil", "attach"]:
+                mounted.append(True)
+            return SimpleNamespace(returncode=0, stdout=b"wrong\n", stderr=b"")
+        rc = M.hub_attach(self.cfg, run=run, ismount=lambda p: bool(mounted), exists=lambda p: True, stdin=b"piped\n")
+        self.assertEqual(rc, 0)
+        self.assertEqual([a[0] for a, _ in calls], ["/usr/bin/hdiutil"])
+        self.assertEqual(calls[0][1], b"piped")
 
 
 class Skips(unittest.TestCase):

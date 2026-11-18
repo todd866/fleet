@@ -318,9 +318,17 @@ def run_once(cfg, force=False, dry=False):
             mounted = False
     if cfg.get("hub_prepare") and not mounted:
         # E.g. attach the encrypted image the copy lives in (`home-mirror hub-attach` on the hub).
+        # hub_password_service: this Mac's keychain item for the image password, piped to hub-attach on stdin
+        # (newline stripped; never printed or written). Without it the hub falls back to its own password_cmd.
+        secret = b""
+        if cfg.get("hub_password_service"):
+            got = subprocess.run(["/usr/bin/security", "find-generic-password", "-s", cfg["hub_password_service"], "-w"],
+                                 capture_output=True, timeout=60)
+            secret = got.stdout.rstrip(b"\n") if got.returncode == 0 else b""
         try:
             done = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", cfg["hub"],
-                                   cfg["hub_prepare"]], capture_output=True, text=True, timeout=900)
+                                   cfg["hub_prepare"]], input=secret, capture_output=True, timeout=900)
+            done.stdout, done.stderr = done.stdout.decode(errors="replace"), done.stderr.decode(errors="replace")
             ok, why = done.returncode == 0, (done.stdout + done.stderr).strip()[-200:]
         except (OSError, subprocess.SubprocessError) as exc:
             ok, why = False, str(exc)
@@ -392,14 +400,20 @@ def run_once(cfg, force=False, dry=False):
     return status
 
 
-def hub_attach(path=None, run=subprocess.run, ismount=os.path.ismount, exists=os.path.exists):
-    """On the hub: make sure the encrypted image is attached. Exit 0 when its volume is mounted."""
+def hub_attach(path=None, run=subprocess.run, ismount=os.path.ismount, exists=os.path.exists, stdin=None):
+    """On the hub: make sure the encrypted image is attached. Exit 0 when its volume is mounted.
+    The password comes from stdin when the caller pipes one (a laptop sends its own keychain's value: the hub's
+    keychain is locked to ssh sessions), else from password_cmd."""
     cfg = json.loads(pathlib.Path(path or HOME / ".config/fleet/home-mirror-hub.json").read_text())
     mount = os.path.join(cfg.get("volumes_root", "/Volumes"), cfg["volname"])
     if ismount(mount):
         return 0
-    password = run(["/bin/zsh", "-c", cfg["password_cmd"]], capture_output=True, timeout=60).stdout or b""
-    password = password.rstrip(b"\n")
+    if stdin is None:
+        stdin = b"" if sys.stdin is None or sys.stdin.isatty() else sys.stdin.buffer.read()
+    password = stdin.rstrip(b"\n")
+    if not password:
+        password = run(["/bin/zsh", "-c", cfg["password_cmd"]], capture_output=True, timeout=60).stdout or b""
+        password = password.rstrip(b"\n")
     if not password:
         print("hub-attach: no password from password_cmd", file=sys.stderr)
         return 1
