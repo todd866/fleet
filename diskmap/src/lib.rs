@@ -14,10 +14,10 @@ mod summary;
 mod tick;
 
 pub use archive::{ship, spool_clear, spool_merge, spool_take, Manifest};
-pub use darwin::{cpu_time, read_dir_entries, read_priority, thermal_blocks_walk, worker_priority, Entry};
+pub use darwin::{cpu_time, read_dir_entries, read_priority, set_skip, skipped, thermal_blocks_walk, worker_priority, Entry};
 pub use engine::{
     apply_opaque, apply_plan, apply_scans, enqueue, growth_against_snapshot, growth_since, hold_count, map_progress,
-    map_volume, opaque_len, opaque_measure, opaque_next, prune_missing, queue_len, remember_volume, scanned_dirs,
+    map_volume, migrate_churn, opaque_len, opaque_measure, opaque_next, OpaqueWalk, prune_missing, queue_len, remember_volume, scanned_dirs,
     walk_one_batch, walk_slice, MapProgress, MapStats, OpaqueTotal, PlanStats, WALK_BATCH,
 };
 pub use logic::{

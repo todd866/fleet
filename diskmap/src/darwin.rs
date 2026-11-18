@@ -191,7 +191,43 @@ pub fn cpu_time() -> Duration {
     of(libc::RUSAGE_SELF) + of(libc::RUSAGE_CHILDREN)
 }
 
+/// The directory being read right now and since when, for the walk worker's
+/// watchdog: a launchd-started worker blocked in open(2) on one directory for
+/// good (18 Nov 2026) and nothing else could move it.
+static READING: std::sync::Mutex<Option<(Instant, PathBuf)>> = std::sync::Mutex::new(None);
+/// Directories that blocked a worker before; never opened again.
+static SKIP: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+pub fn reading_now() -> Option<(Duration, PathBuf)> {
+    let guard = READING.lock().ok()?;
+    guard.as_ref().map(|(t, p)| (t.elapsed(), p.clone()))
+}
+
+pub fn set_skip(paths: Vec<PathBuf>) {
+    if let Ok(mut guard) = SKIP.lock() {
+        *guard = paths;
+    }
+}
+
+pub fn skipped(path: &Path) -> bool {
+    SKIP.lock().map(|g| g.iter().any(|p| p == path)).unwrap_or(false)
+}
+
 pub fn read_dir_entries(path: &Path) -> Result<Vec<Entry>, String> {
+    if skipped(path) {
+        return Err(format!("{}: skipped, it blocked a worker before", path.display()));
+    }
+    if let Ok(mut guard) = READING.lock() {
+        *guard = Some((Instant::now(), path.to_path_buf()));
+    }
+    let out = read_dir_unwatched(path);
+    if let Ok(mut guard) = READING.lock() {
+        *guard = None;
+    }
+    out
+}
+
+fn read_dir_unwatched(path: &Path) -> Result<Vec<Entry>, String> {
     match read_dir_bulk(path) {
         Ok(entries) => Ok(entries),
         Err(err) => read_dir_std(path).map_err(|fallback| format!("{err}; {fallback}")),

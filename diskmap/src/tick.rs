@@ -105,6 +105,30 @@ fn log_walker_skip(logged: &mut bool) {
 /// slice is at most `SLICE_WALL`, so this is ample).
 const TICK_LOCK_WAIT: Duration = Duration::from_secs(5);
 
+/// What the tick is doing, for its deadline message.
+static STAGE: std::sync::Mutex<&'static str> = std::sync::Mutex::new("start");
+
+fn stage(name: &'static str) {
+    if let Ok(mut s) = STAGE.lock() {
+        *s = name;
+    }
+}
+
+/// A tick that has not finished after this long is stuck (18 Nov 2026: one sat
+/// 24 minutes in open(2) on the archive drive, holding `walk.lock`, and
+/// launchd never starts a second tick while one runs). The summary is written
+/// before the archive ship, so ending the tick loses nothing but that ship.
+const TICK_DEADLINE: Duration = Duration::from_secs(150);
+
+pub fn start_tick_deadline() {
+    std::thread::spawn(|| {
+        std::thread::sleep(TICK_DEADLINE);
+        let at = STAGE.lock().map(|s| *s).unwrap_or("?");
+        eprintln!("diskmap: tick still running after {}s (stuck in {at}); exiting", TICK_DEADLINE.as_secs());
+        std::process::exit(3);
+    });
+}
+
 pub fn tick(roots: &Roots) -> Result<Summary, String> {
     darwin::be_gentle();
     let now = unix_now();
@@ -121,7 +145,9 @@ pub fn tick(roots: &Roots) -> Result<Summary, String> {
     } else {
         // Replaying FSEvents only queues rescans, so it runs even while the
         // owner is at the Mac; the background worker drains the queue.
+        stage("fsevents");
         refresh_events(roots, &cfg, &mounted);
+        stage("volumes");
         for vol in &mounted {
             let db_path = db_file(roots, &vol.uuid);
             if let Err(err) = engine::remember_volume(
@@ -141,6 +167,7 @@ pub fn tick(roots: &Roots) -> Result<Summary, String> {
             }
         }
     }
+    stage("summary");
     let summary = build_summary(roots, &cfg, &host, &drives, &mounted, now)?;
     fs::create_dir_all(&roots.state).map_err(|e| e.to_string())?;
     fs::write(roots.state.join("summary.json"), summary::to_json(&summary)).map_err(|e| e.to_string())?;
@@ -148,6 +175,7 @@ pub fn tick(roots: &Roots) -> Result<Summary, String> {
     let where_text = serde_json::to_string_pretty(&where_file).map_err(|e| e.to_string())? + "\n";
     fs::write(roots.state.join("where.json"), where_text).map_err(|e| e.to_string())?;
     if !walker {
+        stage("archive ship");
         if let Err(err) = ship_archive(roots, &cfg, &drives, &host, &mounted) {
             if crate::sqlite::is_locked(&err) {
                 log_walker_skip(&mut logged);
@@ -157,6 +185,7 @@ pub fn tick(roots: &Roots) -> Result<Summary, String> {
         }
     }
     drop(lock);
+    stage("start worker");
     // Last, so the worker never races this tick's own writes.
     if let Err(err) = ensure_walk_worker(roots, &mounted) {
         eprintln!("diskmap: {err}");
@@ -403,6 +432,22 @@ impl Pacer {
 pub fn walk_worker(roots: &Roots) -> Result<(), String> {
     let born = Instant::now();
     let mut pacer = Pacer::new();
+    darwin::set_skip(load_stuck(roots, unix_now()));
+    start_watchdog(roots);
+    let mut opaque: std::collections::HashMap<String, engine::OpaqueWalk> = std::collections::HashMap::new();
+    {
+        // Collapse any churn backlog first, before the first slice or measure.
+        let (cfg, _) = load(roots);
+        let Some(_lock) = wait_walk_lock(&roots.state.join("walk.lock"), LOCK_WAIT)? else {
+            return Ok(());
+        };
+        for vol in darwin::list_volumes().unwrap_or_default() {
+            let db_path = db_file(roots, &vol.uuid);
+            if baseline_done(&db_path) {
+                engine::migrate_churn(&db_path, unix_now(), &cfg.churn_trees)?;
+            }
+        }
+    }
     let mut folded: Option<Instant> = None;
     let lock_path = roots.state.join("walk.lock");
     let log_every = Duration::from_secs(60);
@@ -435,18 +480,24 @@ pub fn walk_worker(roots: &Roots) -> Result<(), String> {
                     }
                     fold_events(vol, &db_path, &cfg.churn_trees);
                 }
-                // Churn trees first: measured with no lock held, then stored.
-                if let Some(tree) = engine::opaque_next(&db_path)? {
+                // A churn tree is measured one slice at a time with no lock
+                // held, alternating with slices of the queue, so one big tree
+                // never holds the queue up.
+                if !opaque.contains_key(&vol.uuid)
+                    && let Some(tree) = engine::opaque_next(&db_path)?
+                {
+                    opaque.insert(vol.uuid.clone(), engine::OpaqueWalk::new(&vol.mount, &tree));
+                }
+                if let Some(walk) = opaque.get_mut(&vol.uuid) {
                     remaining = true;
-                    let abs = if tree.is_empty() { vol.mount.clone() } else { vol.mount.join(&tree) };
-                    let total = engine::opaque_measure(&abs, || pacer.rest(pace));
-                    let Some(_lock) = wait_walk_lock(&lock_path, LOCK_WAIT)? else {
-                        return Ok(());
-                    };
-                    engine::apply_opaque(&db_path, &tree, &total, unix_now(), cfg.event_min_bytes)?;
-                    drop(_lock);
+                    if walk.step(SLICE_WALL) {
+                        let walk = opaque.remove(&vol.uuid).expect("present");
+                        let Some(_lock) = wait_walk_lock(&lock_path, LOCK_WAIT)? else {
+                            return Ok(());
+                        };
+                        engine::apply_opaque(&db_path, &walk.rel, &walk.total, unix_now(), cfg.event_min_bytes)?;
+                    }
                     pacer.rest(pace);
-                    continue;
                 }
                 let queued = engine::queue_len(&db_path).unwrap_or(0);
                 if logged.elapsed() >= log_every && queued > 0 {
@@ -519,6 +570,50 @@ pub fn walk_worker(roots: &Roots) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// A read that has not returned after this long is stuck for good (a
+/// directory read takes milliseconds; a launchd process opening a privacy-
+/// protected folder its binary has no grant for waits indefinitely).
+const STUCK_AFTER: Duration = Duration::from_secs(30);
+/// A stuck directory is skipped for this long, then tried again.
+const STUCK_SKIP_SECS: i64 = 7 * 86400;
+
+fn stuck_path(roots: &Roots) -> PathBuf {
+    roots.state.join("stuck.tsv")
+}
+
+/// Directories that blocked a worker within `STUCK_SKIP_SECS`
+/// (`stuck.tsv`: unix time, tab, absolute path).
+fn load_stuck(roots: &Roots, now: i64) -> Vec<PathBuf> {
+    let Ok(text) = fs::read_to_string(stuck_path(roots)) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| line.split_once('\t'))
+        .filter(|(t, _)| t.parse::<i64>().is_ok_and(|t| now - t < STUCK_SKIP_SECS))
+        .map(|(_, p)| PathBuf::from(p))
+        .collect()
+}
+
+/// A blocked open(2) cannot be interrupted, and a worker blocked in one holds
+/// `worker.lock` so no other starts. The watchdog records the directory in
+/// `stuck.tsv`, says so in `walk.log`, and ends the process; the next tick
+/// starts a worker that skips it.
+fn start_watchdog(roots: &Roots) {
+    let path = stuck_path(roots);
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(5));
+        let Some((held, dir)) = darwin::reading_now() else { continue };
+        if held < STUCK_AFTER {
+            continue;
+        }
+        eprintln!("diskmap: stuck {}s reading {}; skipping it for a week", held.as_secs(), dir.display());
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = writeln!(file, "{}\t{}", unix_now(), dir.display());
+        }
+        std::process::exit(3);
+    });
 }
 
 fn stored_event_id(db_path: &Path) -> u64 {

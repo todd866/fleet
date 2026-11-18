@@ -56,6 +56,7 @@ fn usage() -> &'static str {
 }
 
 fn cmd_tick() -> i32 {
+    tick::start_tick_deadline();
     let roots = Roots::from_env();
     match tick::tick(&roots) {
         Ok(_) => 0,

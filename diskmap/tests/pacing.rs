@@ -294,3 +294,29 @@ fn the_unfinished_child_check_uses_the_partial_index() {
     assert!(plan.contains("dirs_unfinished"), "{plan}");
     let _ = fs::remove_dir_all(&tmp);
 }
+
+/// A directory that blocked a worker (a privacy-protected folder opened by a
+/// launchd process) is never opened again, and its row keeps its last size
+/// rather than dropping to zero.
+#[test]
+fn a_directory_that_blocked_a_worker_is_skipped_and_keeps_its_size() {
+    let tmp = scratch("skip");
+    let root = tmp.join("tree");
+    let db = tmp.join("state/vol.db");
+    fs::create_dir_all(root.join("held")).unwrap();
+    fs::write(root.join("held/f"), vec![9u8; 8192]).unwrap();
+    let t = 1_700_000_000;
+    baseline(&root, &db, t);
+    let before = dir(&open_db(&db).unwrap(), "held").unwrap().unwrap().total_bytes;
+    assert!(before >= 8192);
+    set_skip(vec![root.join("held")]);
+    assert!(skipped(&root.join("held")));
+    assert!(read_dir_entries(&root.join("held")).is_err());
+    fs::write(root.join("held/g"), vec![9u8; 8192]).unwrap();
+    enqueue(&db, "held", false).unwrap();
+    walk_one_batch(&root, &db, t + 10, 0, 10, |_| false).unwrap();
+    set_skip(Vec::new());
+    assert_eq!(queue_len(&db).unwrap(), 0);
+    assert_eq!(dir(&open_db(&db).unwrap(), "held").unwrap().unwrap().total_bytes, before);
+    let _ = fs::remove_dir_all(&tmp);
+}

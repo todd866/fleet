@@ -272,6 +272,10 @@ fn scan_one(
         return Ok(());
     }
     let abs = abs_path(root, path);
+    if darwin::skipped(&abs) {
+        // It blocked a worker before: keep what the map has for it.
+        return Ok(());
+    }
     let entries = match darwin::read_dir_entries(&abs) {
         Ok(v) => v,
         Err(_) => {
@@ -586,29 +590,72 @@ pub struct OpaqueTotal {
     pub dirs: u64,
 }
 
-/// Size of a whole tree without storing a row per directory. Filesystem only:
-/// no database, so it runs outside the walk lock. `rest` is called every 64
-/// directories (the CPU budget). Does not cross mount points or symlinks.
-pub fn opaque_measure(abs: &Path, mut rest: impl FnMut()) -> OpaqueTotal {
-    let mut total = OpaqueTotal::default();
-    let mut stack = vec![abs.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = darwin::read_dir_entries(&dir) else { continue };
-        let refs: Vec<(&str, FileAttr)> = entries.iter().map(|e| (e.name.as_str(), file_attr(e))).collect();
-        let account = logic::account_entries(&refs);
-        total.own_bytes = total.own_bytes.saturating_add(account.own_bytes);
-        total.own_dataless = total.own_dataless.saturating_add(account.own_dataless);
-        total.files += account.files;
-        total.newest = total.newest.max(account.newest);
-        total.dirs += 1;
-        for name in account.subdirs {
-            stack.push(dir.join(name));
-        }
-        if total.dirs % 64 == 0 {
-            rest();
+/// Size of a whole tree without storing a row per directory, measured a
+/// slice at a time so the worker can interleave it with queued rescans.
+/// Filesystem only: no database, so it runs outside the walk lock. Does not
+/// cross mount points or symlinks.
+#[derive(Clone, Debug)]
+pub struct OpaqueWalk {
+    pub rel: String,
+    stack: Vec<PathBuf>,
+    pub total: OpaqueTotal,
+}
+
+impl OpaqueWalk {
+    pub fn new(mount: &Path, rel: &str) -> Self {
+        OpaqueWalk {
+            rel: rel.to_string(),
+            stack: vec![abs_path(mount, rel)],
+            total: OpaqueTotal::default(),
         }
     }
-    total
+
+    /// Read directories for up to `max_wall`. True once the whole tree is read.
+    pub fn step(&mut self, max_wall: Duration) -> bool {
+        let started = Instant::now();
+        while let Some(dir) = self.stack.pop() {
+            if let Ok(entries) = darwin::read_dir_entries(&dir) {
+                let refs: Vec<(&str, FileAttr)> = entries.iter().map(|e| (e.name.as_str(), file_attr(e))).collect();
+                let account = logic::account_entries(&refs);
+                let total = &mut self.total;
+                total.own_bytes = total.own_bytes.saturating_add(account.own_bytes);
+                total.own_dataless = total.own_dataless.saturating_add(account.own_dataless);
+                total.files += account.files;
+                total.newest = total.newest.max(account.newest);
+                for name in account.subdirs {
+                    self.stack.push(dir.join(name));
+                }
+            }
+            self.total.dirs += 1;
+            if started.elapsed() >= max_wall {
+                break;
+            }
+        }
+        self.stack.is_empty()
+    }
+}
+
+/// Measure a whole tree in one go; `rest` runs between 50 ms steps.
+pub fn opaque_measure(abs: &Path, mut rest: impl FnMut()) -> OpaqueTotal {
+    let mut walk = OpaqueWalk {
+        rel: String::new(),
+        stack: vec![abs.to_path_buf()],
+        total: OpaqueTotal::default(),
+    };
+    while !walk.step(Duration::from_millis(50)) {
+        rest();
+    }
+    walk.total
+}
+
+/// Run the one-off churn backlog collapse now (the worker does this at start,
+/// before any churn tree is measured).
+pub fn migrate_churn(db_path: &Path, now: i64, churn: &[String]) -> Result<(), String> {
+    let db = store::open(db_path)?;
+    if store::meta_get(&db, "baseline")?.as_deref() != Some("1") {
+        return Ok(());
+    }
+    in_txn(&db, || migrate_churn_backlog(&db, now, churn))
 }
 
 /// Record a churn tree as one row holding its whole size, dropping any rows
