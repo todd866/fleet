@@ -174,21 +174,21 @@ pub fn tick(roots: &Roots) -> Result<Summary, String> {
     let where_file = build_where(roots, &host, &summary, now)?;
     let where_text = serde_json::to_string_pretty(&where_file).map_err(|e| e.to_string())? + "\n";
     fs::write(roots.state.join("where.json"), where_text).map_err(|e| e.to_string())?;
-    if !walker {
-        stage("archive ship");
-        if let Err(err) = ship_archive(roots, &cfg, &drives, &host, &mounted) {
-            if crate::sqlite::is_locked(&err) {
-                log_walker_skip(&mut logged);
-            } else {
-                return Err(err);
-            }
-        }
-    }
     drop(lock);
     stage("start worker");
-    // Last, so the worker never races this tick's own writes.
+    // After this tick's own map writes, so the worker never races them.
     if let Err(err) = ensure_walk_worker(roots, &mounted) {
         eprintln!("diskmap: {err}");
+    }
+    // Last, and outside the walk lock: the archive drive can block open(2)
+    // for minutes (the tick deadline ends that), and nothing else waits on it.
+    stage("archive ship");
+    if let Err(err) = ship_archive(roots, &cfg, &drives, &host, &mounted) {
+        if crate::sqlite::is_locked(&err) {
+            log_walker_skip(&mut logged);
+        } else {
+            return Err(err);
+        }
     }
     Ok(summary)
 }
@@ -1046,6 +1046,11 @@ fn ship_archive(roots: &Roots, cfg: &DiskConfig, drives: &[DriveDef], host: &Res
                 hist.extend(history);
                 let manifest = archive::ship(&dest, &host.id, &uuid, &ev, &hist)?;
                 archive::spool_clear(&spool, &host.id, &uuid)?;
+                // Shipping is idempotent (events keyed by id), so if the
+                // worker holds the map now, the next tick records it.
+                let Some(_lock) = wait_walk_lock(&roots.state.join("walk.lock"), TICK_LOCK_WAIT)? else {
+                    continue;
+                };
                 let db = store::open(&path)?;
                 store::meta_set(&db, "shipped_event_id", &manifest.events_through_id.to_string())?;
                 let days = serde_json::to_string(&manifest.history_days).unwrap_or_else(|_| "[]".into());

@@ -1113,8 +1113,13 @@ pub const CHURN_TREES: &[&str] = &[
     "Library/Caches",
     "Users/*/Library/Caches",
     "Users/*/.cursor/projects",
+    "Users/*/.Trash",
+    "Users/*/.npm",
     "**/.next",
-    "**/node_modules/.cache",
+    // Dependency trees: agent worktrees each bring tens of thousands of
+    // folders (18 Nov 2026); their size matters, their layout does not.
+    "**/node_modules",
+    "**/_cacache",
     "**/.git/objects",
     "**/DerivedData",
 ];

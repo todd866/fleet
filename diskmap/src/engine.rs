@@ -543,7 +543,8 @@ fn route_churn(db: &Db, tree: &str, now: i64) -> Result<(), String> {
     }
 }
 
-const CHURN_MIGRATED_KEY: &str = "churn_v1";
+/// Bumped whenever `CHURN_TREES` grows, so queued rescans inside new trees collapse too.
+const CHURN_MIGRATED_KEY: &str = "churn_v2";
 
 /// Maps made before churn trees were opaque carry queued rescans inside them
 /// (tens of thousands under the per-user temp folder). Collapse each tree's
