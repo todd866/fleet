@@ -252,6 +252,7 @@ def _backups(name, host, config, now):
         rows.append(_idrive_ingest(name, host["idrive_ingest"], cfg, now))
     if host.get("offload_queue") is not None:
         rows.append(_offload_queue(name, host["offload_queue"], now))
+        rows.extend(_offload_autopilot(name, host["offload_queue"].get("autopilot"), now))
     if host.get("home_mirror") is not None:
         rows.append(_home_mirror(name, host["home_mirror"], cfg, now))
     if "drive_mirror_epoch" in host:
@@ -1238,7 +1239,44 @@ def _offload_queue(name, status, now):
     return _row(f"backup:{name}:offload", level, "backup", f"{name} offload",
                 "stale" if stale else f"{ready:.1f} GB review",
                 f"{waiting:.1f} GB waiting" + (f"; {len(blocked)} blocked" if blocked else ""),
-                detail + "; no automatic deletion; final checks required before removal")
+                detail + "; queued items move to the Bin after the offload tool's final checks; nothing is deleted")
+
+
+def _offload_autopilot(name, pilot, now):
+    """Two rows: the cold-data pipeline (free, queued, waiting on IDrive, ready) and the Bin of verified offloads."""
+    if not isinstance(pilot, dict):
+        return []
+    gb = lambda key, d=pilot: float(d.get(key) or 0) / 1e9
+    if pilot.get("error") and "free_bytes" not in pilot:
+        return [_row(f"storage:{name}:cold", "warn", "disk", f"{name} cold data", "unread", "autopilot",
+                     str(pilot["error"]))]
+    flow = pilot.get("pipeline") or {}
+    age = now - int(pilot.get("checked_at") or 0)
+    stale = age > 3 * 3600 or age < -120
+    free, target = gb("free_bytes"), gb("target_bytes")
+    picks = pilot.get("picks") or []
+    in_flight = sum(float(flow.get(k) or 0) for k in ("queued", "waiting", "ready")) / 1e9
+    short = gb("shortfall_bytes")
+    level = "warn" if stale or pilot.get("error") or (short > 0 and not picks) or flow.get("blocked") else "pass"
+    nxt = "; ".join(f'{p["path"]} {float(p["bytes"]) / 1e9:.1f} GB {p.get("class", "?")}' for p in picks[:10])
+    detail = (f"target {target:.0f} GB empty; counting the Bin and items in flight {gb('effective_free_bytes'):.0f} GB; "
+              f"short {short:.0f} GB; cold and eligible {gb('cold_bytes'):.1f} GB; "
+              + (f"next pick: {nxt}" if nxt else "nothing to pick") + "."
+              + (" No eligible cold data covers the shortfall: widen the scan or decide on warm data." if short > 0 and not picks else "")
+              + (f" Blocked {float(flow.get('blocked') or 0) / 1e9:.1f} GB." if flow.get("blocked") else "")
+              + (f" {pilot['error']}." if pilot.get("error") else ""))
+    rows = [_row(f"storage:{name}:cold", level, "disk", f"{name} cold data",
+                 "stale" if stale else f"{free:.0f} GB free",
+                 f"queued {float(flow.get('queued') or 0) / 1e9:.0f} · IDrive {float(flow.get('waiting') or 0) / 1e9:.0f} · ready {float(flow.get('ready') or 0) / 1e9:.0f} GB",
+                 detail)]
+    bin_ = pilot.get("bin") or {}
+    held = (float(bin_.get("confirmed_bytes") or 0) + float(bin_.get("named_bytes") or 0)) / 1e9
+    rows.append(_row(f"storage:{name}:bin", "warn" if held >= 1 else "pass", "disk", f"{name} Bin",
+                     f"{held:.0f} GB offloads", "run empty-bin --verified-offloads" if held >= 1 else "nothing to free",
+                     f"The Bin holds {held:.1f} GB of verified offloads ({bin_.get('items', 0)} items). Space returns only when "
+                     "the Bin is emptied, and agents never empty it. `empty-bin --verified-offloads` proves each item "
+                     "against its verified manifest and deletes only those; everything else stays in the Bin."))
+    return rows
 
 
 def _ai_usage(summary, now):

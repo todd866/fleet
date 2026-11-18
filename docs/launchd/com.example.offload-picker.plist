@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Daily at 18:30Z through utc-daily (--retry: an unreachable laptop is tried again at the next tick).
+	     Runs the laptop's cold-data picker over the existing SSH launcher: below the 500 GB free target it queues the
+	     coldest eligible items through the offload tool (at most daily_gb a day). fleet storage/offload/autopilot.py. -->
+	<key>Label</key>
+	<string>com.example.offload-picker</string>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>LowPriorityIO</key>
+	<true/>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/zsh</string>
+		<string>REPLACE_HOME/.local/bin/utc-daily</string>
+		<string>--label</string>
+		<string>com.example.offload-picker</string>
+		<string>--at</string>
+		<string>18:30</string>
+		<string>--retry</string>
+		<string>--</string>
+		<string>/usr/bin/ssh</string>
+		<string>-o</string>
+		<string>BatchMode=yes</string>
+		<string>-o</string>
+		<string>ConnectTimeout=20</string>
+		<string>-o</string>
+		<string>ServerAliveInterval=30</string>
+		<string>laptop</string>
+		<string>/usr/bin/python3 REPLACE_HOME/Projects/fleet/storage/offload/autopilot.py pick --apply</string>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>StandardErrorPath</key>
+	<string>REPLACE_HOME/.local/state/fleet/offload-autopilot/picker.err</string>
+	<key>StandardOutPath</key>
+	<string>REPLACE_HOME/.local/state/fleet/offload-autopilot/picker.log</string>
+	<key>StartInterval</key>
+	<integer>300</integer>
+</dict>
+</plist>
