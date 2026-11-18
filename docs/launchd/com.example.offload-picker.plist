@@ -2,7 +2,7 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<!-- Daily at 18:30Z through utc-daily (--retry: an unreachable laptop is tried again at the next tick).
+	<!-- Daily at 18:30Z through utc-daily with its retry option (an unreachable laptop is tried again at the next tick).
 	     Runs the laptop's cold-data picker over the existing SSH launcher: below the 500 GB free target it queues the
 	     coldest eligible items through the offload tool (at most daily_gb a day). fleet storage/offload/autopilot.py. -->
 	<key>Label</key>
