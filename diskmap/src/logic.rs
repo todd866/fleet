@@ -41,6 +41,8 @@ pub struct DiskConfig {
     /// Extra temp, cache or churn trees (volume-relative patterns, see
     /// `churn_root`), mapped as one opaque total instead of row by row.
     pub churn_trees: Vec<String>,
+    /// Replaces `PROTECTED_TREES` when present.
+    pub protected_trees: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -86,6 +88,7 @@ pub fn default_config() -> DiskConfig {
         alert_cooldown_secs: ALERT_COOLDOWN_SECS,
         drives_json: None,
         churn_trees: Vec::new(),
+        protected_trees: None,
     }
 }
 
@@ -103,6 +106,7 @@ struct ConfigFile {
     alert_cooldown_secs: Option<i64>,
     drives_json: Option<String>,
     churn_trees: Option<Vec<String>>,
+    protected_trees: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -158,6 +162,9 @@ pub fn load_config(text: Option<&str>) -> Result<DiskConfig, String> {
     }
     if let Some(v) = parsed.drives_json.filter(|s| !s.is_empty()) {
         cfg.drives_json = Some(v);
+    }
+    if let Some(v) = parsed.protected_trees {
+        cfg.protected_trees = Some(v.into_iter().map(|p| norm_rel(&p)).filter(|p| !p.is_empty()).collect());
     }
     if let Some(v) = parsed.churn_trees {
         cfg.churn_trees = v.into_iter().map(|p| norm_rel(&p)).filter(|p| !p.is_empty()).collect();
@@ -1144,8 +1151,22 @@ pub fn churn_root(path: &str, extra: &[String]) -> Option<String> {
 /// `CHURN_TREES`.
 pub const PROTECTED_TREES: &[&str] = &["**/*.photoslibrary"];
 
+/// `protected_trees` from the config, when set (an empty list opens them all
+/// again, once the binary has its privacy grant back).
+static PROTECTED: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
+
+pub fn set_protected(trees: Option<Vec<String>>) {
+    if let Ok(mut g) = PROTECTED.lock() {
+        *g = trees;
+    }
+}
+
 pub fn protected_root(path: &str) -> Option<String> {
-    tree_root(path, PROTECTED_TREES.iter().copied())
+    let configured = PROTECTED.lock().ok().and_then(|g| g.clone());
+    match configured {
+        Some(list) => tree_root(path, list.iter().map(String::as_str)),
+        None => tree_root(path, PROTECTED_TREES.iter().copied()),
+    }
 }
 
 /// What to record when `dir` blocked a worker: the folder itself, or its

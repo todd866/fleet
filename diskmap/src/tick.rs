@@ -438,6 +438,7 @@ pub fn walk_worker(roots: &Roots) -> Result<(), String> {
     {
         // Collapse any churn backlog first, before the first slice or measure.
         let (cfg, _) = load(roots);
+        logic::set_protected(cfg.protected_trees.clone());
         let Some(_lock) = wait_walk_lock(&roots.state.join("walk.lock"), LOCK_WAIT)? else {
             return Ok(());
         };
