@@ -1,0 +1,12 @@
+[package]
+name = "fleet-run"
+version = "0.1.1"
+edition.workspace = true
+license.workspace = true
+description = "Run a command under one stable, signed identity so macOS privacy grants stick"
+
+[dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+libc = "0.2"

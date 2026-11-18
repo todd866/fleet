@@ -1,0 +1,371 @@
+#!/usr/bin/env python3
+"""fleet-install: build, sign and install this workspace's binaries so macOS privacy grants stick.
+
+  fleet-install [--remote] [--host H] [--no-build] TOOL...   build (cargo --release), sign, install
+  fleet-install resign TOOL...      sign the copy already in the install folder (no rebuild)
+  fleet-install check               exit 1 if any installed fleet binary lacks the stable signature
+  fleet-install dr TOOL...          print each installed binary's designated requirement
+  fleet-install tcc [--mark]        Full Disk Access state of every fleet binary (system TCC.db);
+                                    --mark switches tcc-run to fleet-run once fleet-run holds it
+  fleet-install tools               list the workspace's binaries
+
+Why: macOS privacy controls (TCC) remember a command-line binary by its designated requirement
+(DR). An ad-hoc signature's DR is the code hash, so every rebuild is a stranger and loses its
+grants; a launchd job that opens a protected folder then hangs or is refused. Signed with one
+certificate and a fixed identifier, the DR is the same for every build, and a grant made once
+survives rebuilds. The install folder is synced to the other Macs, and the signature travels
+inside the file, so the Macs without the certificate get signed copies too.
+
+Rules this tool keeps:
+- It refuses to install an unsigned (ad-hoc) build into the install folder; that copy would sync
+  to every Mac and drop their grants. Build on a Mac without the certificate with
+  `--remote` from the Mac that has it, or pass --allow-adhoc for a deliberate exception.
+- It never signs the installed file in place (running copies would be killed): it signs a copy
+  outside the synced folder and renames it over the old one.
+
+Site values (~/.config/fleet/site.json, all optional):
+  "codesign_prefix":   identifier prefix; each tool is signed as PREFIX.TOOL
+  "codesign_identity": the identity to sign with; default: the first "Developer ID Application"
+  "install_dir":       default ~/.local/bin
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+from fleet import site  # noqa: E402
+
+DEFAULT_PREFIX = "org.example.fleet"
+TCC_DB = Path("/Library/Application Support/com.apple.TCC/TCC.db")
+FLEET_RUN_MARKER = Path.home() / ".local/state/fleet/tcc/fleet-run-granted"
+
+
+def settings() -> dict:
+    s = site.SITE
+    return {
+        "prefix": str(s.get("codesign_prefix") or DEFAULT_PREFIX),
+        "identity": s.get("codesign_identity") or "",
+        "install_dir": Path(os.path.expanduser(str(s.get("install_dir") or "~/.local/bin"))),
+    }
+
+
+def workspace_tools(root: Path = ROOT) -> dict[str, str]:
+    """Map each binary name to its package, read from the workspace Cargo.toml files."""
+    members_txt = (root / "Cargo.toml").read_text()
+    m = re.search(r"members\s*=\s*\[([^\]]*)\]", members_txt)
+    members = re.findall(r'"([^"]+)"', m.group(1)) if m else []
+    tools: dict[str, str] = {}
+    for member in members:
+        toml = root / member / "Cargo.toml"
+        if not toml.is_file():
+            continue
+        pkg = None
+        bins: list[str] = []
+        section = ""
+        for line in toml.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("["):
+                section = line
+                continue
+            nm = re.match(r'name\s*=\s*"([^"]+)"', line)
+            if not nm:
+                continue
+            if section == "[package]":
+                pkg = nm.group(1)
+            elif section == "[[bin]]":
+                bins.append(nm.group(1))
+        if pkg is None:
+            continue
+        if not bins and (root / member / "src" / "main.rs").is_file():
+            bins = [pkg]
+        for b in bins:
+            tools[b] = pkg
+    return tools
+
+
+def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, text=True, capture_output=True, **kw)
+
+
+def find_identity(explicit: str = "") -> str:
+    out = run(["security", "find-identity", "-v", "-p", "codesigning"]).stdout
+    if explicit:
+        return explicit if explicit in out else ""
+    for line in out.splitlines():
+        m = re.search(r'"(Developer ID Application: [^"]+)"', line)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def team_of(identity: str) -> str:
+    m = re.search(r"\(([A-Z0-9]{10})\)\s*$", identity)
+    return m.group(1) if m else ""
+
+
+def designated_requirement(path: Path) -> str:
+    r = run(["codesign", "-dr", "-", str(path)])
+    text = r.stdout + r.stderr
+    m = re.search(r"designated => (.*)", text)
+    return m.group(1).strip() if m else ""
+
+
+def signature_info(path: Path) -> dict:
+    r = run(["codesign", "-dv", str(path)])
+    text = r.stderr + r.stdout
+    info = {"signed": r.returncode == 0}
+    for key in ("Identifier", "TeamIdentifier", "Signature"):
+        m = re.search(rf"^{key}=(.*)$", text, re.M)
+        info[key] = m.group(1).strip() if m else ""
+    info["adhoc"] = "adhoc" in text or info["Signature"] == "adhoc"
+    return info
+
+
+def is_macho(path: Path) -> bool:
+    try:
+        with path.open("rb") as f:
+            magic = f.read(4)
+    except OSError:
+        return False
+    return magic in (b"\xcf\xfa\xed\xfe", b"\xca\xfe\xba\xbe", b"\xce\xfa\xed\xfe")
+
+
+def expected_ok(path: Path, tool: str, prefix: str, team: str) -> tuple[bool, str]:
+    info = signature_info(path)
+    want = f"{prefix}.{tool}"
+    if not info["signed"]:
+        return False, "not signed"
+    if info["adhoc"]:
+        return False, f"ad-hoc ({info['Identifier']})"
+    if info["Identifier"] != want:
+        return False, f"identifier {info['Identifier']}, want {want}"
+    if team and info["TeamIdentifier"] != team:
+        return False, f"team {info['TeamIdentifier']}, want {team}"
+    if not info["TeamIdentifier"] or info["TeamIdentifier"] == "not set":
+        return False, "no team identifier"
+    return True, f"{want} team {info['TeamIdentifier']}"
+
+
+def staging_dir() -> Path:
+    # Outside the synced install folder, so the sync never ships a half-signed file,
+    # and on the same volume, so the final rename is atomic.
+    d = Path.home() / ".local/state/fleet/install-staging"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def sign_and_install(src: Path, tool: str, cfg: dict, identity: str, allow_adhoc: bool) -> int:
+    dest = cfg["install_dir"] / tool
+    before = designated_requirement(dest) if dest.exists() else ""
+    tmp = staging_dir() / f"{tool}.{os.getpid()}"
+    shutil.copy2(src, tmp)
+    os.chmod(tmp, 0o755)
+    ident = f"{cfg['prefix']}.{tool}"
+    if identity:
+        # No hardened runtime: these tools load no plug-ins and need no entitlements, and the
+        # runtime would change nothing TCC checks. No timestamp: signing must work offline.
+        cmd = ["codesign", "--force", "--sign", identity, "--identifier", ident, "--timestamp=none", str(tmp)]
+    else:
+        cmd = ["codesign", "--force", "--sign", "-", "--identifier", ident, str(tmp)]
+    try:
+        r = subprocess.run(cmd, text=True, capture_output=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        # A keychain "allow" dialog is waiting for the owner; do not retry behind it.
+        print(f"fleet-install: codesign timed out for {tool} (a keychain prompt is probably waiting)", file=sys.stderr)
+        tmp.unlink(missing_ok=True)
+        return 3
+    if r.returncode != 0:
+        print(f"fleet-install: codesign failed for {tool}: {r.stderr.strip()}", file=sys.stderr)
+        tmp.unlink(missing_ok=True)
+        return 1
+    v = run(["codesign", "--verify", "--strict", str(tmp)])
+    if v.returncode != 0:
+        print(f"fleet-install: {tool} does not verify: {v.stderr.strip()}", file=sys.stderr)
+        tmp.unlink(missing_ok=True)
+        return 1
+    if identity:
+        ok, why = expected_ok(tmp, tool, cfg["prefix"], team_of(identity))
+        if not ok:
+            print(f"fleet-install: {tool} signed but wrong: {why}", file=sys.stderr)
+            tmp.unlink(missing_ok=True)
+            return 1
+    after = designated_requirement(tmp)
+    os.replace(tmp, dest)
+    if not before:
+        note = "new"
+    elif before == after:
+        note = "DR unchanged"
+    else:
+        note = "DR changed (expected once, when leaving an ad-hoc signature)"
+    print(f"installed {dest}  [{note}]")
+    print(f"  designated => {after}")
+    return 0
+
+
+def resolve_identity(cfg: dict, allow_adhoc: bool) -> str | None:
+    identity = find_identity(cfg["identity"])
+    if identity:
+        return identity
+    if allow_adhoc:
+        print("fleet-install: WARNING: no signing identity; installing ad-hoc. Every Mac that "
+              "syncs this file loses its privacy grants for it.", file=sys.stderr)
+        return ""
+    want = cfg["identity"] or "a Developer ID Application identity"
+    print(f"fleet-install: {want} is not on this Mac. Run fleet-install on the Mac that holds it "
+          "(with --remote to build on a worker), or pass --allow-adhoc.", file=sys.stderr)
+    return None
+
+
+def cmd_install(a, cfg) -> int:
+    tools = workspace_tools()
+    unknown = [t for t in a.tools if t not in tools]
+    if unknown:
+        print(f"fleet-install: not a workspace binary: {', '.join(unknown)} (see `fleet-install tools`)", file=sys.stderr)
+        return 64
+    identity = resolve_identity(cfg, a.allow_adhoc)
+    if identity is None:
+        return 3
+    pkgs = sorted({tools[t] for t in a.tools})
+    if not a.no_build:
+        build = ["cargo", "build", "--release"] + [x for p in pkgs for x in ("-p", p)]
+        if a.remote:
+            cmd = ["remote-run"] + (["--host", a.host] if a.host else [])
+            for t in a.tools:
+                cmd += ["--pull", f"target/release/{t}"]
+            cmd += ["--"] + build
+        else:
+            cmd = build
+        print("$", " ".join(cmd), flush=True)
+        if subprocess.run(cmd, cwd=ROOT).returncode != 0:
+            return 1
+    rc = 0
+    for t in a.tools:
+        src = ROOT / "target" / "release" / t
+        if not src.is_file():
+            print(f"fleet-install: {src} is missing", file=sys.stderr)
+            rc = 1
+            continue
+        rc = max(rc, sign_and_install(src, t, cfg, identity, a.allow_adhoc))
+    return rc
+
+
+def cmd_resign(a, cfg) -> int:
+    identity = resolve_identity(cfg, False)
+    if identity is None:
+        return 3
+    rc = 0
+    for t in a.tools:
+        dest = cfg["install_dir"] / t
+        if not dest.is_file() or not is_macho(dest):
+            print(f"fleet-install: {dest} is not an installed binary", file=sys.stderr)
+            rc = 1
+            continue
+        rc = max(rc, sign_and_install(dest, t, cfg, identity, False))
+    return rc
+
+
+def cmd_check(a, cfg) -> int:
+    identity = find_identity(cfg["identity"])
+    team = team_of(identity) if identity else ""
+    bad = 0
+    for t in sorted(workspace_tools()):
+        p = cfg["install_dir"] / t
+        if not p.is_file() or p.is_symlink() or not is_macho(p):
+            continue
+        ok, why = expected_ok(p, t, cfg["prefix"], team)
+        print(f"{'ok ' if ok else 'BAD'} {t:<20} {why}")
+        bad += not ok
+    if bad:
+        print(f"{bad} binary(ies) without the stable signature: run `fleet-install resign TOOL` on the Mac with the certificate")
+    return 1 if bad else 0
+
+
+def cmd_dr(a, cfg) -> int:
+    for t in a.tools:
+        p = cfg["install_dir"] / t
+        print(f"{t}: {designated_requirement(p) or '(none)'}")
+    return 0
+
+
+def tcc_rows(db: Path = TCC_DB) -> list[tuple]:
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        return con.execute(
+            "select client, auth_value, auth_reason, last_modified, hex(csreq) from access "
+            "where service='kTCCServiceSystemPolicyAllFiles'").fetchall()
+    finally:
+        con.close()
+
+
+def cmd_tcc(a, cfg) -> int:
+    try:
+        rows = tcc_rows()
+    except sqlite3.Error as e:
+        print(f"fleet-install: cannot read {TCC_DB} ({e}); this session has no Full Disk Access", file=sys.stderr)
+        return 2
+    by_client = {r[0]: r for r in rows}
+    state = {0: "off", 2: "ON", 3: "limited"}
+    granted = set()
+    for t in sorted(workspace_tools()):
+        p = cfg["install_dir"] / t
+        if not p.is_file():
+            continue
+        r = by_client.get(str(p))
+        if r is None:
+            print(f"{t:<20} no row (never asked)")
+        else:
+            print(f"{t:<20} Full Disk Access {state.get(r[1], r[1])}  (reason {r[2]}, row written {r[3]})")
+            if r[1] == 2:
+                granted.add(t)
+    if a.mark:
+        # tcc-run hands its jobs to fleet-run only on a Mac where fleet-run holds the grant;
+        # the marker is per Mac (this folder is not synced).
+        marker = FLEET_RUN_MARKER
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        if "fleet-run" in granted:
+            marker.write_text("fleet-run holds Full Disk Access on this Mac; tcc-run uses it\n")
+            print(f"marked: {marker}")
+        elif marker.exists():
+            marker.rename(marker.with_suffix(".revoked"))
+            print(f"fleet-run has no grant here: {marker} moved aside; tcc-run stays on zsh")
+        else:
+            print("fleet-run has no grant here; tcc-run stays on zsh")
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    cfg = settings()
+    sub = {"resign", "check", "dr", "tcc", "tools"}
+    if argv and argv[0] in sub:
+        p = argparse.ArgumentParser(prog=f"fleet-install {argv[0]}")
+        if argv[0] in ("resign", "dr"):
+            p.add_argument("tools", nargs="+")
+        if argv[0] == "tcc":
+            p.add_argument("--mark", action="store_true",
+                           help="let tcc-run use fleet-run on this Mac if fleet-run holds the grant")
+        a = p.parse_args(argv[1:])
+        if argv[0] == "tools":
+            for t, pkg in sorted(workspace_tools().items()):
+                print(f"{t}\t{pkg}")
+            return 0
+        return {"resign": cmd_resign, "check": cmd_check, "dr": cmd_dr, "tcc": cmd_tcc}[argv[0]](a, cfg)
+    p = argparse.ArgumentParser(prog="fleet-install", description=__doc__.split("\n\n")[0])
+    p.add_argument("--remote", action="store_true", help="build on a worker with remote-run, sign here")
+    p.add_argument("--host", help="worker for --remote")
+    p.add_argument("--no-build", action="store_true", help="install what is already in target/release")
+    p.add_argument("--allow-adhoc", action="store_true", help="install unsigned when no identity is here")
+    p.add_argument("tools", nargs="+")
+    return cmd_install(p.parse_args(argv), cfg)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

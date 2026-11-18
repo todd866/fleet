@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["heavy-slot", "agent-mail", "queue-steward", "diskmap", "placement", "agentkit"]
+members = ["heavy-slot", "agent-mail", "queue-steward", "diskmap", "placement", "agentkit", "fleet-run"]
 
 [workspace.package]
 edition = "2024"
