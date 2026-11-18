@@ -32,7 +32,7 @@ takes effect between runs, and counts as a reason to run again at once; a source
 `"priority": true` that becomes available stops a running backup so the next run includes it
 (files already uploaded are not sent again).
 
-With `scope_verified_requests: true`, a verified folder inside `priority_batches` gets a
+With `scope_verified_requests: true`, a verified folder inside `priority_batches` or any source gets a
 narrow confirmation pass before broad archive batches. Its original /backup cloud path and
 masks are preserved. Exact configured batches keep their names; active priority uploads finish
 uninterrupted. Only a successful, file-count-checked receipt can clear a verification request.
@@ -582,13 +582,23 @@ def priority_config(cfg, batch):
     return result
 
 
+def request_roots(cfg):
+    """Where a verified folder may ask for its own scope: inside any priority batch, and, with
+    `scope_verified_requests`, inside any configured source (an offload may land on any pool drive).
+    priority_config still refuses masked or escaping paths."""
+    roots = [expand(p).rstrip('/') for b in cfg.get('priority_batches', []) for p in b['paths']]
+    if cfg.get('scope_verified_requests'):
+        roots += [expand(s['path']).rstrip('/') for s in cfg.get('sources', [])]
+    return roots
+
+
 def cycle_choice(cfg, ledger, now):
     # New verified folders get their own completion receipt, rather than waiting
     # for an entire archive drive to finish. Exact configured batches keep their
     # existing order and names, including an already-running phase.
     if cfg.get('scope_verified_requests'):
         batches = cfg.get('priority_batches', [])
-        roots = [expand(p).rstrip('/') for b in batches for p in b['paths']]
+        roots = request_roots(cfg)
         exact = {expand(b['paths'][0]).rstrip('/') for b in batches if len(b['paths']) == 1}
         for path, stamp in sorted(cfg.get('_priority_requests', {}).items(), key=lambda item: int(item[1])):
             if path in exact or not any(path == root or path.startswith(root + '/') for root in roots):
@@ -714,14 +724,15 @@ def main(argv=None):
     imp = sub.add_parser("import-login")
     imp.add_argument("folder")
     args = parser.parse_args(argv)
-    cfg = load_config()
+    cfg = load_config(CONFIG)
     if args.cmd == "request":
         path = expand(args.path).rstrip('/')
-        roots = [expand(p).rstrip('/') for b in cfg.get('priority_batches', []) for p in b['paths']]
+        roots = request_roots(cfg)
         if (not path.startswith('/') or '..' in pathlib.Path(path).parts
                 or args.verified_at <= 0 or args.verified_at > time.time() + 120
                 or not any(path == root or path.startswith(root + '/') for root in roots)):
             raise ValueError('request is outside configured priority paths or has an invalid timestamp')
+        priority_config(cfg, {'paths': [path]})  # refuse a masked or escaping path now, not at the next tick
         STATE.mkdir(parents=True, exist_ok=True)
         with (STATE / 'priority-requests.lock').open('a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)

@@ -218,6 +218,37 @@ class PriorityCycle(unittest.TestCase):
             base['_priority_requests']={path:100050}
             with self.assertRaises(ValueError):M.cycle_choice(base,{},100100)
 
+class VerifiedRequestsAnySource(unittest.TestCase):
+    """18 Nov 2026: offloads land on whichever pool drive has room, so a verified folder on any
+    configured source must get its own narrow scope, while masks and escapes stay refused."""
+    def base(self):
+        return cfg(sources=[{'name':'A','path':'/data'},{'name':'Pool','path':'/pool','mask':['skip']}],
+                   priority_batches=[{'name':'archive','paths':['/data/laptop']}],scope_verified_requests=True)
+
+    def test_folder_on_another_source_gets_a_narrow_scope(self):
+        base=self.base();base['_priority_requests']={'/pool/laptop-archives/Pictures/old':100050}
+        name,scoped=M.cycle_choice(base,{},100100)
+        self.assertTrue(name.startswith('verified-offload-'))
+        self.assertEqual(scoped['sources'][0]['path'],'/pool/laptop-archives/Pictures/old')
+        self.assertEqual(scoped['sources'][0]['mount_at'],'Pool/laptop-archives/Pictures/old')
+
+    def test_without_the_switch_only_batch_roots_count(self):
+        base=self.base();base['scope_verified_requests']=False
+        base['_priority_requests']={'/pool/laptop-archives/x':100050}
+        self.assertEqual(M.cycle_choice(base,{},100100)[0],'archive')
+
+    def test_request_command_refuses_masked_and_outside_paths(self):
+        import json,os,tempfile
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            conf=Path(tmp)/'c.json';conf.write_text(json.dumps(self.base()))
+            with patch.object(M,'CONFIG',conf),patch.object(M,'STATE',Path(tmp)/'state'):
+                for bad in ['/pool/skip/x','/elsewhere/x','/pool/a/../../etc']:
+                    with self.assertRaises(ValueError):M.main(['request',bad,'100'])
+                self.assertEqual(M.main(['request','/pool/laptop-archives/ok','100']),0)
+                self.assertIn('/pool/laptop-archives/ok',json.loads((Path(tmp)/'state/priority-requests.json').read_text()))
+
+
 class CycleTransitions(unittest.TestCase):
     def test_priority_success_is_not_a_full_success_when_bulk_starts(self):
         import tempfile,json
