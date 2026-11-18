@@ -214,9 +214,107 @@ pub fn skipped(path: &Path) -> bool {
     SKIP.lock().map(|g| g.iter().any(|p| path.starts_with(p))).unwrap_or(false)
 }
 
+/// The privacy gate while diskmap lacks Full Disk Access: folders found
+/// refused at run time, and where to record new ones. None (the default, and
+/// with Full Disk Access) opens everything.
+struct Gate {
+    learned: Vec<PathBuf>,
+    file: Option<PathBuf>,
+}
+
+static GATE: std::sync::Mutex<Option<Gate>> = std::sync::Mutex::new(None);
+
+/// Turn the gate on (`Some(learned)`, Full Disk Access off) or off (`None`).
+/// `file` gets a line (unix time, tab, path) for each folder newly refused.
+pub fn set_gate(learned: Option<Vec<PathBuf>>, file: Option<PathBuf>) {
+    if let Ok(mut g) = GATE.lock() {
+        *g = learned.map(|learned| Gate { learned, file });
+    }
+}
+
+pub fn gate_on() -> bool {
+    GATE.lock().map(|g| g.is_some()).unwrap_or(true)
+}
+
+/// Boot-volume path relative to the volume root, or None for a path on
+/// another volume (anything under /Volumes).
+pub fn boot_rel(path: &Path) -> Option<String> {
+    let text = path.to_string_lossy();
+    if text == "/Volumes" || text.starts_with("/Volumes/") {
+        return None;
+    }
+    let rel = text
+        .strip_prefix("/System/Volumes/Data")
+        .filter(|r| r.is_empty() || r.starts_with('/'))
+        .unwrap_or(&text);
+    Some(rel.trim_start_matches('/').to_string())
+}
+
+/// True when the gate is on and opening `path` would ask macOS for a privacy
+/// grant: a consent-gated tree, a folder refused before, or any other volume
+/// (macOS gates USB and Thunderbolt disks as removable volumes, even ones
+/// that report Fixed media, and network volumes).
+pub fn gated(path: &Path) -> bool {
+    let Ok(guard) = GATE.lock() else { return true };
+    let Some(gate) = guard.as_ref() else { return false };
+    if gate.learned.iter().any(|p| path.starts_with(p)) {
+        return true;
+    }
+    match boot_rel(path) {
+        None => true,
+        Some(rel) => crate::logic::consent_root(&rel).is_some(),
+    }
+}
+
+/// Without Full Disk Access, a refused open (EPERM, which TCC and the
+/// sandbox return; plain permissions give EACCES) is remembered so the
+/// folder is not asked about again.
+fn learn_refusal(path: &Path) {
+    let Ok(mut guard) = GATE.lock() else { return };
+    let Some(gate) = guard.as_mut() else { return };
+    if gate.learned.iter().any(|p| path.starts_with(p)) {
+        return;
+    }
+    gate.learned.push(path.to_path_buf());
+    if let Some(file) = &gate.file {
+        use std::io::Write;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(file) {
+            let _ = writeln!(f, "{now}\t{}", path.display());
+        }
+    }
+}
+
+/// Why a directory could not be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadFail {
+    /// Not opened: privacy-gated without Full Disk Access, or stuck before.
+    Gated,
+    /// open(2) refused with EPERM (privacy control or system integrity).
+    Refused,
+    Other(String),
+}
+
+impl std::fmt::Display for ReadFail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadFail::Gated => write!(f, "not opened: privacy-gated or stuck before"),
+            ReadFail::Refused => write!(f, "refused (EPERM)"),
+            ReadFail::Other(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
 pub fn read_dir_entries(path: &Path) -> Result<Vec<Entry>, String> {
-    if skipped(path) {
-        return Err(format!("{}: skipped, it blocked a worker before", path.display()));
+    read_dir_checked(path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+pub fn read_dir_checked(path: &Path) -> Result<Vec<Entry>, ReadFail> {
+    if skipped(path) || gated(path) {
+        return Err(ReadFail::Gated);
     }
     if let Ok(mut guard) = READING.lock() {
         *guard = Some((Instant::now(), path.to_path_buf()));
@@ -225,21 +323,44 @@ pub fn read_dir_entries(path: &Path) -> Result<Vec<Entry>, String> {
     if let Ok(mut guard) = READING.lock() {
         *guard = None;
     }
+    if matches!(out, Err(ReadFail::Refused)) {
+        learn_refusal(path);
+    }
     out
 }
 
-fn read_dir_unwatched(path: &Path) -> Result<Vec<Entry>, String> {
+fn read_dir_unwatched(path: &Path) -> Result<Vec<Entry>, ReadFail> {
     match read_dir_bulk(path) {
         Ok(entries) => Ok(entries),
-        Err(err) => read_dir_std(path).map_err(|fallback| format!("{err}; {fallback}")),
+        // A refused or forbidden open would only be refused again (and asked
+        // about again): no second try.
+        Err(BulkFail::Open(code)) if code == libc::EPERM => Err(ReadFail::Refused),
+        Err(BulkFail::Open(code)) if code == libc::EACCES => {
+            Err(ReadFail::Other(format!("open {}: {}", path.display(), std::io::Error::from_raw_os_error(code))))
+        }
+        Err(err) => read_dir_std(path).map_err(|fallback| ReadFail::Other(format!("{err}; {fallback}"))),
     }
 }
 
-fn read_dir_bulk(path: &Path) -> Result<Vec<Entry>, String> {
-    let c = CString::new(path.to_string_lossy().as_bytes()).map_err(|e| e.to_string())?;
+enum BulkFail {
+    Open(i32),
+    Other(String),
+}
+
+impl std::fmt::Display for BulkFail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BulkFail::Open(code) => write!(f, "open: {}", std::io::Error::from_raw_os_error(*code)),
+            BulkFail::Other(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+fn read_dir_bulk(path: &Path) -> Result<Vec<Entry>, BulkFail> {
+    let c = CString::new(path.to_string_lossy().as_bytes()).map_err(|e| BulkFail::Other(e.to_string()))?;
     let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY) };
     if fd < 0 {
-        return Err(format!("open {}: {}", path.display(), std::io::Error::last_os_error()));
+        return Err(BulkFail::Open(std::io::Error::last_os_error().raw_os_error().unwrap_or(0)));
     }
     let mut attr = Attrlist {
         bitmapcount: ATTR_BIT_MAP_COUNT,
@@ -270,7 +391,7 @@ fn read_dir_bulk(path: &Path) -> Result<Vec<Entry>, String> {
         if n < 0 {
             let err = std::io::Error::last_os_error();
             unsafe { libc::close(fd) };
-            return Err(format!("getattrlistbulk {}: {err}", path.display()));
+            return Err(BulkFail::Other(format!("getattrlistbulk {}: {err}", path.display())));
         }
         if n == 0 {
             break;
@@ -278,7 +399,7 @@ fn read_dir_bulk(path: &Path) -> Result<Vec<Entry>, String> {
         let parsed = parse_bulk(&buf, n);
         if parsed.is_empty() {
             unsafe { libc::close(fd) };
-            return Err(format!("getattrlistbulk {}: unreadable record", path.display()));
+            return Err(BulkFail::Other(format!("getattrlistbulk {}: unreadable record", path.display())));
         }
         out.extend(parsed);
     }

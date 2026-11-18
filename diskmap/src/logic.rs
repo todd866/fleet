@@ -41,7 +41,8 @@ pub struct DiskConfig {
     /// Extra temp, cache or churn trees (volume-relative patterns, see
     /// `churn_root`), mapped as one opaque total instead of row by row.
     pub churn_trees: Vec<String>,
-    /// Replaces `PROTECTED_TREES` when present.
+    /// Trees never opened, Full Disk Access or not (volume-relative
+    /// patterns, see `protected_root`). None by default.
     pub protected_trees: Option<Vec<String>>,
 }
 
@@ -1145,14 +1146,8 @@ pub fn churn_root(path: &str, extra: &[String]) -> Option<String> {
     tree_root(path, CHURN_TREES.iter().copied().chain(extra.iter().map(String::as_str)))
 }
 
-/// Folders macOS guards per app (Photos): a launchd-started binary without
-/// a grant blocks in open(2) on every folder inside (18 Nov 2026). The walker
-/// never opens them; their rows keep their last sizes. Same pattern syntax as
-/// `CHURN_TREES`.
-pub const PROTECTED_TREES: &[&str] = &["**/*.photoslibrary"];
-
-/// `protected_trees` from the config, when set (an empty list opens them all
-/// again, once the binary has its privacy grant back).
+/// Folders the owner always wants left alone, from the config's
+/// `protected_trees` (none by default). Independent of Full Disk Access.
 static PROTECTED: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
 
 pub fn set_protected(trees: Option<Vec<String>>) {
@@ -1162,11 +1157,83 @@ pub fn set_protected(trees: Option<Vec<String>>) {
 }
 
 pub fn protected_root(path: &str) -> Option<String> {
-    let configured = PROTECTED.lock().ok().and_then(|g| g.clone());
-    match configured {
-        Some(list) => tree_root(path, list.iter().map(String::as_str)),
-        None => tree_root(path, PROTECTED_TREES.iter().copied()),
-    }
+    let configured = PROTECTED.lock().ok().and_then(|g| g.clone())?;
+    tree_root(path, configured.iter().map(String::as_str))
+}
+
+/// Trees on the boot volume that macOS privacy controls (TCC) guard. Without
+/// Full Disk Access, opening one asks the owner (Desktop, Documents,
+/// Downloads, Photos, media libraries, other apps' data) or is refused and
+/// logged; a launchd process can also block in open(2) on one for good (W28).
+/// The walker never opens them then; their rows keep their last sizes.
+/// Volume-relative, same syntax as `CHURN_TREES`. Every volume under
+/// /Volumes is gated as a whole too (removable and network volumes), see
+/// `darwin::gated`. Trees found by an EPERM are added at run time
+/// (`gated.tsv`), so this list need not be complete for silent refusals; it
+/// must be complete for the ones that prompt.
+pub const CONSENT_TREES: &[&str] = &[
+    // Prompting: Desktop, Documents, Downloads, Photos, media libraries.
+    "Users/*/Desktop",
+    "Users/*/Documents",
+    "Users/*/Downloads",
+    "Users/*/Pictures",
+    "Users/*/Music",
+    "Users/*/Movies/TV",
+    "**/*.photoslibrary",
+    "**/*.musiclibrary",
+    "**/*.tvlibrary",
+    "Users/*/Library/Photos",
+    // Other apps' data (kTCCServiceSystemPolicyAppData) and iCloud Drive.
+    "Users/*/Library/Containers",
+    "Users/*/Library/Group Containers",
+    "Users/*/Library/Daemon Containers",
+    "Users/*/Library/Mobile Documents",
+    "Users/*/Library/Caches/com.apple.TV",
+    "Users/*/Library/Caches/com.apple.Music",
+    "Users/*/Library/Caches/com.apple.Safari",
+    "Users/*/Library/Caches/com.apple.HomeKit",
+    "Users/*/Library/Caches/com.apple.homed",
+    "Users/*/Library/Caches/CloudKit",
+    "Users/*/Library/Caches/familycircled",
+    "Users/*/Library/Caches/com.apple.findmy.fmipcore",
+    "Users/*/Library/Caches/com.apple.ap.adprivacyd",
+    "Users/*/Library/Caches/com.apple.containermanagerd",
+    "Users/*/Library/WebKit/com.apple.TV",
+    // Personal data (Full Disk Access only).
+    "Users/*/.Trash",
+    "Users/*/Library/Mail",
+    "Users/*/Library/Messages",
+    "Users/*/Library/Safari",
+    "Users/*/Library/Calendars",
+    "Users/*/Library/Reminders",
+    "Users/*/Library/HomeKit",
+    "Users/*/Library/Cookies",
+    "Users/*/Library/Suggestions",
+    "Users/*/Library/Sharing",
+    "Users/*/Library/Accounts",
+    "Users/*/Library/IdentityServices",
+    "Users/*/Library/Biome",
+    "Users/*/Library/DuetExpertCenter",
+    "Users/*/Library/PersonalizationPortrait",
+    "Users/*/Library/Trial",
+    "Users/*/Library/StatusKit",
+    "Users/*/Library/Metadata/CoreSpotlight",
+    "Users/*/Library/Application Support/AddressBook",
+    "Users/*/Library/Application Support/CallHistoryDB",
+    "Users/*/Library/Application Support/CallHistoryTransactions",
+    "Users/*/Library/Application Support/FaceTime",
+    "Users/*/Library/Application Support/Knowledge",
+    "Users/*/Library/Application Support/MobileSync",
+    "Users/*/Library/Application Support/com.apple.TCC",
+    "Users/*/Library/Application Support/com.apple.sharedfilelist",
+    "Library/Application Support/com.apple.TCC",
+    "private/var/protected",
+    "private/var/db/CoreDuet",
+];
+
+/// The consent-gated tree `path` (volume-relative, boot volume) lies in.
+pub fn consent_root(path: &str) -> Option<String> {
+    tree_root(path, CONSENT_TREES.iter().copied())
 }
 
 /// What to record when `dir` blocked a worker: the folder itself, or its

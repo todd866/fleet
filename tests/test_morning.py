@@ -154,6 +154,17 @@ class Thresholds(unittest.TestCase):
         # A Mac with no ingest status file gets no row at all.
         self.assertNotIn(key, by_key(evaluate({"hosts": {"hub": host()}}, config(), NOW_S)))
 
+    def test_diskmap_without_full_disk_access_is_one_row(self):
+        key = "disk:hub:diskmap-access"
+        trees = [{"path": "~u/Desktop", "bytes": 12_000_000_000}, {"path": "/Volumes/Ext1", "bytes": 1}]
+        snap = lambda access: {"hosts": {"hub": host(diskmap_access=access)}}
+        row = by_key(evaluate(snap({"full_disk": False, "checked_at": NOW_S, "unmeasured": trees}), config(), NOW_S))[key]
+        self.assertEqual(row.status, "warn")
+        self.assertIn("diskmap: 2 trees unmeasured, switch on Full Disk Access for diskmap to measure them", row.detail)
+        self.assertIn("~u/Desktop 12 GB", row.detail)
+        for access in ({"full_disk": True, "unmeasured": []}, None):
+            self.assertNotIn(key, by_key(evaluate(snap(access), config(), NOW_S)))
+
     def test_home_mirror_ages_and_skips(self):
         key = "backup:hub:home-mirror"
         snap = lambda **s: {"hosts": {"hub": host(home_mirror=s)}}

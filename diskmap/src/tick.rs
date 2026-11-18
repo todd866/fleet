@@ -1,6 +1,7 @@
 //! One pass for launchd: keep the initial-walk worker alive, fold in FSEvents
 //! once that walk has finished, then summary, alerts, archive.
 
+use crate::access;
 use crate::archive;
 use crate::cloud::{self, CloudFolder};
 use crate::darwin::{self, Mounted};
@@ -135,6 +136,11 @@ pub fn tick(roots: &Roots) -> Result<Summary, String> {
     let (cfg, host) = load(roots);
     let drives = load_drives(roots, &cfg);
     let mounted = darwin::list_volumes().unwrap_or_default();
+    // Without Full Disk Access nothing privacy-gated is opened (W28, W29).
+    stage("access");
+    let access = access::refresh(&roots.state, now);
+    access::apply(&roots.state, &access);
+    let walk_vols = walkable(&mounted, access.full_disk);
     // The worker takes the walk lock one short slice at a time, so the tick
     // waits for the current slice instead of skipping its writes.
     let lock = wait_walk_lock(&roots.state.join("walk.lock"), TICK_LOCK_WAIT)?;
@@ -146,7 +152,22 @@ pub fn tick(roots: &Roots) -> Result<Summary, String> {
         // Replaying FSEvents only queues rescans, so it runs even while the
         // owner is at the Mac; the background worker drains the queue.
         stage("fsevents");
-        refresh_events(roots, &cfg, &mounted);
+        // Only volumes the worker may walk: another volume's replay cursor
+        // stays put, so its changes are replayed once access is granted.
+        refresh_events(roots, &cfg, &walk_vols);
+        if access.full_disk && access.requeue {
+            stage("requeue gated");
+            match requeue_gated(roots, &mounted) {
+                Ok(n) => {
+                    eprintln!("diskmap: Full Disk Access granted; {n} gated trees queued for a fresh walk");
+                    let done = access::AccessState { requeue: false, ..access.clone() };
+                    if let Err(err) = access::write_state(&roots.state, &done) {
+                        eprintln!("diskmap: access state: {err}");
+                    }
+                }
+                Err(err) => eprintln!("diskmap: requeue gated trees: {err}"),
+            }
+        }
         stage("volumes");
         for vol in &mounted {
             let db_path = db_file(roots, &vol.uuid);
@@ -168,7 +189,8 @@ pub fn tick(roots: &Roots) -> Result<Summary, String> {
         }
     }
     stage("summary");
-    let summary = build_summary(roots, &cfg, &host, &drives, &mounted, now)?;
+    let mut summary = build_summary(roots, &cfg, &host, &drives, &mounted, now)?;
+    summary.access = Some(access_summary(roots, &mounted, &access));
     fs::create_dir_all(&roots.state).map_err(|e| e.to_string())?;
     fs::write(roots.state.join("summary.json"), summary::to_json(&summary)).map_err(|e| e.to_string())?;
     let where_file = build_where(roots, &host, &summary, now)?;
@@ -177,13 +199,15 @@ pub fn tick(roots: &Roots) -> Result<Summary, String> {
     drop(lock);
     stage("start worker");
     // After this tick's own map writes, so the worker never races them.
-    if let Err(err) = ensure_walk_worker(roots, &mounted) {
+    if let Err(err) = ensure_walk_worker(roots, &walk_vols) {
         eprintln!("diskmap: {err}");
     }
     // Last, and outside the walk lock: the archive drive can block open(2)
     // for minutes (the tick deadline ends that), and nothing else waits on it.
     stage("archive ship");
-    if let Err(err) = ship_archive(roots, &cfg, &drives, &host, &mounted) {
+    // Without Full Disk Access the archive drive (a volume under /Volumes) is
+    // gated too: the ship spools instead.
+    if let Err(err) = ship_archive(roots, &cfg, &drives, &host, &walk_vols) {
         if crate::sqlite::is_locked(&err) {
             log_walker_skip(&mut logged);
         } else {
@@ -433,6 +457,9 @@ pub fn walk_worker(roots: &Roots) -> Result<(), String> {
     let born = Instant::now();
     let mut pacer = Pacer::new();
     darwin::set_skip(load_stuck(roots, unix_now()));
+    // The tick probes for Full Disk Access; the worker follows its record.
+    let mut full_disk = access::current(&roots.state, unix_now()).full_disk;
+    access::apply(&roots.state, &access::current(&roots.state, unix_now()));
     start_watchdog(roots);
     let mut opaque: std::collections::HashMap<String, engine::OpaqueWalk> = std::collections::HashMap::new();
     {
@@ -442,7 +469,7 @@ pub fn walk_worker(roots: &Roots) -> Result<(), String> {
         let Some(_lock) = wait_walk_lock(&roots.state.join("walk.lock"), LOCK_WAIT)? else {
             return Ok(());
         };
-        for vol in darwin::list_volumes().unwrap_or_default() {
+        for vol in walkable(&darwin::list_volumes().unwrap_or_default(), full_disk) {
             let db_path = db_file(roots, &vol.uuid);
             if baseline_done(&db_path) {
                 engine::migrate_churn(&db_path, unix_now(), &cfg.churn_trees)?;
@@ -454,7 +481,15 @@ pub fn walk_worker(roots: &Roots) -> Result<(), String> {
     let log_every = Duration::from_secs(60);
     let mut logged = Instant::now();
     while born.elapsed() < WORKER_LIFETIME {
-        let mounted = darwin::list_volumes().unwrap_or_default();
+        let access_now = access::current(&roots.state, unix_now());
+        if access_now.full_disk != full_disk {
+            full_disk = access_now.full_disk;
+            access::apply(&roots.state, &access_now);
+            // Stuck folders recorded without access are tried again with it.
+            darwin::set_skip(load_stuck(roots, unix_now()));
+            opaque.clear();
+        }
+        let mounted = walkable(&darwin::list_volumes().unwrap_or_default(), full_disk);
         let (cfg, _) = load(roots);
         let fold_due = folded.is_none_or(|t| t.elapsed() >= FOLD_EVERY);
         if fold_due {
@@ -582,6 +617,142 @@ const STUCK_SKIP_SECS: i64 = 7 * 86400;
 
 fn stuck_path(roots: &Roots) -> PathBuf {
     roots.state.join("stuck.tsv")
+}
+
+fn is_boot(vol: &Mounted) -> bool {
+    vol.mount == Path::new("/System/Volumes/Data") || vol.mount == Path::new("/")
+}
+
+/// The volumes the walker may open: all of them with Full Disk Access, else
+/// only the boot volume (macOS asks before a process reads any other disk,
+/// USB and Thunderbolt disks included, W29). Their free and total space come
+/// from getfsstat, which needs no grant.
+pub fn walkable(mounted: &[Mounted], full_disk: bool) -> Vec<Mounted> {
+    mounted.iter().filter(|v| full_disk || is_boot(v)).cloned().collect()
+}
+
+/// Mapped rows of the boot volume that lie at a consent-gated root, with
+/// their last sizes. Database only: nothing on disk is touched.
+pub fn consent_rows(db: &crate::sqlite::Db) -> Result<Vec<(String, i64)>, String> {
+    let mut out: Vec<(String, i64)> = Vec::new();
+    for pattern in logic::CONSENT_TREES {
+        if pattern.starts_with("**/") {
+            continue;
+        }
+        let mut level: Vec<String> = vec![String::new()];
+        for comp in pattern.split('/') {
+            let mut next = Vec::new();
+            for parent in &level {
+                if comp.contains('*') {
+                    for child in store::children(db, parent)? {
+                        let name = child.path.rsplit('/').next().unwrap_or("").to_string();
+                        if logic::glob_match(comp, &name) {
+                            next.push(child.path);
+                        }
+                    }
+                } else {
+                    let path = engine::join_rel(parent, comp);
+                    if store::dir(db, &path)?.is_some() {
+                        next.push(path);
+                    }
+                }
+            }
+            level = next;
+        }
+        for path in level {
+            if let Some(row) = store::dir(db, &path)? {
+                out.push((path, row.total_bytes));
+            }
+        }
+    }
+    // Patterns that match anywhere (media libraries) count only outside the
+    // roots above.
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// Full Disk Access just arrived: queue every gated tree on the boot volume
+/// for a deep rescan, and retire the lists of folders skipped without it.
+fn requeue_gated(roots: &Roots, mounted: &[Mounted]) -> Result<usize, String> {
+    let mut n = 0;
+    let learned: Vec<PathBuf> = access::load_learned(&roots.state)
+        .into_iter()
+        .chain(load_stuck(roots, unix_now()))
+        .collect();
+    for vol in mounted.iter().filter(|v| is_boot(v)) {
+        let db_path = db_file(roots, &vol.uuid);
+        if !baseline_done(&db_path) {
+            continue;
+        }
+        let db = store::open(&db_path)?;
+        let mut paths: Vec<String> = consent_rows(&db)?.into_iter().map(|(p, _)| p).collect();
+        for abs in &learned {
+            if let Some(rel) = darwin::boot_rel(abs) {
+                if store::dir(&db, &rel)?.is_some() {
+                    paths.push(rel);
+                }
+            }
+        }
+        paths.sort();
+        paths.dedup();
+        for path in &paths {
+            store::pending_push(&db, path, true)?;
+            n += 1;
+        }
+    }
+    for name in ["stuck.tsv", "gated.tsv"] {
+        let from = roots.state.join(name);
+        if from.exists() {
+            let _ = fs::rename(&from, roots.state.join(format!("{name}.before-fda")));
+        }
+    }
+    darwin::set_skip(Vec::new());
+    Ok(n)
+}
+
+/// The summary's access block: without Full Disk Access, each gated tree
+/// that the map holds (with its last size), each folder refused at run time,
+/// and each other mounted volume.
+fn access_summary(roots: &Roots, mounted: &[Mounted], access: &access::AccessState) -> summary::AccessSummary {
+    let mut unmeasured = Vec::new();
+    if !access.full_disk {
+        let learned = access::load_learned(&roots.state);
+        for vol in mounted {
+            if !is_boot(vol) {
+                unmeasured.push(summary::Unmeasured {
+                    path: vol.mount.to_string_lossy().into_owned(),
+                    bytes: vol.total_bytes.saturating_sub(vol.free_bytes),
+                });
+                continue;
+            }
+            let db_path = db_file(roots, &vol.uuid);
+            let Ok(db) = store::open_readonly(&db_path) else { continue };
+            let mut rows = consent_rows(&db).unwrap_or_default();
+            for abs in &learned {
+                if let Some(rel) = darwin::boot_rel(abs) {
+                    if logic::consent_root(&rel).is_some() || rows.iter().any(|(p, _)| rel.starts_with(&format!("{p}/"))) {
+                        continue;
+                    }
+                    let bytes = store::dir(&db, &rel).ok().flatten().map(|r| r.total_bytes).unwrap_or(0);
+                    rows.push((rel, bytes));
+                }
+            }
+            rows.sort();
+            rows.dedup_by(|a, b| a.0 == b.0);
+            for (path, bytes) in rows {
+                unmeasured.push(summary::Unmeasured {
+                    path: format!("/{path}"),
+                    bytes: bytes.max(0) as u64,
+                });
+            }
+        }
+    }
+    summary::AccessSummary {
+        full_disk: access.full_disk,
+        checked_at: access.checked_at,
+        unmeasured,
+    }
 }
 
 /// Directories that blocked a worker within `STUCK_SKIP_SECS`
@@ -788,6 +959,7 @@ pub fn build_summary(
         locations,
         drives: rollups.iter().map(summary::drive_out).collect(),
         alerts,
+        access: None,
     };
     Ok(summary)
 }

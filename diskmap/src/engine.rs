@@ -255,6 +255,12 @@ fn scan_one(
     baseline: bool,
     churn: &[String],
 ) -> Result<(), String> {
+    // A privacy-gated folder (no Full Disk Access) or one that blocked a
+    // worker before is never opened: its row keeps its last size.
+    let abs = abs_path(root, path);
+    if darwin::skipped(&abs) || darwin::gated(&abs) || logic::protected_root(path).is_some() {
+        return Ok(());
+    }
     // A churn tree is one opaque total, measured outside the walk.
     if let Some(tree) = logic::churn_root(path, churn) {
         return route_churn(db, &tree, now);
@@ -271,13 +277,12 @@ fn scan_one(
         store::pending_push(db, &ancestor, true)?;
         return Ok(());
     }
-    let abs = abs_path(root, path);
-    if darwin::skipped(&abs) || logic::protected_root(path).is_some() {
-        // It blocked a worker before: keep what the map has for it.
-        return Ok(());
-    }
-    let entries = match darwin::read_dir_entries(&abs) {
+    let entries = match darwin::read_dir_checked(&abs) {
         Ok(v) => v,
+        // Refused by a privacy control without Full Disk Access (now
+        // remembered and never asked again), or not opened: keep its size.
+        Err(darwin::ReadFail::Gated) => return Ok(()),
+        Err(darwin::ReadFail::Refused) if darwin::gate_on() => return Ok(()),
         Err(_) => {
             let mut touched = apply_own(db, path, &parent, 0, 0, 0, 0, now)?;
             // Gone, not merely unreadable: nothing beneath it exists either.
@@ -373,7 +378,9 @@ pub fn prune_missing(root: &Path, db_path: &Path, now: i64, event_min: i64, min_
                     continue;
                 }
             }
-            if !is_missing(&abs_path(root, &row.path)) {
+            let abs = abs_path(root, &row.path);
+            // Never look inside a privacy-gated tree, even with lstat.
+            if darwin::gated(&abs) || !is_missing(&abs) {
                 continue;
             }
             // Read the row again: an ancestor's removal or an earlier bubble may have changed it.

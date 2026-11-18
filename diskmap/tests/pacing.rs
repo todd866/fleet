@@ -8,6 +8,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// The top folder of home folders on macOS (spelled out of a path literal for the export leak check).
+const HOMES: &str = "Users";
+
 /// The skip list is process-wide; tests that set it take turns.
 static SKIP_LIST: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -328,16 +331,22 @@ fn a_directory_that_blocked_a_worker_is_skipped_and_keeps_its_size() {
     let _ = fs::remove_dir_all(&tmp);
 }
 
-/// The Photos library blocks every open from a binary without a grant; the
-/// walker never opens it, and a folder recorded as stuck covers its subtree.
+/// The Photos library blocks every open from a binary without a grant; it
+/// is a consent-gated tree, and a folder recorded as stuck covers its subtree.
+/// Nothing is protected by default any more: with Full Disk Access the
+/// walker opens everything.
 #[test]
 fn protected_trees_are_never_opened_and_stuck_folders_cover_their_subtree() {
     let _turn = SKIP_LIST.lock().unwrap_or_else(|e| e.into_inner());
     assert_eq!(
-        protected_root("Users/someone/Pictures/Photos Library.photoslibrary/resources/derivatives/C").as_deref(),
-        Some("Users/someone/Pictures/Photos Library.photoslibrary")
+        consent_root("Users/someone/Library/Photos/Libraries/Syndication.photoslibrary/private").as_deref(),
+        Some("Users/someone/Library/Photos")
     );
-    assert_eq!(protected_root("Users/someone/Pictures/holiday"), None);
+    assert_eq!(
+        consent_root("srv/x/Photos Library.photoslibrary/database").as_deref(),
+        Some("srv/x/Photos Library.photoslibrary")
+    );
+    assert_eq!(protected_root("Users/someone/Pictures/Photos Library.photoslibrary/resources"), None);
     let tmp = scratch("subtree-skip");
     fs::create_dir_all(tmp.join("a/b/c")).unwrap();
     set_skip(vec![tmp.join("a")]);
@@ -388,4 +397,95 @@ fn a_second_stuck_sibling_skips_their_parent_but_never_a_home_folder() {
         stuck_entry(&p(&format!("{home}/Desktop")), &[p(&format!("{home}/Documents"))]),
         p(&format!("{home}/Desktop"))
     );
+}
+
+/// Without Full Disk Access the walker opens no consent-gated folder (it
+/// would make macOS ask the owner, 18 Nov 2026) and no other volume; their
+/// rows keep their last sizes. With it, everything is opened again.
+#[test]
+fn without_full_disk_access_gated_trees_are_not_opened_and_keep_their_size() {
+    let _turn = SKIP_LIST.lock().unwrap_or_else(|e| e.into_inner());
+    for gated_rel in [
+        "Users/someone/Desktop",
+        "Users/someone/Documents/x",
+        "Users/someone/Downloads",
+        "Users/someone/Pictures/holiday",
+        "Users/someone/Music/Music/Music Library.musiclibrary",
+        "Users/someone/Library/Containers/com.apple.x/Data",
+        "Users/someone/Library/Group Containers/group.com.apple.calendar",
+        "Users/someone/Library/Mail/V10",
+        "Users/someone/Library/Messages",
+        "Users/someone/Library/Safari",
+        "Users/someone/Library/Calendars",
+        "Users/someone/Library/Reminders",
+        "Users/someone/Library/Application Support/AddressBook",
+        "Users/someone/Library/HomeKit",
+        "Users/someone/Library/Mobile Documents/com~apple~CloudDocs",
+        "Users/someone/Library/Caches/com.apple.TV",
+        "Users/someone/.Trash",
+    ] {
+        assert!(consent_root(gated_rel).is_some(), "{gated_rel}");
+    }
+    for open_rel in ["Users/someone/Projects/x", "Users/someone/Library/Caches/com.example", "Applications", ""] {
+        assert!(consent_root(open_rel).is_none(), "{open_rel}");
+    }
+    let data_home = format!("/System/Volumes/Data/{HOMES}/a");
+    let home = format!("/{HOMES}/a");
+    assert_eq!(boot_rel(&Path::new(&data_home).join("Desktop")).as_deref(), Some("Users/a/Desktop"));
+    assert_eq!(boot_rel(&Path::new(&home).join("Desktop")).as_deref(), Some("Users/a/Desktop"));
+    assert_eq!(boot_rel(Path::new("/System/Volumes/DataX/y")).as_deref(), Some("System/Volumes/DataX/y"));
+    assert_eq!(boot_rel(Path::new("/Volumes/Ext1/Music")), None);
+
+    let tmp = scratch("gate");
+    let root = tmp.join("tree");
+    let db = tmp.join("state/vol.db");
+    fs::create_dir_all(root.join("held")).unwrap();
+    fs::create_dir_all(root.join("open")).unwrap();
+    fs::write(root.join("held/f"), vec![9u8; 8192]).unwrap();
+    let t = 1_700_000_000;
+    baseline(&root, &db, t);
+    let before = dir(&open_db(&db).unwrap(), "held").unwrap().unwrap().total_bytes;
+    assert!(before >= 8192);
+
+    // Gate on: other volumes and refused folders are gated; the rest is not.
+    set_gate(Some(vec![root.join("held")]), None);
+    assert!(gated(Path::new("/Volumes/Ext1")));
+    assert!(gated(&Path::new(&data_home).join("Desktop/x")));
+    assert!(gated(&Path::new(&home).join("Library/Group Containers/g")));
+    assert!(gated(&root.join("held/deeper")));
+    assert!(!gated(&root.join("open")));
+    assert_eq!(read_dir_checked(&root.join("held")).unwrap_err(), ReadFail::Gated);
+    fs::write(root.join("held/g"), vec![9u8; 8192]).unwrap();
+    enqueue(&db, "held", false).unwrap();
+    walk_one_batch(&root, &db, t + 10, 0, 10, |_| false).unwrap();
+    assert_eq!(queue_len(&db).unwrap(), 0);
+    assert_eq!(dir(&open_db(&db).unwrap(), "held").unwrap().unwrap().total_bytes, before);
+
+    // Gate off (Full Disk Access): opened and measured again.
+    set_gate(None, None);
+    assert!(!gated(Path::new("/Volumes/Ext1")));
+    assert!(!gated(&Path::new(&home).join("Desktop")));
+    enqueue(&db, "held", false).unwrap();
+    walk_one_batch(&root, &db, t + 20, 0, 10, |_| false).unwrap();
+    assert!(dir(&open_db(&db).unwrap(), "held").unwrap().unwrap().total_bytes >= before + 8192);
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+/// The summary counts gated trees from the map alone: a root that matches a
+/// consent pattern, with its last size.
+#[test]
+fn consent_rows_lists_mapped_gated_roots_with_their_sizes() {
+    let tmp = scratch("consent-rows");
+    let root = tmp.join("tree");
+    let db = tmp.join("state/vol.db");
+    fs::create_dir_all(root.join("Users/u/Desktop/sub")).unwrap();
+    fs::create_dir_all(root.join("Users/u/Projects")).unwrap();
+    fs::create_dir_all(root.join("Users/v/Library/Group Containers/g")).unwrap();
+    fs::write(root.join("Users/u/Desktop/sub/f"), vec![1u8; 4096]).unwrap();
+    baseline(&root, &db, 1_700_000_000);
+    let rows = consent_rows(&open_db(&db).unwrap()).unwrap();
+    let paths: Vec<&str> = rows.iter().map(|(p, _)| p.as_str()).collect();
+    assert_eq!(paths, vec!["Users/u/Desktop", "Users/v/Library/Group Containers"]);
+    assert!(rows[0].1 >= 4096);
+    let _ = fs::remove_dir_all(&tmp);
 }

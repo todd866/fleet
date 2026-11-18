@@ -50,6 +50,7 @@ def evaluate(snapshot, config, now):
         rows.extend(_backups(name, host, config, now))
         rows.extend(_sync(name, host))
         rows.extend(_updates(name, host))
+        rows.extend(_diskmap_access(name, host.get("diskmap_access")))
         rows.extend(_jobs(name, host, config, now, tz, registry, prefixes))
         rows.extend(_queue(name, host, now, tz))
         rows.extend(_thermal(name, host, config, now))
@@ -308,6 +309,21 @@ def _sync(name, host):
         value, datum = "0", "in sync"
     detail = f"errors {errors}; out of sync {out}; receive-only local changes {local}"
     return [_row(f"sync:{name}", status, "sync", name, value, datum, detail)]
+
+
+def _diskmap_access(name, access):
+    """One row while diskmap lacks Full Disk Access: without it the walker leaves consent-gated
+    folders and other disks unmeasured instead of making macOS ask the owner (18 Nov 2026)."""
+    if not isinstance(access, dict) or access.get("full_disk") is not False:
+        return []
+    trees = [t for t in access.get("unmeasured") or [] if isinstance(t, dict)]
+    n = len(trees)
+    biggest = sorted(trees, key=lambda t: -(t.get("bytes") or 0))[:5]
+    listed = ", ".join(f"{t.get('path')} {_gb(round((t.get('bytes') or 0) / 1e9, 1))}" for t in biggest)
+    detail = (f"diskmap: {n} trees unmeasured, switch on Full Disk Access for diskmap to measure them"
+              f" (System Settings > Privacy & Security > Full Disk Access); sizes shown are the last measured"
+              + (f"; largest: {listed}" if listed else ""))
+    return [_row(f"disk:{name}:diskmap-access", "warn", "disk", f"{name} diskmap", f"{n} trees", "no FDA", detail)]
 
 
 def _updates(name, host):

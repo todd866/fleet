@@ -64,6 +64,8 @@ def _gather():
         "home_mirror": _json(HOME / ".local/state/home-mirror/status.json"),
         "offload_queue": _json(HOME / str(_site().get("offload_status_path") or ".local/state/offload/status.json")),
         "icloud": _icloud(),
+        # Full Disk Access and the trees diskmap leaves unmeasured without it (diskmap summary).
+        "diskmap_access": _diskmap_access(),
         "cool_c": _cool_target(),
         "queue": _queue(),
     }
@@ -95,6 +97,12 @@ def _disks():
     if mounts:
         return disks_from_mounts(drives, mounts, int(time.time()))
     return []
+
+
+def _diskmap_access():
+    summary = _json(HOME / ".local/state/diskmap/summary.json")
+    access = summary.get("access") if isinstance(summary, dict) else None
+    return access if isinstance(access, dict) else None
 
 
 def _drives_path():

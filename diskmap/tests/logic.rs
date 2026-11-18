@@ -314,6 +314,7 @@ fn fleet_rows_share_one_width() {
             grower: "Movies".into(),
             message: "Movies, 149 GB free".into(),
         }],
+        access: None,
     };
     let text = format_fleet(&fleet_lines(&[summary], 1_000));
     let lines: Vec<&str> = text.lines().collect();

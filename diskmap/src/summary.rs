@@ -69,6 +69,25 @@ pub struct Summary {
     pub locations: Vec<Location>,
     pub drives: Vec<DriveOut>,
     pub alerts: Vec<Alert>,
+    /// Full Disk Access and what goes unmeasured without it. Absent on
+    /// summaries from builds before 18 Nov 2026.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<AccessSummary>,
+}
+
+/// A tree the walker does not open while diskmap lacks Full Disk Access; its
+/// size is the last one measured (0 when never measured).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Unmeasured {
+    pub path: String,
+    pub bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AccessSummary {
+    pub full_disk: bool,
+    pub checked_at: i64,
+    pub unmeasured: Vec<Unmeasured>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
