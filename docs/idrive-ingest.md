@@ -122,6 +122,18 @@ The offload queue verifies the source and destination again after qualifying clo
 A later bulk run does not erase a valid narrow receipt. Changed masks, paths, missing sources,
 failed files, and stale observations still prevent reclamation.
 
+Verified requests run oldest first. `request_order` (a list of host path prefixes) puts matching
+requests ahead of that, for example a folder that is the only copy of a machine before folders still
+held elsewhere. A priority run that ends without a receipt keeps its place and is retried; after three
+such runs the scope is set aside for 24 hours with a problem naming the failed files, so it cannot
+block the queue. A new verification request brings it back at once.
+
+IDrive reports a run with some failed files as `Success*`. It counts as a success only when the log
+names every failed file and each matches a regular expression in `accept_failed` (for example
+`/Library/Containers/com\.apple\.news/Data/Library/Caches/` for cache names too long to store, or
+`/Icon\r$` for Finder's custom-icon files). The receipt then lists those files as
+`accepted_failures`. With no `accept_failed`, a `Success*` run is never a success.
+
 One lock serializes ticks; phase state is persisted before changing mounts so restart resumes
 the same plan. Priority runs complete before bulk resumes. Existing uploaded paths remain in
 the account, and completed files are available to the client's incremental backup logic.

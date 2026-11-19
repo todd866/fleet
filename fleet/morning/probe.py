@@ -63,6 +63,8 @@ def _gather():
         # A laptop's copy of its home on the hub (home-mirror), where this Mac pushes one.
         "home_mirror": _json(HOME / ".local/state/home-mirror/status.json"),
         "offload_queue": _json(HOME / str(_site().get("offload_status_path") or ".local/state/offload/status.json")),
+        # free-space-guard's last run on this Mac (storage/free-space-guard).
+        "free_space_guard": _json(HOME / ".local/state/fleet/free-space-guard/status.json"),
         "icloud": _icloud(),
         # Full Disk Access and the trees diskmap leaves unmeasured without it (diskmap summary).
         "diskmap_access": _diskmap_access(),

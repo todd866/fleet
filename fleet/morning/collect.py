@@ -232,7 +232,7 @@ def _host_snapshot(name, raw, registry_host, config, health, now, registered=Non
             idrive = int(latest["observed_mtime"])
     if "idrive" in raw or name in (backups.get("idrive_hosts") or []) or idrive is not None or _has_kind(health_host, "idrive"):
         row["idrive"] = raw.get("idrive") if "idrive" in raw else (None if idrive is None else {"last_epoch": idrive})
-    for key in ("idrive_ingest", "home_mirror", "offload_queue", "placement", "diskmap_access"):
+    for key in ("idrive_ingest", "home_mirror", "offload_queue", "free_space_guard", "placement", "diskmap_access"):
         if isinstance(raw.get(key), dict) and raw[key]:
             row[key] = raw[key]
     if name in (backups.get("mirror_hosts") or []):

@@ -254,6 +254,8 @@ def _backups(name, host, config, now):
     if host.get("offload_queue") is not None:
         rows.append(_offload_queue(name, host["offload_queue"], now))
         rows.extend(_offload_autopilot(name, host["offload_queue"].get("autopilot"), now))
+    if isinstance(host.get("free_space_guard"), dict):
+        rows.append(_free_space_guard(name, host["free_space_guard"], now))
     if host.get("home_mirror") is not None:
         rows.append(_home_mirror(name, host["home_mirror"], cfg, now))
     if "drive_mirror_epoch" in host:
@@ -1295,6 +1297,37 @@ def _offload_autopilot(name, pilot, now):
                      "the Bin is emptied, and agents never empty it. `empty-bin --verified-offloads` proves each item "
                      "against its verified manifest and deletes only those; everything else stays in the Bin."))
     return rows
+
+
+def _free_space_guard(name, status, now):
+    """One row per laptop: free space against its floor and target, and what the guard freed today.
+    Below the target with the guard running is its normal work (pass); below the floor after every step is a failure
+    that names the top growers; a guard that has not run for 3 hours is a warning."""
+    gb = lambda value: float(value or 0) / 1e9
+    key, title = f"storage:{name}:free", f"{name} free space"
+    age = now - int(status.get("checked_at") or 0)
+    if status.get("state") == "unconfigured":
+        return _row(key, "warn", "disk", title, "no targets", "free-space-guard", str(status.get("note") or ""))
+    free, floor, target = gb(status.get("free_bytes")), float(status.get("floor_gb") or 0), float(status.get("target_gb") or 0)
+    freed = gb(status.get("freed_today_bytes"))
+    value = f"{free:.0f} GB free"
+    datum = f"floor {floor:.0f}, target {target:.0f}; guard freed {freed:.1f} GB today"
+    detail = f"{name} free {free:.0f} GB (floor {floor:.0f}, target {target:.0f}); guard freed {freed:.1f} GB today."
+    pilot = status.get("autopilot") or {}
+    if pilot.get("bin_bytes"):
+        detail += f" The Bin holds {gb(pilot['bin_bytes']):.0f} GB of verified offloads (owner's empty-bin frees it)."
+    if status.get("deferred"):
+        detail += f" Deferred: {status['deferred']}."
+    level = "pass"
+    if status.get("state") == "below-floor":
+        level = "fail"
+        grew = "; ".join(f"{g.get('path')} +{gb(g.get('grew_bytes')):.0f} GB" for g in (status.get("growers") or [])[:5])
+        detail += (" Still under the floor after caches, writers and the autopilot. Top growers since "
+                   f"{(status.get('growers') or [{}])[0].get('since', '?')}: {grew or 'diskmap has no history'}.")
+    if age > 3 * 3600 or age < -300:
+        level = "warn" if level == "pass" else level
+        value, detail = "stale", f"guard last ran {age / 3600:.0f} h ago. " + detail
+    return _row(key, level, "disk", title, value, datum, detail)
 
 
 def _ai_usage(summary, now):

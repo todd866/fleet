@@ -156,6 +156,119 @@ class Due(unittest.TestCase):
         self.assertFalse(M.due(self.NOW,dict(success,epoch=self.NOW-1000),0,"second",start,True))
 
 
+class PartialSuccess(unittest.TestCase):
+    """19 Nov 2026: a laptop's only backup finished as "Success*" (380,088 of 380,093 files already in
+    IDrive; 4 over-long Apple News cache names and a Chrome "Icon\\r" failed). The tick could not read
+    the status, wrote no receipt, and moved the queue on as though the run had vanished."""
+    LOG = ("[ERROR REPORT]\n--------------\n"
+           "[Wed Nov 18 23:08:08 2026] [FAILED] [/backup/V/lap2/Library/Containers/com.apple.news/Data/Library/Caches/News/"
+           "CachedImages/:P:1:Aex:imgfile-(253.0)-Optional(radius=10.0, corners=[topLeft, topRight], continuous=true)-nil--<request-data>]"
+           " Reason : file name too long.\n"
+           "[Wed Nov 18 23:08:08 2026] [FAILED] [/backup/V/lap2/Applications/Chrome Apps.localized/Icon\r]\n\n\n"
+           "[SUMMARY:] \n---------\nFiles considered for backup : 10\n"
+           "Files backed up now : 0 [Added(0) / modified(0)] [Size of backed up files: 0 bytes]\n"
+           "Files already present in your account : 8\nFiles failed to backup : 2\n")
+    ACCEPT = [r"/Library/Containers/com\.apple\.news/Data/Library/Caches/", r"/Icon\r$"]
+
+    def rows(self):
+        return M.parse_runs(["1795042762_Success*_Manual"], {"1795042762_Success*_Manual": self.LOG}.get)
+
+    def test_partial_success_is_read_with_its_failed_files(self):
+        row = self.rows()[0]
+        self.assertEqual((row["status"], row["failed"], row["present"]), ("Success*", 2, 8))
+        self.assertTrue(row["failures"][0]["path"].endswith("<request-data>"))
+        self.assertEqual(row["failures"][0]["reason"], "file name too long.")
+        self.assertEqual(row["failures"][1]["path"], "/backup/V/lap2/Applications/Chrome Apps.localized/Icon\r")
+
+    def test_accepted_only_when_every_failure_matches(self):
+        row = self.rows()[0]
+        ok = M.accepted(row, self.ACCEPT)
+        self.assertEqual((ok["status"], ok["failed"], len(ok["accepted_failures"])), ("Success", 0, 2))
+        self.assertIsNone(M.accepted(row, self.ACCEPT[:1]))      # the Icon file is not covered
+        self.assertIsNone(M.accepted(row, []))                    # nothing accepted by default
+        self.assertIsNone(M.accepted(dict(row, failed=3), self.ACCEPT))  # a failure the log did not name
+
+    def test_accepted_failures_complete_the_file_count(self):
+        import tempfile, json
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); (root / 'data/lap2').mkdir(parents=True); state = root / 'state'; state.mkdir()
+            base = cfg(sources=[{'name': 'A', 'path': str(root / 'data')}],
+                       priority_batches=[{'name': 'lap2', 'paths': [str(root / 'data/lap2')]}])
+            phase = M.priority_config(base, base['priority_batches'][0]); sources = M.plan(phase)
+            signature = M.spec_hash(phase, sources)
+            start = {'at': 100, 'spec': signature, 'sources': [sources[0]['name']],
+                     'source_paths': {sources[0]['name']: {'path': sources[0]['path'], 'masks': []}}}
+            success = M.accepted(self.rows()[0], self.ACCEPT); success['epoch'] = 110
+            observed = {'running': False, 'last_start': start, 'last_success': success, 'last': success, 'spec': signature}
+            (state / 'cycle.json').write_text(json.dumps({'phase': 'lap2', 'phase_config': phase, 'receipts': {}}))
+            with patch.object(M, 'STATE', state), patch.object(M.time, 'time', return_value=100000), \
+                    patch.object(M, 'tick', side_effect=[observed, {'running': True}]), \
+                    patch.object(M, 'exec_', return_value=(0, '10', '')):
+                result = M.cycle(base)
+            receipt = result['cycle']['receipts']['lap2']
+            self.assertEqual(len(receipt['success']['accepted_failures']), 2)
+            self.assertEqual(result['cycle']['phase'], 'bulk')
+
+
+class RequestOrder(unittest.TestCase):
+    ROOT = Path('/srv/vault')
+
+    def base(self, **extra):
+        return cfg(sources=[{'name': 'V', 'path': str(self.ROOT)}],
+                   priority_batches=[{'name': 'all', 'paths': [str(self.ROOT)]}],
+                   scope_verified_requests=True, **extra)
+
+    def requests(self):
+        r = self.ROOT
+        return {str(r / 'laptop-backup'): 100, str(r / 'hub-data'): 100, str(r / 'lap2-backup/IGT'): 200}
+
+    def test_oldest_request_first_by_default(self):
+        c = self.base(); c['_priority_requests'] = self.requests()
+        _name, scoped = M.cycle_choice(c, {'receipts': {}}, 1000)
+        self.assertEqual(scoped['sources'][0]['path'], str(self.ROOT / 'laptop-backup'))
+
+    def test_request_order_puts_the_only_copy_first(self):
+        c = self.base(request_order=[str(self.ROOT / 'lap2-backup')]); c['_priority_requests'] = self.requests()
+        _name, scoped = M.cycle_choice(c, {'receipts': {}}, 1000)
+        self.assertEqual(scoped['sources'][0]['path'], str(self.ROOT / 'lap2-backup/IGT'))
+
+    def test_scope_set_aside_lets_the_next_one_run_until_requested_again(self):
+        c = self.base(request_order=[str(self.ROOT / 'lap2-backup')]); c['_priority_requests'] = self.requests()
+        lap2_id = 'verified-offload-' + M.hashlib.sha256(str(self.ROOT / 'lap2-backup/IGT').encode()).hexdigest()[:16]
+        ledger = {'receipts': {}, 'gave_up': {lap2_id: 500}}
+        self.assertEqual(M.cycle_choice(c, ledger, 1000)[1]['sources'][0]['path'], str(self.ROOT / 'laptop-backup'))
+        c['_priority_requests'][str(self.ROOT / 'lap2-backup/IGT')] = 600   # verified again after setting aside
+        self.assertEqual(M.cycle_choice(c, ledger, 1000)[0], lap2_id)
+        c['_priority_requests'][str(self.ROOT / 'lap2-backup/IGT')] = 200
+        self.assertEqual(M.cycle_choice(c, ledger, 500 + M.GIVE_UP_FOR_S)[0], lap2_id)  # a day later it is tried again
+
+
+class Retry(unittest.TestCase):
+    def test_priority_run_without_receipt_is_retried_then_set_aside(self):
+        import tempfile, json
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); (root / 'data/lap2').mkdir(parents=True); state = root / 'state'; state.mkdir()
+            base = cfg(sources=[{'name': 'A', 'path': str(root / 'data')}],
+                       priority_batches=[{'name': 'lap2', 'paths': [str(root / 'data/lap2')]}])
+            phase = M.priority_config(base, base['priority_batches'][0]); sources = M.plan(phase)
+            signature = M.spec_hash(phase, sources)
+            (state / 'cycle.json').write_text(json.dumps({'phase': 'lap2', 'phase_config': phase, 'receipts': {}}))
+            phases = []
+            for at in (100, 5000, 9000):
+                start = {'at': at, 'spec': signature, 'sources': [sources[0]['name']],
+                         'source_paths': {sources[0]['name']: {'path': sources[0]['path'], 'masks': []}}}
+                last = {'epoch': at + 10, 'status': 'Failure', 'failed': 1}
+                observed = {'running': False, 'last_start': start, 'last_success': None, 'last': last, 'spec': signature}
+                with patch.object(M, 'STATE', state), patch.object(M.time, 'time', return_value=at + 60), \
+                        patch.object(M, 'tick', side_effect=[observed, {'running': True}]):
+                    result = M.cycle(base)
+                phases.append(result['cycle']['phase'])
+            self.assertEqual(phases, ['lap2', 'lap2', 'bulk'])
+            self.assertTrue(any('set aside' in p for p in result['problems']))
+
+
 if __name__ == "__main__":
     unittest.main()
 

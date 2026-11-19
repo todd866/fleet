@@ -63,7 +63,10 @@ LOGFILE = f"{CLIENT}/idriveIt/manual-backup.log"
 LOG_MAX = 50 * 1024 * 1024   # the client redraws its progress screen; a multi-day run would fill the disk
 INSTALLER = "https://www.idrivedownloads.com/downloads/linux/download-for-linux/linux-bin/idriveforlinux.bin"
 DEFAULT_MASKS = [".Spotlight-V100", ".fseventsd", ".Trashes", ".DocumentRevisions-V100", ".TemporaryItems"]
-LOG_NAME = re.compile(r"^(\d{9,11})_([A-Za-z]+)_([A-Za-z]+)$")
+LOG_NAME = re.compile(r"^(\d{9,11})_([A-Za-z]+\*?)_([A-Za-z]+)$")  # "Success*": done, some files failed
+# One failed file in the log's ERROR REPORT. A path can hold "]" (Apple News cache names do), so the
+# closing bracket is the one followed by " Reason : " or by the end of the entry.
+FAILED_FILE = re.compile(r"\[FAILED\] \[(/.*?)\](?= Reason : |[ \t]*(?:\r?\n|$))(?: Reason : ([^\n]*))?", re.S)
 COUNTS = {
     "considered": r"Files considered for backup\s*:\s*(\d+)",
     "backed_up": r"Files backed up now\s*:\s*(\d+)",
@@ -215,9 +218,28 @@ def parse_runs(listing, read_log):
         size = re.search(r"Size of backed up files:\s*([^\]]+)\]", text)
         if size:
             row["size"] = size.group(1).strip()
+        if row["status"].endswith("*"):
+            row["failures"] = [{"path": f.group(1), "reason": (f.group(2) or "").strip()}
+                               for f in FAILED_FILE.finditer(text)][:200]
     for row in rows:
         row.pop("log", None)
     return rows
+
+
+def accepted(row, patterns):
+    """A finished run as a success, or None. "Success*" counts only when the log names every failed
+    file and each matches a configured `accept_failed` pattern (files IDrive cannot store, such as
+    over-long cache names); the run then reads as a success that lists what it left out."""
+    if not row:
+        return None
+    if row["status"] == "Success":
+        return row
+    failures = row.get("failures") or []
+    if (row["status"] != "Success*" or not patterns or not row.get("failed")
+            or len(failures) != row["failed"]
+            or not all(any(re.search(p, f["path"]) for p in patterns) for f in failures)):
+        return None
+    return dict(row, status="Success", reported_status="Success*", failed=0, accepted_failures=failures)
 
 
 def parse_progress(tail):
@@ -425,7 +447,7 @@ def tick(cfg, dry=False):
         problems.append("no backup set (client not signed in?)")
     history = [r for r in (history or []) if r["epoch"] >= int(cfg.get("count_from") or 0)]
     last = history[0] if history else None
-    success = next((r for r in history if r["status"] == "Success"), None)
+    success = next((ok for ok in (accepted(r, cfg.get("accept_failed")) for r in history) if ok), None)
     started_at = previous.get("started_at")
     last_start = previous.get("last_start") or {}
     held = holds(previous.get("held"), success, last_start)
@@ -598,6 +620,16 @@ def request_roots(cfg):
     return roots
 
 
+GIVE_UP_AFTER = 3        # runs of one priority scope that end without a receipt before it is set aside
+GIVE_UP_FOR_S = 24 * 3600  # how long it stays aside (a new verification request brings it back at once)
+
+
+def set_aside(ledger, name, requested, now):
+    """A scope that kept ending without a receipt waits, so it cannot hold the queue for ever."""
+    at = int((ledger.get('gave_up') or {}).get(name) or 0)
+    return bool(at and now - at < GIVE_UP_FOR_S and requested <= at)
+
+
 def cycle_choice(cfg, ledger, now):
     # New verified folders get their own completion receipt, rather than waiting
     # for an entire archive drive to finish. Exact configured batches keep their
@@ -606,12 +638,21 @@ def cycle_choice(cfg, ledger, now):
         batches = cfg.get('priority_batches', [])
         roots = request_roots(cfg)
         exact = {expand(b['paths'][0]).rstrip('/') for b in batches if len(b['paths']) == 1}
-        for path, stamp in sorted(cfg.get('_priority_requests', {}).items(), key=lambda item: int(item[1])):
+        # Oldest verification first, except that `request_order` (path prefixes) goes ahead of it:
+        # a folder with no other copy (19 Nov 2026: a laptop's only backup) before ones still held elsewhere.
+        order = [expand(p).rstrip('/') for p in cfg.get('request_order', [])]
+        def rank(item):
+            path, stamp = item
+            hits = [i for i, p in enumerate(order) if path == p or path.startswith(p + '/')]
+            return (hits[0] if hits else len(order), int(stamp))
+        for path, stamp in sorted(cfg.get('_priority_requests', {}).items(), key=rank):
             if path in exact or not any(path == root or path.startswith(root + '/') for root in roots):
                 continue
             if int(stamp) <= 0 or int(stamp) > now + 120:
                 continue
             name = 'verified-offload-' + hashlib.sha256(path.encode()).hexdigest()[:16]
+            if set_aside(ledger, name, int(stamp), now):
+                continue
             receipt = ledger.get('receipts', {}).get(name, {})
             if (receipt.get('completed_at') and receipt.get('paths') == [path]
                     and int((receipt.get('start') or {}).get('at') or 0) >= int(stamp)):
@@ -626,6 +667,8 @@ def cycle_choice(cfg, ledger, now):
                          if any(path == expand(root).rstrip('/') or path.startswith(expand(root).rstrip('/') + '/')
                                 for root in batch['paths'])] or [0])
         expected_paths = sorted(expand(p).rstrip('/') for p in batch['paths'])
+        if set_aside(ledger, batch['name'], requested, now):
+            continue
         if (not completed or sorted(receipt.get('paths', [])) != expected_paths
                 or now - completed >= float(batch.get('every_h', 24)) * 3600
                 or requested > int((receipt.get('start') or {}).get('at') or 0)):
@@ -668,7 +711,8 @@ def cycle(cfg, dry=False):
         count = int(output.strip()) if rc == 0 and output.strip().isdigit() else None
         audit = {'counted_for': success.get('epoch'), 'files_on_disk': count,
                  'considered': success.get('considered')}
-        accounted = (success.get('backed_up', -1) + success.get('present', -1))
+        accounted = (success.get('backed_up', -1) + success.get('present', -1)
+                     + len(success.get('accepted_failures') or []))
         if count is not None and count == success.get('considered') == accounted and not observed.get('problems'):
             audit['gap'] = 0
             ledger.setdefault('receipts', {})[phase] = {
@@ -676,6 +720,26 @@ def cycle(cfg, dry=False):
                 'paths': [r['path'] for r in start['source_paths'].values()]}
         else:
             cycle_problems.append('completed scope file-count verification failed; no completion receipt')
+    # A priority run that ended without a receipt (failed, cancelled, or files IDrive would not take)
+    # is retried, not skipped: its scope stays first in the order. After GIVE_UP_AFTER such runs it is
+    # set aside for a day with a problem that names what failed, so it cannot block the queue.
+    last = observed.get('last') or {}
+    receipt = ledger.get('receipts', {}).get(phase, {})
+    attempts = ledger.setdefault('attempts', {})
+    if receipt and int((receipt.get('start') or {}).get('at') or 0) >= int(start.get('at') or 0) > 0:
+        attempts.pop(phase, None)
+    elif (phase != 'bulk' and not observed.get('running') and start.get('spec') == phase_spec
+            and int(start.get('at') or 0) > 0 and int(last.get('epoch') or 0) >= int(start['at']) - 120):
+        tried = attempts.setdefault(phase, [])
+        if int(start['at']) not in tried:
+            tried.append(int(start['at']))
+        if len(tried) >= GIVE_UP_AFTER:
+            failed = ', '.join(f['path'] for f in (last.get('failures') or [])[:5])
+            cycle_problems.append(f"priority scope {phase} ended {len(tried)} times without a receipt "
+                                  f"(last: {last.get('status')}, {last.get('failed')} failed{': ' + failed if failed else ''}); "
+                                  f"set aside for {GIVE_UP_FOR_S // 3600} h")
+            ledger.setdefault('gave_up', {})[phase] = now
+            attempts.pop(phase, None)
     wanted, next_cfg = cycle_choice(cfg, ledger, now)
     if observed.get('running'):
         if phase == 'bulk' and wanted != 'bulk' and cfg.get('preempt_bulk_for_priority'):
