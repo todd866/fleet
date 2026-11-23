@@ -1,0 +1,13 @@
+{
+  "bind": "127.0.0.1",
+  "port": 8694,
+  "public_base": "https://hub.example.ts.net:8444",
+  "token_file": "~/.config/fleet/fleet-api-token",
+  "ota_dir": "~/.local/state/fleet-api/ota",
+  "audit_log": "~/.local/state/fleet-api/actions.jsonl",
+  "bundle_id": "org.example.fleet",
+  "app_title": "Fleet",
+  "evidence_dir": "~/.local/state/fleet/evidence",
+  "read_rate_limit_per_min": 60,
+  "write_rate_limit_per_min": 20
+}

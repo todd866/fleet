@@ -1,0 +1,8 @@
+// Public defaults; override locally in ~/.config/fleet/ios-private.xcconfig
+DEVELOPMENT_TEAM =
+FLEET_BUNDLE_ID = org.example.fleet
+FLEET_WIDGET_BUNDLE_ID = org.example.fleet.widgets
+FLEET_APP_GROUP = group.org.example.fleet
+FLEET_DEFAULT_SERVER = https:/$()/hub.example.ts.net:8444
+
+#include? "../../../../.config/fleet/ios-private.xcconfig"

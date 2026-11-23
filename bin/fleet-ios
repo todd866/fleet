@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""Build, test, archive, OTA-publish, pair, and device-install the Fleet iOS app."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import plistlib
+import shutil
+import subprocess
+import tempfile
+import urllib.parse
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+IOS_DIR = ROOT / "ios"
+PROJECT_YML = IOS_DIR / "project.yml"
+XCODEPROJ = IOS_DIR / "Fleet.xcodeproj"
+BUILD_DIR = IOS_DIR / "build"
+ARCHIVE_PATH = BUILD_DIR / "Fleet.xcarchive"
+EXPORT_DIR = BUILD_DIR / "export"
+IPA_PATH = BUILD_DIR / "Fleet.ipa"
+
+DEFAULT_CONFIG: dict[str, Any] = {
+    "hub_ssh": "hub",
+    "hub_url": "https://hub.example.ts.net:8444",
+    "ota_dir": "~/.local/state/fleet-api/ota",
+    "device_id": "",
+    "team_id": "",
+    "bundle_id": "org.example.fleet",
+    "widget_bundle_id": "org.example.fleet.widgets",
+    "keychain_service": "fleet-api-token",
+    "asc_key_id": "",
+    "asc_key_path": "",
+    "asc_issuer_file": "",
+}
+
+
+def load_config(path: Path | None = None) -> dict[str, Any]:
+    cfg_path = path or Path(os.environ.get("FLEET_IOS_CONFIG") or "~/.config/fleet/ios-config.json").expanduser()
+    cfg = dict(DEFAULT_CONFIG)
+    if cfg_path.is_file():
+        data = json.loads(cfg_path.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            cfg.update({k: v for k, v in data.items() if v is not None})
+    return cfg
+
+
+def _run(cmd: list[str], *, env: dict[str, str] | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
+    print("+", " ".join(cmd), flush=True)
+    return subprocess.run(cmd, env=env, text=True, check=check)
+
+
+def cmd_generate(_cfg: dict[str, Any], _args: argparse.Namespace) -> int:
+    _run(["xcodegen", "generate", "--spec", str(PROJECT_YML), "--project", str(IOS_DIR)])
+    return 0
+
+
+def cmd_test(cfg: dict[str, Any], args: argparse.Namespace) -> int:
+    cmd_generate(cfg, args)
+    _run([
+        "xcodebuild",
+        "-project", str(XCODEPROJ),
+        "-scheme", "Fleet",
+        "-destination", args.destination,
+        "test",
+    ])
+    _run([
+        "xcodebuild",
+        "-project", str(XCODEPROJ),
+        "-scheme", "FleetWidgets",
+        "-destination", "generic/platform=iOS Simulator",
+        "build",
+    ])
+    return 0
+
+
+def _asc_flags(cfg: dict[str, Any]) -> list[str]:
+    key_id = str(cfg.get("asc_key_id") or "").strip()
+    key_path = Path(str(cfg.get("asc_key_path") or "")).expanduser() if cfg.get("asc_key_path") else None
+    issuer_file = Path(str(cfg.get("asc_issuer_file") or "")).expanduser() if cfg.get("asc_issuer_file") else None
+    issuer_id = os.environ.get("ASC_ISSUER_ID", "").strip()
+    if not issuer_id and issuer_file and issuer_file.is_file():
+        issuer_id = issuer_file.read_text(encoding="utf-8").strip()
+    if key_id and key_path and key_path.is_file() and issuer_id:
+        return [
+            "-authenticationKeyPath", str(key_path),
+            "-authenticationKeyID", key_id,
+            "-authenticationKeyIssuerID", issuer_id,
+        ]
+    return []
+
+
+def _archive_fleet(cfg: dict[str, Any]) -> None:
+    BUILD_DIR.mkdir(parents=True, exist_ok=True)
+    if ARCHIVE_PATH.exists():
+        shutil.rmtree(ARCHIVE_PATH)
+    asc = _asc_flags(cfg)
+    base_cmd = [
+        "xcodebuild",
+        "-project", str(XCODEPROJ),
+        "-scheme", "Fleet",
+        "-configuration", "Release",
+        "-destination", "generic/platform=iOS",
+        "-archivePath", str(ARCHIVE_PATH),
+    ]
+    res = _run(base_cmd + ["-allowProvisioningUpdates"] + asc + ["archive"], check=False)
+    if res.returncode == 0:
+        return
+    print("Warning: full provisioning archive failed; retrying with cached wildcard profile (empty entitlements)...", flush=True)
+    if ARCHIVE_PATH.exists():
+        shutil.rmtree(ARCHIVE_PATH)
+    _run(base_cmd + ["CODE_SIGN_ENTITLEMENTS=", "archive"], check=True)
+
+
+def _export_or_package_ipa(cfg: dict[str, Any]) -> Path:
+    if EXPORT_DIR.exists():
+        shutil.rmtree(EXPORT_DIR)
+    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    if IPA_PATH.exists():
+        IPA_PATH.unlink()
+
+    team_id = str(cfg.get("team_id") or "").strip()
+    opts: dict[str, Any] = {
+        "method": "development",
+        "signingStyle": "automatic",
+        "compileBitcode": False,
+        "thinning": "<none>",
+    }
+    if team_id:
+        opts["teamID"] = team_id
+    opts_path = BUILD_DIR / "ExportOptions.plist"
+    with opts_path.open("wb") as fh:
+        plistlib.dump(opts, fh)
+
+    # Use system-only PATH so Homebrew rsync does not break IDEDistributionCreateIPAStep.
+    sys_env = dict(os.environ)
+    sys_env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
+    asc = _asc_flags(cfg)
+    res = _run(
+        [
+            "xcodebuild", "-exportArchive",
+            "-archivePath", str(ARCHIVE_PATH),
+            "-exportOptionsPlist", str(opts_path),
+            "-exportPath", str(EXPORT_DIR),
+        ] + asc,
+        env=sys_env,
+        check=False,
+    )
+    exported_ipas = list(EXPORT_DIR.glob("*.ipa"))
+    if res.returncode == 0 and exported_ipas:
+        shutil.copy2(exported_ipas[0], IPA_PATH)
+        print(f"Exported IPA via xcodebuild -exportArchive -> {IPA_PATH}", flush=True)
+        return IPA_PATH
+
+    app_dir = ARCHIVE_PATH / "Products" / "Applications" / "Fleet.app"
+    if not app_dir.is_dir():
+        raise RuntimeError(f"Expected Fleet.app at {app_dir} but it does not exist")
+    print("Warning: xcodebuild -exportArchive failed; packaging signed xcarchive Fleet.app via ditto Payload fallback...", flush=True)
+    with tempfile.TemporaryDirectory(prefix="fleet-ipa-") as tmp:
+        payload = Path(tmp) / "Payload"
+        payload.mkdir()
+        _run(["/usr/bin/ditto", str(app_dir), str(payload / "Fleet.app")], check=True)
+        _run(["/usr/bin/ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", str(payload), str(IPA_PATH)], check=True)
+    print(f"Packaged IPA via Payload fallback -> {IPA_PATH} ({IPA_PATH.stat().st_size} bytes)", flush=True)
+    return IPA_PATH
+
+
+def cmd_publish_ipa(cfg: dict[str, Any], args: argparse.Namespace) -> int:
+    cmd_generate(cfg, args)
+    _archive_fleet(cfg)
+    ipa = _export_or_package_ipa(cfg)
+    if args.no_upload:
+        print(f"Built {ipa} (upload skipped)")
+        return 0
+    hub_ssh = str(cfg.get("hub_ssh") or "").strip()
+    ota_dir = str(cfg.get("ota_dir") or "~/.local/state/fleet-api/ota").rstrip("/")
+    if not hub_ssh or hub_ssh == "hub":
+        raise RuntimeError("Set hub_ssh in ~/.config/fleet/ios-config.json before uploading OTA")
+    _run(["ssh", hub_ssh, f"mkdir -p {ota_dir}"], check=True)
+    _run(["rsync", "-av", str(ipa), f"{hub_ssh}:{ota_dir}/Fleet.ipa.tmp"], check=True)
+    _run(["ssh", hub_ssh, f"mv -f {ota_dir}/Fleet.ipa.tmp {ota_dir}/Fleet.ipa"], check=True)
+    print(f"Published OTA IPA to {hub_ssh}:{ota_dir}/Fleet.ipa", flush=True)
+    return 0
+
+
+def cmd_install_device(cfg: dict[str, Any], args: argparse.Namespace) -> int:
+    device_id = str(args.device or cfg.get("device_id") or "").strip()
+    if not device_id:
+        raise RuntimeError("No target device UDID set (--device or device_id in ios-config.json)")
+    app_dir = ARCHIVE_PATH / "Products" / "Applications" / "Fleet.app"
+    if not app_dir.is_dir():
+        cmd_generate(cfg, args)
+        _archive_fleet(cfg)
+    _run(["xcrun", "devicectl", "device", "install", "app", "--device", device_id, str(app_dir)], check=True)
+    return 0
+
+
+def cmd_pair_url(cfg: dict[str, Any], _args: argparse.Namespace) -> int:
+    service = str(cfg.get("keychain_service") or "fleet-api-token")
+    hub_url = str(cfg.get("hub_url") or "").rstrip("/")
+    res = subprocess.run(
+        ["security", "find-generic-password", "-s", service, "-w"],
+        capture_output=True,
+        text=True,
+    )
+    if res.returncode != 0 or not res.stdout.strip():
+        raise RuntimeError(f"Could not read token from Keychain service {service!r}")
+    tok = res.stdout.strip()
+    pair = f"fleet://pair?url={urllib.parse.quote(hub_url, safe='')}&token={urllib.parse.quote(tok, safe='')}"
+    print(pair)
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description="Manage Fleet iOS builds, tests, OTA publishing, and device installs")
+    ap.add_argument("--config", type=Path, default=None)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("generate", help="Run xcodegen to generate ios/Fleet.xcodeproj")
+
+    p_test = sub.add_parser("test", help="Run Simulator unit tests and build widget extension")
+    p_test.add_argument("--destination", default="platform=iOS Simulator,name=iPhone Duo")
+
+    p_pub = sub.add_parser("publish-ipa", help="Archive Release IPA and rsync to hub OTA directory")
+    p_pub.add_argument("--no-upload", action="store_true")
+
+    p_inst = sub.add_parser("install-device", help="Install signed Fleet.app directly onto paired iPhone via devicectl")
+    p_inst.add_argument("--device", default=None)
+
+    sub.add_parser("pair-url", help="Print fleet://pair URL from local Keychain token")
+
+    args = ap.parse_args(argv)
+    cfg = load_config(args.config)
+    handlers = {
+        "generate": cmd_generate,
+        "test": cmd_test,
+        "publish-ipa": cmd_publish_ipa,
+        "install-device": cmd_install_device,
+        "pair-url": cmd_pair_url,
+    }
+    return handlers[args.cmd](cfg, args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
