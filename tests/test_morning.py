@@ -1355,6 +1355,34 @@ class ProbeJobsResilience(unittest.TestCase):
                 rows = probe._jobs()
             self.assertEqual([r["label"] for r in rows], ["com.example.good"])
 
+    def test_security_evidence_rows_and_staleness(self):
+        now = 1_800_000_000
+        self.assertEqual(evaluate({"hosts": {}}, {}, now), [])
+        fresh = {
+            "hosts": {},
+            "security_evidence": {
+                "version": 1,
+                "generated": now - 120,
+                "status": "pass",
+                "rows": [
+                    {"key": "sec:lap:integrity", "name": "lap chain", "status": "pass", "value": "intact", "datum": "12 links", "detail": ""},
+                    {"key": "sec:audit", "name": "daily audit", "status": "fail", "value": "missing", "datum": "", "detail": "no audit result"},
+                ],
+            },
+        }
+        rows = evaluate(fresh, {}, now)
+        by_key = {r.key: r for r in rows}
+        self.assertEqual(by_key["sec:lap:integrity"].status, "pass")
+        self.assertEqual(by_key["sec:lap:integrity"].area, "security")
+        self.assertEqual(by_key["sec:audit"].status, "fail")
+
+        stale = {"hosts": {}, "security_evidence": {"version": 1, "generated": now - 3 * 3600, "rows": []}}
+        stale_rows = evaluate(stale, {}, now)
+        self.assertEqual(len(stale_rows), 1)
+        self.assertEqual(stale_rows[0].key, "sec:verify")
+        self.assertEqual(stale_rows[0].status, "warn")
+        self.assertEqual(stale_rows[0].value, "stale")
+
 
 if __name__ == "__main__":
     unittest.main()

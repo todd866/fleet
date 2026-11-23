@@ -41,6 +41,7 @@ def collect(config, *, here, now, state=None, run=None, home=None, gather=None, 
     merged["capacity"] = _capacity(home, config, now, run)
     merged["board"] = _board(home, run)
     merged["agentkit"] = _agentkit(run)
+    merged["security_evidence"] = _security_evidence(merged.get("hosts") or {}, home, config)
     merged["upstream"] = _upstream(home)
     from fleet.ai_usage import read_summary
     merged["ai_usage"] = read_summary(home)
@@ -93,6 +94,9 @@ def collect_local(config, *, here, now, home, run=None, gather=None):
     health = _read_json(home / ".local" / "state" / "fleet" / "health.json") or {}
     registered = _registered_jobs(Path(config.get("registry") or home / ".local/state/mac-sync/registry"))
     reading = _host_snapshot(here, raw, registry.get(here) or {}, config, health, now, registered=registered)
+    sec = _security_evidence_local(home, config)
+    if sec is not None:
+        reading["security_evidence"] = sec
     return {
         "version": 1,
         "host": here,
@@ -100,6 +104,39 @@ def collect_local(config, *, here, now, home, run=None, gather=None):
         "reading": reading,
         "projects": _projects_here(config, home, here, reading, run, now),
     }
+
+
+def _security_evidence_local(home, config):
+    """Read the archive host's security-evidence check.json when present."""
+    raw_path = (config.get("security_evidence") or {}).get("check_path")
+    path = Path(str(raw_path)).expanduser() if raw_path else Path(home).parent / "evidence" / "archive" / "check.json"
+    if not path.is_file():
+        return None
+    doc = _read_json(path)
+    if isinstance(doc, dict) and isinstance(doc.get("rows"), list):
+        return doc
+    return {"status": "warn", "generated": int(path.stat().st_mtime), "rows": [], "error": "unreadable"}
+
+
+def _security_evidence(hosts, home, config):
+    best = None
+    best_gen = -1
+    candidates = []
+    local = _security_evidence_local(home, config)
+    if isinstance(local, dict):
+        candidates.append(local)
+    for host in (hosts or {}).values():
+        if isinstance(host, dict) and isinstance(host.get("security_evidence"), dict):
+            candidates.append(host["security_evidence"])
+    for doc in candidates:
+        try:
+            gen = int(doc.get("generated") or 0)
+        except (TypeError, ValueError):
+            gen = 0
+        if best is None or gen >= best_gen:
+            best = doc
+            best_gen = gen
+    return best
 
 
 def _default_gather():

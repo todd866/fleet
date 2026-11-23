@@ -14,7 +14,7 @@ RANK = {"pass": 0, "warn": 1, "fail": 2}
 # A sleeping laptop is info once its snapshot is older than 3 h. Warn only after 48 h.
 SNAPSHOT_INFO_S = 3 * 3600
 SNAPSHOT_WARN_S = 48 * 3600
-ORDER = ("host", "disk", "backup", "sync", "update", "job", "thermal", "capacity", "agent", "project", "check", "place", "cloud", "kit", "upstream")
+ORDER = ("host", "disk", "backup", "sync", "update", "job", "thermal", "capacity", "agent", "project", "check", "security", "place", "cloud", "kit", "upstream")
 REGISTERED = re.compile(r"^[0-9a-f]{64}$")
 # macOS volumes that live in the boot disk's container: the internal disk again, not another one.
 SYSTEM_VOLUMES = frozenset((
@@ -63,6 +63,7 @@ def evaluate(snapshot, config, now):
     rows.extend(_cloud(snapshot.get("cloud"), now))
     rows.extend(_coverage(snapshot.get("coverage"), now))
     rows.extend(_agentkit(snapshot.get("agentkit")))
+    rows.extend(_security_evidence(snapshot.get("security_evidence"), now))
     rows.extend(_job_reviews(snapshot.get("job_reviews"), now))
     rows.extend(_upstream(snapshot.get("upstream"), config, now))
     rows.extend(_unregistered_jobs(snapshot.get("hosts") or {}, registry))
@@ -1239,6 +1240,38 @@ def _coverage(coverage, now):
     if generated and now - generated <= 24 * 3600:
         return [_row("coverage:evidence", "pass", "place", "coverage", "fresh", _hours((now - generated) / 3600), "coverage.json is under a day old")]
     return [_row("coverage:evidence", "warn", "place", "coverage", "stale", "over 24 h", "coverage.json missing or older than a day")]
+
+
+def _security_evidence(doc, now):
+    if not isinstance(doc, dict):
+        return []
+    try:
+        generated = int(doc.get("generated") or 0)
+    except (TypeError, ValueError):
+        generated = 0
+    if doc.get("error"):
+        return [_row("sec:verify", "warn", "security", "security evidence", "unread", "check.json", str(doc["error"]))]
+    age_s = max(0, now - generated) if generated else None
+    if age_s is not None and age_s > 2 * 3600:
+        age_label = f"{age_s // 3600} h"
+        return [_row(
+            "sec:verify", "warn", "security", "security evidence", "stale", age_label,
+            f"security evidence check.json is {age_label} old (verifier runs every 15 min)",
+        )]
+    rows = []
+    for item in doc.get("rows") or []:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key") or "sec:row")
+        status = str(item.get("status") or "warn")
+        if status not in ("pass", "warn", "fail"):
+            status = "warn"
+        name = str(item.get("name") or key)
+        value = str(item.get("value") or "")
+        datum = str(item.get("datum") or "")
+        detail = str(item.get("detail") or "")
+        rows.append(_row(key, status, "security", name, value, datum, detail))
+    return rows
 
 
 def _agentkit(kit):
