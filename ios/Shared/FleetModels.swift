@@ -273,11 +273,12 @@ public struct CapacityPool: Codable, Sendable, Hashable, Identifiable {
     public var freshness: String?
     public var paused: Bool?
     public var unavailable: Bool?
+    public var unavailableReason: String?
 
     public var id: String { "\(engine)-\(pool)" }
 
     enum CodingKeys: String, CodingKey {
-        case engine, pool, stale, freshness, paused, unavailable
+        case engine, pool, stale, freshness, paused, unavailable, unavailableReason
         case remainingPct = "remaining_pct"
         case jobsLeft = "jobs_left"
         case tokensLeft = "tokens_left"
@@ -294,7 +295,8 @@ public struct CapacityPool: Codable, Sendable, Hashable, Identifiable {
         stale: Bool? = nil,
         freshness: String? = nil,
         paused: Bool? = nil,
-        unavailable: Bool? = nil
+        unavailable: Bool? = nil,
+        unavailableReason: String? = nil
     ) {
         self.engine = engine
         self.pool = pool
@@ -306,6 +308,7 @@ public struct CapacityPool: Codable, Sendable, Hashable, Identifiable {
         self.freshness = freshness
         self.paused = paused
         self.unavailable = unavailable
+        self.unavailableReason = unavailableReason
     }
 
     public init(from decoder: Decoder) throws {
@@ -319,7 +322,15 @@ public struct CapacityPool: Codable, Sendable, Hashable, Identifiable {
         stale = try? c.decodeIfPresent(Bool.self, forKey: .stale)
         freshness = c.decodeFlexibleString(forKey: .freshness)
         paused = try? c.decodeIfPresent(Bool.self, forKey: .paused)
-        unavailable = try? c.decodeIfPresent(Bool.self, forKey: .unavailable)
+        unavailableReason = try? c.decodeIfPresent(String.self, forKey: .unavailableReason)
+        if let boolVal = try? c.decodeIfPresent(Bool.self, forKey: .unavailable) {
+            unavailable = boolVal
+        } else if let strVal = try? c.decodeIfPresent(String.self, forKey: .unavailable), !strVal.isEmpty {
+            unavailable = true
+            unavailableReason = unavailableReason ?? strVal
+        } else {
+            unavailable = nil
+        }
     }
 }
 
@@ -344,6 +355,16 @@ public struct CapacityResponse: Codable, Sendable, Hashable {
 
 // MARK: - Backups & Placement
 
+private struct IDriveStorageDict: Decodable {
+    let usedGB: Double?
+    let totalGB: Double?
+
+    enum CodingKeys: String, CodingKey {
+        case usedGB = "used_gb"
+        case totalGB = "total_gb"
+    }
+}
+
 public struct IDriveSummary: Codable, Sendable, Hashable {
     public var checkedAt: Int?
     public var hostVM: String?
@@ -366,6 +387,73 @@ public struct IDriveSummary: Codable, Sendable, Hashable {
         case totalBytes = "total_bytes"
         case lastSuccessEpoch = "last_success_epoch"
         case lastSuccessStatus = "last_success_status"
+    }
+
+    public init(
+        checkedAt: Int? = nil,
+        hostVM: String? = nil,
+        container: String? = nil,
+        running: Bool? = nil,
+        appending: Bool? = nil,
+        percent: Double? = nil,
+        sentBytes: Int64? = nil,
+        totalBytes: Int64? = nil,
+        phase: String? = nil,
+        lastSuccessEpoch: Int? = nil,
+        lastSuccessStatus: String? = nil,
+        storage: String? = nil
+    ) {
+        self.checkedAt = checkedAt
+        self.hostVM = hostVM
+        self.container = container
+        self.running = running
+        self.appending = appending
+        self.percent = percent
+        self.sentBytes = sentBytes
+        self.totalBytes = totalBytes
+        self.phase = phase
+        self.lastSuccessEpoch = lastSuccessEpoch
+        self.lastSuccessStatus = lastSuccessStatus
+        self.storage = storage
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        checkedAt = c.decodeFlexibleInt(forKey: .checkedAt)
+        hostVM = c.decodeFlexibleString(forKey: .hostVM)
+        container = c.decodeFlexibleString(forKey: .container)
+        running = try? c.decodeIfPresent(Bool.self, forKey: .running)
+        appending = try? c.decodeIfPresent(Bool.self, forKey: .appending)
+        percent = c.decodeFlexibleDouble(forKey: .percent)
+        if let sent = try? c.decodeIfPresent(Int64.self, forKey: .sentBytes) {
+            sentBytes = sent
+        } else if let dbl = c.decodeFlexibleDouble(forKey: .sentBytes) {
+            sentBytes = Int64(dbl)
+        } else {
+            sentBytes = nil
+        }
+        if let total = try? c.decodeIfPresent(Int64.self, forKey: .totalBytes) {
+            totalBytes = total
+        } else if let dbl = c.decodeFlexibleDouble(forKey: .totalBytes) {
+            totalBytes = Int64(dbl)
+        } else {
+            totalBytes = nil
+        }
+        phase = c.decodeFlexibleString(forKey: .phase)
+        lastSuccessEpoch = c.decodeFlexibleInt(forKey: .lastSuccessEpoch)
+        lastSuccessStatus = c.decodeFlexibleString(forKey: .lastSuccessStatus)
+        if let str = try? c.decodeIfPresent(String.self, forKey: .storage) {
+            storage = str
+        } else if let dict = try? c.decodeIfPresent(IDriveStorageDict.self, forKey: .storage) {
+            let usedTxt = FleetFormatter.formatGB(dict.usedGB)
+            if let totalGB = dict.totalGB {
+                storage = "\(usedTxt) / \(FleetFormatter.formatGB(totalGB))"
+            } else {
+                storage = usedTxt
+            }
+        } else {
+            storage = nil
+        }
     }
 }
 
@@ -620,19 +708,78 @@ public struct AuditFinding: Codable, Sendable, Hashable, Identifiable {
     public var id: String { "\(level)|\(rule)|\(text)" }
 }
 
+private struct NamespaceAuditCountsDict: Decodable {
+    let runs: Int?
+    let securityRuns: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case runs
+        case securityRuns = "security_runs"
+    }
+}
+
 public struct NamespaceAudit: Codable, Sendable, Hashable {
     public var file: String?
     public var status: String?
-    public var counts: CountsSummary?
+    public var runs: Int?
+    public var securityRuns: Int?
     public var failCount: Int?
     public var warnCount: Int?
     public var topFindings: [AuditFinding]?
 
     enum CodingKeys: String, CodingKey {
-        case file, status, counts
+        case file, status, counts, runs, securityRuns
         case failCount = "fail_count"
         case warnCount = "warn_count"
         case topFindings = "top_findings"
+    }
+
+    public init(
+        file: String? = nil,
+        status: String? = nil,
+        runs: Int? = nil,
+        securityRuns: Int? = nil,
+        failCount: Int? = nil,
+        warnCount: Int? = nil,
+        topFindings: [AuditFinding]? = nil
+    ) {
+        self.file = file
+        self.status = status
+        self.runs = runs
+        self.securityRuns = securityRuns
+        self.failCount = failCount
+        self.warnCount = warnCount
+        self.topFindings = topFindings
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        file = c.decodeFlexibleString(forKey: .file)
+        status = c.decodeFlexibleString(forKey: .status)
+        if let directRuns = c.decodeFlexibleInt(forKey: .runs) {
+            runs = directRuns
+            securityRuns = c.decodeFlexibleInt(forKey: .securityRuns)
+        } else if let dict = try? c.decodeIfPresent(NamespaceAuditCountsDict.self, forKey: .counts) {
+            runs = dict.runs
+            securityRuns = dict.securityRuns
+        } else {
+            runs = nil
+            securityRuns = nil
+        }
+        failCount = c.decodeFlexibleInt(forKey: .failCount)
+        warnCount = c.decodeFlexibleInt(forKey: .warnCount)
+        topFindings = try? c.decodeIfPresent([AuditFinding].self, forKey: .topFindings)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encodeIfPresent(file, forKey: .file)
+        try c.encodeIfPresent(status, forKey: .status)
+        try c.encodeIfPresent(runs, forKey: .runs)
+        try c.encodeIfPresent(securityRuns, forKey: .securityRuns)
+        try c.encodeIfPresent(failCount, forKey: .failCount)
+        try c.encodeIfPresent(warnCount, forKey: .warnCount)
+        try c.encodeIfPresent(topFindings, forKey: .topFindings)
     }
 }
 
@@ -715,6 +862,36 @@ public struct CoworkClaim: Codable, Sendable, Hashable, Identifiable {
     public var note: String?
 
     public var id: String { "\(work)|\(host)|\(provider ?? "")" }
+
+    enum CodingKeys: String, CodingKey {
+        case work, host, provider, heartbeat, expires, note
+    }
+
+    public init(
+        work: String,
+        host: String,
+        provider: String? = nil,
+        heartbeat: String? = nil,
+        expires: String? = nil,
+        note: String? = nil
+    ) {
+        self.work = work
+        self.host = host
+        self.provider = provider
+        self.heartbeat = heartbeat
+        self.expires = expires
+        self.note = note
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        work = (try? c.decode(String.self, forKey: .work)) ?? "unknown"
+        host = (try? c.decode(String.self, forKey: .host)) ?? "unknown"
+        provider = c.decodeFlexibleString(forKey: .provider)
+        heartbeat = c.decodeFlexibleString(forKey: .heartbeat)
+        expires = c.decodeFlexibleString(forKey: .expires)
+        note = c.decodeFlexibleString(forKey: .note)
+    }
 }
 
 public struct MailResponse: Codable, Sendable, Hashable {
@@ -837,8 +1014,32 @@ public enum FleetFormatter {
         return f2.date(from: raw)
     }
 
+    public static func parseTimestamp(_ raw: String?) -> Date? {
+        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
+            return nil
+        }
+        if let epoch = Double(trimmed), epoch > 1_000_000_000 {
+            return Date(timeIntervalSince1970: epoch)
+        }
+        if let iso = parseISO(trimmed) {
+            return iso
+        }
+        let localFmt = DateFormatter()
+        localFmt.locale = Locale(identifier: "en_US_POSIX")
+        localFmt.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        if let local = localFmt.date(from: trimmed) {
+            return local
+        }
+        return nil
+    }
+
     public static func relativeTime(fromISO iso: String?, now: Date = Date()) -> String {
         guard let date = parseISO(iso) else { return iso ?? "—" }
+        return formatDelta(seconds: Int(now.timeIntervalSince(date)))
+    }
+
+    public static func relativeTime(fromTimestamp raw: String?, now: Date = Date()) -> String {
+        guard let date = parseTimestamp(raw) else { return raw ?? "—" }
         return formatDelta(seconds: Int(now.timeIntervalSince(date)))
     }
 

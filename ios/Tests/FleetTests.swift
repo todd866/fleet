@@ -150,7 +150,13 @@ final class FleetTests: XCTestCase {
           "local_tripwire_open": 0,
           "namespace_audits": {
             "primary": {
-              "status": "pass",
+              "file": "2026-11-23.json",
+              "status": "fail",
+              "counts": {
+                "denies": {"secrets": 2},
+                "runs": 790,
+                "security_runs": 7142
+              },
               "fail_count": 0,
               "warn_count": 1,
               "top_findings": [
@@ -163,24 +169,77 @@ final class FleetTests: XCTestCase {
 
         let sec = try JSONDecoder().decode(SecurityResponse.self, from: secJSON)
         XCTAssertEqual(sec.localTripwireOpen, 0)
+        XCTAssertEqual(sec.namespaceAudits?["primary"]?.runs, 790)
         XCTAssertEqual(sec.namespaceAudits?["primary"]?.topFindings?.first?.rule, "silence")
 
         let mailJSON = """
         {
           "messages": [
-            {"id": "msg-1", "at": "2026-11-24T00:00:00Z", "from": "hub:storage", "to": "primary:fleet", "text": "Check drive floor"}
+            {"id": "msg-1", "at": "2026-11-24 07:01:05", "from": "hub", "project": "storage", "text": "Check drive floor"}
           ],
           "unread_by_host": {"hub": 0, "primary": 1},
           "claims": [
-            {"work": "fleet-ios", "host": "primary", "provider": "agy", "note": "Building SwiftUI app"}
+            {"work": "fleet-ios", "host": "primary", "provider": "agy", "heartbeat": 1795474914, "expires": 1795503714, "note": "Building SwiftUI app"}
           ]
         }
         """.data(using: .utf8)!
 
         let mail = try JSONDecoder().decode(MailResponse.self, from: mailJSON)
         XCTAssertEqual(mail.messages.first?.displayText, "Check drive floor")
+        XCTAssertEqual(mail.messages.first?.project, "storage")
         XCTAssertEqual(mail.unreadByHost?["primary"], 1)
         XCTAssertEqual(mail.claims.first?.work, "fleet-ios")
+        XCTAssertEqual(mail.claims.first?.heartbeat, "1795474914")
+    }
+
+    func testDecodeLiveShapedOverviewVariants() throws {
+        let json = """
+        {
+          "generated_at": 1795476680,
+          "date": "2026-11-24",
+          "counts": {"pass": 293, "warn": 40, "fail": 23},
+          "hosts": [],
+          "capacity": {
+            "paused": ["codex"],
+            "pools": [
+              {
+                "engine": "codex",
+                "pool": "codex:primary",
+                "remaining_pct": 0,
+                "paused": true,
+                "unavailable": "downgraded & paused"
+              }
+            ]
+          },
+          "backups": {
+            "idrive": {
+              "checked_at": 1795476352,
+              "host_vm": "Running",
+              "container": true,
+              "running": true,
+              "percent": 17.08,
+              "sent_bytes": 187235595029,
+              "total_bytes": 1095922268785,
+              "phase": "Running",
+              "storage": {"used_gb": 5203.48, "total_gb": 10000.0}
+            },
+            "placement_violations": 1
+          },
+          "security": {"status": "pass"},
+          "unread_mail": 4,
+          "active_claims": 1
+        }
+        """.data(using: .utf8)!
+
+        let ov = try JSONDecoder().decode(FleetOverviewResponse.self, from: json)
+        XCTAssertEqual(ov.capacity.pools.first?.unavailable, true)
+        XCTAssertEqual(ov.capacity.pools.first?.unavailableReason, "downgraded & paused")
+        XCTAssertEqual(ov.backups.idrive?.container, "true")
+        XCTAssertEqual(ov.backups.idrive?.storage, "5.20 TB / 10.00 TB")
+
+        let now = Date(timeIntervalSince1970: 1795476680)
+        XCTAssertEqual(FleetFormatter.relativeTime(fromTimestamp: "1795476620", now: now), "1m ago")
+        XCTAssertNotEqual(FleetFormatter.relativeTime(fromTimestamp: "2026-11-24 07:01:05", now: now), "2026-11-24 07:01:05")
     }
 
     func testPairingLinkValidation() throws {

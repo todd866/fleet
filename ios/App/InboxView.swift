@@ -140,7 +140,7 @@ struct InboxView: View {
                                 .foregroundStyle(.secondary)
                         }
                         if let hb = claim.heartbeat {
-                            Text("Heartbeat \(FleetFormatter.relativeTime(fromISO: hb))")
+                            Text("Heartbeat \(FleetFormatter.relativeTime(fromTimestamp: hb))")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                         }
@@ -161,12 +161,12 @@ struct InboxView: View {
                 ForEach(msgs, id: \.stableID) { msg in
                     VStack(alignment: .leading, spacing: 4) {
                         HStack {
-                            Text("\(msg.from ?? "agent") → \(msg.to ?? "fleet")")
+                            Text("\(msg.from ?? "agent") → \(msg.to ?? msg.project ?? "fleet")")
                                 .font(.caption.weight(.bold).monospaced())
                                 .foregroundStyle(FleetTheme.pass)
                             Spacer()
                             if let at = msg.at {
-                                Text(FleetFormatter.relativeTime(fromISO: at))
+                                Text(FleetFormatter.relativeTime(fromTimestamp: at))
                                     .font(.caption2)
                                     .foregroundStyle(.secondary)
                             }

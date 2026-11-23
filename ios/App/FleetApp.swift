@@ -110,25 +110,63 @@ final class FleetAppModel {
         isRefreshing = true
         defer { isRefreshing = false }
 
-        do {
-            async let overviewTask = client.fetchOverview()
-            async let morningTask = client.fetchMorning()
-            async let backupsTask = client.fetchBackups()
-            async let securityTask = client.fetchSecurity()
-            async let mailTask = client.fetchMail()
+        async let overviewRes = fetchResult { try await self.client.fetchOverview() }
+        async let morningRes = fetchResult { try await self.client.fetchMorning() }
+        async let backupsRes = fetchResult { try await self.client.fetchBackups() }
+        async let securityRes = fetchResult { try await self.client.fetchSecurity() }
+        async let mailRes = fetchResult { try await self.client.fetchMail() }
 
-            let (ov, mo, bk, sec, ml) = try await (overviewTask, morningTask, backupsTask, securityTask, mailTask)
-            self.overview = ov
-            self.morning = mo
-            self.backups = bk
-            self.security = sec
-            self.mail = ml
+        let (ov, mo, bk, sec, ml) = await (overviewRes, morningRes, backupsRes, securityRes, mailRes)
+        var failures: [String] = []
+
+        switch ov {
+        case .success(let val):
+            self.overview = val
+            FleetStore.shared.saveOverview(val)
+        case .failure(let err):
+            failures.append("Overview: \(err.localizedDescription)")
+        }
+
+        switch mo {
+        case .success(let val):
+            self.morning = val
+            FleetStore.shared.saveMorning(val)
+        case .failure(let err):
+            failures.append("Board: \(err.localizedDescription)")
+        }
+
+        switch bk {
+        case .success(let val):
+            self.backups = val
+        case .failure(let err):
+            failures.append("Backups: \(err.localizedDescription)")
+        }
+
+        switch sec {
+        case .success(let val):
+            self.security = val
+        case .failure(let err):
+            failures.append("Security: \(err.localizedDescription)")
+        }
+
+        switch ml {
+        case .success(let val):
+            self.mail = val
+        case .failure(let err):
+            failures.append("Mail: \(err.localizedDescription)")
+        }
+
+        if failures.count < 5 {
             self.lastRefreshDate = Date()
-            self.errorMessage = nil
-            FleetStore.shared.saveOverview(ov)
-            FleetStore.shared.saveMorning(mo)
+        }
+        self.errorMessage = failures.isEmpty ? nil : failures.joined(separator: "\n")
+    }
+
+    private func fetchResult<T: Sendable>(_ op: () async throws -> T) async -> Result<T, Error> {
+        do {
+            return .success(try await op())
         } catch {
-            self.errorMessage = error.localizedDescription
+            return .failure(error)
         }
     }
 

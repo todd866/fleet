@@ -419,9 +419,15 @@ private struct HostTelemetryCard: View {
                             StatusPill(label: "unmounted", color: FleetTheme.warn)
                         }
                         Spacer()
-                        Text("\(FleetFormatter.formatGB(drive.freeGB)) free / \(FleetFormatter.formatGB(drive.totalGB))")
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(.secondary)
+                        if let totalGB = drive.totalGB {
+                            Text("\(FleetFormatter.formatGB(drive.freeGB)) free / \(FleetFormatter.formatGB(totalGB))")
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                        } else {
+                            Text("\(FleetFormatter.formatGB(drive.freeGB)) free")
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                        }
                     }
                 }
             }
@@ -480,7 +486,10 @@ private struct CapacityPoolRow: View {
                 .tint(barColor)
 
             HStack {
-                if let jobs = pool.jobsLeft {
+                if let reason = pool.unavailableReason, !reason.isEmpty {
+                    Text(reason)
+                        .lineLimit(1)
+                } else if let jobs = pool.jobsLeft {
                     Text("~\(Int(jobs)) jobs left")
                 }
                 Spacer()
