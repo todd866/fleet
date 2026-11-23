@@ -22,6 +22,7 @@ pub const ALL_GUARD_NAMES: &[&str] = &[
     "approval-files",
     "idrive-cleanup",
     "secrets",
+    "guard-config",
 ];
 use fancy_regex::Regex;
 use serde_json::Value;
@@ -126,6 +127,7 @@ pub fn decide_value(name: &str, value: &Value, cfg: &GuardConfig) -> Decision {
             Some(path) => match name {
                 "slot-files" => slot_files_path(&path, cfg),
                 "approval-files" => approval_files_path(&path, cfg),
+                "guard-config" => guard_config_file(&path, value, cfg),
                 _ => Decision::allow(),
             },
             None => Decision::allow(),
@@ -147,32 +149,52 @@ pub fn decide_value(name: &str, value: &Value, cfg: &GuardConfig) -> Decision {
         "approval-files" => approval_files(&command, cfg),
         "idrive-cleanup" => idrive_cleanup(&command, cfg),
         "secrets" => secrets(&command, cfg),
+        "guard-config" => guard_config(&command, cfg),
         _ => Decision::allow(),
     }
 }
 
 /// The guards that judge a file-writing tool call. Every other guard reads shell commands only.
-const FILE_TOOL_GUARDS: &[&str] = &["slot-files", "approval-files"];
+const FILE_TOOL_GUARDS: &[&str] = &["slot-files", "approval-files", "guard-config"];
 
-/// The path a file-writing tool call (Claude `Write`, `Edit`, `MultiEdit`, `NotebookEdit`) names.
+fn tool_name_of(value: &Value) -> Option<&str> {
+    value
+        .get("tool_name")
+        .and_then(|t| t.as_str())
+        .or_else(|| value.get("toolCall").and_then(|tc| tc.get("name")).and_then(|t| t.as_str()))
+}
+
+fn tool_input_of(value: &Value) -> Option<&Value> {
+    value
+        .get("tool_input")
+        .or_else(|| value.get("toolCall").and_then(|tc| tc.get("args")))
+}
+
+/// The path a file-writing tool call (Claude `Write`/`Edit`/`MultiEdit`/`NotebookEdit`, Antigravity `write_to_file`/`write_file`/`replace_file_content`/`multi_replace_file_content`/`edit_file`) names.
 fn file_target(value: &Value) -> Option<String> {
-    let tool = value.get("tool_name").and_then(|t| t.as_str())?;
-    if !matches!(tool, "Write" | "Edit" | "MultiEdit" | "NotebookEdit") {
+    let tool = tool_name_of(value)?;
+    if !matches!(
+        tool,
+        "Write" | "Edit" | "MultiEdit" | "NotebookEdit"
+            | "write_to_file" | "write_file" | "replace_file_content" | "multi_replace_file_content" | "edit_file"
+    ) {
         return None;
     }
-    let input = value.get("tool_input")?;
+    let input = tool_input_of(value)?;
     input
         .get("file_path")
         .or_else(|| input.get("notebook_path"))
+        .or_else(|| input.get("TargetFile"))
+        .or_else(|| input.get("Path"))
         .and_then(|p| p.as_str())
         .filter(|p| !p.is_empty())
         .map(str::to_string)
 }
 
 fn is_shell(value: &Value) -> bool {
-    match value.get("tool_name").and_then(|t| t.as_str()) {
+    match tool_name_of(value) {
         None => true,
-        Some("Bash" | "Shell" | "shell" | "shell_command" | "local_shell" | "exec_command") => true,
+        Some("Bash" | "Shell" | "shell" | "shell_command" | "local_shell" | "exec_command" | "run_command") => true,
         Some(_) => false,
     }
 }
@@ -180,7 +202,24 @@ fn is_shell(value: &Value) -> bool {
 /// Relative targets use the tool call's `cwd` when the payload has one.
 /// Cursor user hooks are started in `~/.cursor`, which is not the shell's directory.
 fn call_dir(value: &Value, cfg: &GuardConfig) -> Option<GuardConfig> {
-    let raw = value.get("cwd").and_then(|c| c.as_str()).filter(|s| !s.is_empty())?;
+    let raw = value
+        .get("cwd")
+        .and_then(|c| c.as_str())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            tool_input_of(value)
+                .and_then(|i| i.get("Cwd"))
+                .and_then(|c| c.as_str())
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| {
+            value
+                .get("workspacePaths")
+                .and_then(|w| w.as_array())
+                .and_then(|a| a.first())
+                .and_then(|c| c.as_str())
+                .filter(|s| !s.is_empty())
+        })?;
     let mut local = cfg.clone();
     local.cwd = PathBuf::from(expand_path(raw, cfg));
     Some(local)
@@ -190,12 +229,23 @@ fn command_of(value: &Value) -> String {
     if let Some(s) = value.get("command").and_then(|c| c.as_str()) {
         return s.to_string();
     }
-    value
-        .get("tool_input")
-        .and_then(|t| t.get("command"))
+    tool_input_of(value)
+        .and_then(|t| t.get("command").or_else(|| t.get("CommandLine")))
         .and_then(|c| c.as_str())
         .unwrap_or("")
         .to_string()
+}
+
+pub fn format_agy(d: &Decision) -> String {
+    if d.is_allow() {
+        serde_json::json!({ "decision": "allow" }).to_string()
+    } else {
+        serde_json::json!({
+            "decision": d.decision,
+            "reason": format!("[agentkit:{}] {}", d.rule, d.reason),
+        })
+        .to_string()
+    }
 }
 
 pub fn format_neutral(d: &Decision) -> String {
@@ -306,13 +356,549 @@ const KEYWORDS: &[&str] = &[
     "then", "do", "else", "elif", "if", "while", "until", "!", "{", "}", "case", "in",
 ];
 
+const HARD_DELETE_REASON: &str = "Move it to the Trash with `trash <path>`. Hard deletes are allowed only inside /tmp, /private/tmp, /var/folders, $TMPDIR or a scratchpad directory.";
+
+/// Three readings of the line; any one denying denies. The first splits at every separator,
+/// quoted or not (so `echo 'x; rm -rf y'` is read as a delete). The second walks the commands
+/// the shell would run (`units_deep`): ssh past the first word, text a shell is handed,
+/// `rsync --delete`, every `find` root, a path moved into temp and deleted there. The third
+/// reads whole statements and refuses a program word it cannot read (`$(echo rm)`, `$X`).
+/// Until 21 Nov 2026 only the first existed, and those shapes were allowed.
 fn hard_delete(cmd: &str, cfg: &GuardConfig) -> Decision {
+    hard_delete_at(cmd, cfg, 0)
+}
+
+fn hard_delete_at(cmd: &str, cfg: &GuardConfig, depth: usize) -> Decision {
+    let d = hard_delete_legacy(cmd, cfg);
+    if d.is_deny() {
+        return d;
+    }
+    let text = neutralize_text_args(&strip_file_heredocs(cmd));
+    let mut air = AirCache::for_line(&text);
+    let d = hard_delete_units(&text, cfg, &mut air);
+    if d.is_deny() {
+        return d;
+    }
+    hard_delete_statements(&text, cfg, &mut air, depth)
+}
+
+/// `is_air` may run `ssh -G`; one answer per host per call. A host reached on this line with
+/// an option that can send the connection elsewhere (`-o HostName=…`, `-F`, `-J`, `-l`,
+/// `user@`), or whose remote text runs ssh again, is not the worker for this line: until
+/// 21 Nov 2026 `ssh -o HostName=other worker 'rm -rf ~/x'` matched the worker's alias.
+#[derive(Default)]
+struct AirCache {
+    known: std::collections::HashMap<String, bool>,
+    redirected: std::collections::HashSet<String>,
+}
+
+/// Does this ssh command line carry an option that can change where it connects?
+fn ssh_redirects(argv: &[String]) -> bool {
+    let Some((host, rest)) = ssh_parts_argv(argv) else { return true };
+    // Only options that cannot change where it connects keep the worker exemption:
+    // -t -T -q -v -4 -6 -C -n and -p PORT. Anything else (-o, -F, -J, -l, -i, -S, ...) loses it.
+    let opts_end = argv.iter().position(|a| *a == host).unwrap_or(argv.len());
+    let mut redirect_opt = false;
+    let mut i = 1;
+    while i < opts_end {
+        let a = argv[i].as_str();
+        i += 1;
+        if a == "-p" {
+            i += 1;
+            continue;
+        }
+        let Some(body) = a.strip_prefix('-') else { redirect_opt = true; break };
+        let port = body.strip_prefix('p').is_some_and(|v| !v.is_empty() && v.chars().all(|c| c.is_ascii_digit()));
+        if !port && (body.is_empty() || body.starts_with('-') || !body.chars().all(|c| "tTqv46Cn".contains(c))) {
+            redirect_opt = true;
+            break;
+        }
+    }
+    redirect_opt || host.contains('@') || rest.iter().any(|r| compiled(r"(?:^|[\s;&|(`'\x22])ssh\b").is_match(r))
+}
+
+impl AirCache {
+    fn for_line(cmd: &str) -> Self {
+        let mut cache = AirCache::default();
+        for u in units_deep(cmd) {
+            if u.prog() == "ssh" && !u.later && ssh_redirects(&u.argv) {
+                if let Some((host, _)) = ssh_parts_argv(&u.argv) {
+                    cache.redirected.insert(host.rsplit('@').next().unwrap_or(&host).to_string());
+                    cache.redirected.insert(host);
+                }
+            }
+        }
+        cache
+    }
+
+    fn is_air(&mut self, host: &str, cfg: &GuardConfig) -> bool {
+        let bare = host.rsplit('@').next().unwrap_or(host);
+        if self.redirected.contains(host) || self.redirected.contains(bare) {
+            return false;
+        }
+        if let Some(v) = self.known.get(host) {
+            return *v;
+        }
+        let v = cfg.is_air(host);
+        self.known.insert(host.to_string(), v);
+        v
+    }
+}
+
+fn hard_delete_deny(what: &str, host: Option<&str>) -> Decision {
+    let over = host.map(|h| format!(" (over ssh to {h})")).unwrap_or_default();
+    Decision::deny("hard-delete", format!("BLOCKED hard delete: {what}{over}. {HARD_DELETE_REASON}"))
+}
+
+/// Programs that run the words after them as a command (beyond the wrappers already stripped).
+const EXECUTORS: &[&str] = &[
+    "watch", "parallel", "flock", "chronic", "unbuffer", "doas", "chroot", "sg", "fd", "ssh-agent", "script",
+];
+
+fn deletes_with_find(argv: &[String]) -> bool {
+    argv.iter().any(|a| a == "-delete")
+        || argv.windows(2).any(|w| {
+            matches!(w[0].as_str(), "-exec" | "-execdir" | "-ok" | "-okdir") && DELETERS.contains(&base_name(&w[1]))
+        })
+}
+
+/// The start points of a `find`: the words before its first expression (after -H/-L/-P).
+fn find_roots(argv: &[String]) -> Vec<&str> {
+    let mut out = Vec::new();
+    for a in argv.iter().skip(1) {
+        if out.is_empty() && matches!(a.as_str(), "-H" | "-L" | "-P" | "-E" | "-X" | "-d" | "-s" | "-x") {
+            continue;
+        }
+        if a.starts_with('-') || a.starts_with('(') || a == "!" {
+            break;
+        }
+        out.push(a.as_str());
+    }
+    if out.is_empty() {
+        out.push(".");
+    }
+    out
+}
+
+/// `--delete`, `--del`, `--delete-after`, `--delete-excluded`, ... (not `--remove-source-files`,
+/// which removes from the source what was copied).
+fn rsync_deletes(argv: &[String]) -> bool {
+    argv.iter().skip(1).any(|a| a.starts_with("--del"))
+}
+
+/// The second reading: every command `units_deep` finds, judged by what it was read from.
+fn hard_delete_units(cmd: &str, cfg: &GuardConfig, air: &mut AirCache) -> Decision {
+    let all = units_deep(cmd);
+    if any_unparsed(&all) && compiled(r"\b(?:rm|rmdir|unlink|shred|srm)\b|-delete\b|--del").is_match(cmd) {
+        return hard_delete_deny("a delete on a line that cannot be read with certainty", None);
+    }
+    let mut launder: Option<String> = None;
+    let mut temp_delete = false;
+    for u in &all {
+        let remote = u.remote.as_deref();
+        if let Some(host) = remote
+            && air.is_air(host, cfg)
+        {
+            // The worker's own files: it may delete its build output. Only the remote text is
+            // exempt; a local `"$(...)"` around it has no remote and is judged here.
+            continue;
+        }
+        if u.carrier || u.argv.is_empty() {
+            continue;
+        }
+        // `git rm`, `docker rm`: a later word is a program only after a known executor.
+        if u.later && !EXECUTORS.contains(&u.parent.as_str()) {
+            continue;
+        }
+        let prog = u.prog();
+        let operands = u.operands();
+        if DELETERS.contains(&prog) {
+            if operands.is_empty() || !operands.iter().all(|t| is_temp(t, cfg)) {
+                return hard_delete_deny(&format!("`{prog}` on a non-temp path"), remote);
+            }
+            temp_delete = true;
+        } else if prog == "find" && deletes_with_find(&u.argv) {
+            if find_roots(&u.argv).iter().any(|r| !is_temp(r, cfg)) {
+                return hard_delete_deny("`find -delete` / `find -exec rm` outside a temp dir (every start point counts)", remote);
+            }
+            temp_delete = true;
+        } else if prog == "rsync" && rsync_deletes(&u.argv) {
+            // The destination is not always the last word (`... dest/ --exclude /tmp/x`), so
+            // every operand after the first must be temp or on the worker.
+            // `-e 'ssh -o HostName=…'` can send it to another host than the name says.
+            // rsync also takes its connection program from the environment.
+            let own_rsh = u.argv.iter().any(|a| a == "-e" || a.starts_with("--rsh") || (a.starts_with('-') && !a.starts_with("--") && a.contains('e')))
+                || ["RSYNC_RSH", "RSYNC_CONNECT_PROG", "RSYNC_PROXY"].iter().any(|n| cmd.contains(n) || u.wrappers.iter().any(|w| w.contains(n)));
+            let mut safe = |w: &str| match w.split_once(':') {
+                Some((host, path)) if !host.contains('/') && !host.is_empty() => {
+                    (!own_rsh && !host.contains('@') && air.is_air(host, cfg))
+                        || (path.starts_with('/') && is_temp(path, cfg))
+                }
+                _ => !w.is_empty() && is_temp(w, cfg),
+            };
+            let to_temp = operands.len() >= 2 && operands[1..].iter().all(|w| safe(w));
+            if !to_temp {
+                return hard_delete_deny(
+                    "`rsync --delete` removes from a non-temp destination whatever the source lacks",
+                    remote,
+                );
+            }
+            temp_delete = true;
+        } else if matches!(prog, "mv" | "ln") && !u.guessed && operands.len() >= 2 {
+            // Any temp operand beside a non-temp one: the destination may come first (`mv -t /tmp x`).
+            if operands.iter().any(|w| is_temp(w, cfg)) && operands.iter().any(|w| !is_temp(w, cfg)) {
+                launder = Some(prog.to_string());
+            }
+        }
+    }
+    if let (Some(prog), true) = (launder, temp_delete) {
+        return hard_delete_deny(
+            &format!("`{prog}` of a non-temp path into a temp dir on a line that deletes there"),
+            None,
+        );
+    }
+    Decision::allow()
+}
+
+/// One statement of a command line: its text and the separator in front of it.
+struct Statement {
+    text: String,
+    before: String,
+}
+
+/// Index just past the `)` that closes the substitution whose body starts at `i`.
+fn subst_end(b: &[u8], mut i: usize) -> usize {
+    let mut depth = 1usize;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 1,
+            b'\'' => {
+                i += 1;
+                while i < b.len() && b[i] != b'\'' {
+                    i += 1;
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    if b[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    b.len()
+}
+
+/// Splits a line into statements at top-level separators, keeping `$(...)`, `<(...)`,
+/// backticks, `${...}` and quotes inside the word they belong to, so `$(echo rm) -rf x` is one
+/// statement whose program word is `$(echo`. Also returns the bodies of command substitutions
+/// (not arithmetic), which the shell runs first.
+fn statements(cmd: &str) -> (Vec<Statement>, Vec<String>) {
+    let b = cmd.as_bytes();
+    let mut out = Vec::new();
+    let mut subs = Vec::new();
+    let (mut i, mut start) = (0usize, 0usize);
+    let mut before = String::new();
+    let mut in_double = false;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'\\' {
+            i += 2;
+            continue;
+        }
+        if c == b'\'' && !in_double {
+            i += 1;
+            while i < b.len() && b[i] != b'\'' {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'"' {
+            in_double = !in_double;
+            i += 1;
+            continue;
+        }
+        let rest = &b[i..];
+        if rest.starts_with(b"$((") {
+            i = subst_end(b, i + 3);
+            continue;
+        }
+        if rest.starts_with(b"$(") || (!in_double && (rest.starts_with(b"<(") || rest.starts_with(b">("))) {
+            let end = subst_end(b, i + 2);
+            let close = if end > i + 2 && b.get(end - 1) == Some(&b')') { end - 1 } else { end };
+            subs.push(cmd[i + 2..close.max(i + 2)].to_string());
+            i = end;
+            continue;
+        }
+        if rest.starts_with(b"${") {
+            while i < b.len() && b[i] != b'}' {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'`' {
+            let open = i + 1;
+            i += 1;
+            while i < b.len() && b[i] != b'`' {
+                if b[i] == b'\\' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            subs.push(cmd[open.min(b.len())..i.min(b.len())].to_string());
+            i += 1;
+            continue;
+        }
+        if in_double {
+            i += 1;
+            continue;
+        }
+        let len = if rest.starts_with(b"&&") || rest.starts_with(b"||") || rest.starts_with(b"|&") || rest.starts_with(b";;") {
+            2
+        } else if matches!(c, b';' | b'|' | b'\n' | b'(' | b')') {
+            1
+        } else if c == b'&' && !(i > 0 && matches!(b[i - 1], b'<' | b'>')) && b.get(i + 1) != Some(&b'>') {
+            1
+        } else {
+            0
+        };
+        if len == 0 {
+            i += 1;
+            continue;
+        }
+        out.push(Statement { text: cmd[start..i].to_string(), before: before.clone() });
+        before = cmd[i..i + len].to_string();
+        i += len;
+        start = i;
+    }
+    out.push(Statement { text: cmd[start.min(cmd.len())..].to_string(), before });
+    (out, subs)
+}
+
+/// The statement after its leading `NAME=value` words, each read as one shell word: quotes,
+/// `$(...)`, backticks and `${...}` in the value stay inside it.
+fn skip_assignments(text: &str) -> &str {
+    let mut rest = text.trim_start();
+    loop {
+        let b = rest.as_bytes();
+        let name_end = b.iter().position(|c| !(c.is_ascii_alphanumeric() || *c == b'_')).unwrap_or(b.len());
+        if name_end == 0 || b[0].is_ascii_digit() || b.get(name_end) != Some(&b'=') {
+            return rest;
+        }
+        let mut i = name_end + 1;
+        while i < b.len() && !b[i].is_ascii_whitespace() {
+            match b[i] {
+                b'\\' => i += 2,
+                b'\'' => {
+                    i += 1;
+                    while i < b.len() && b[i] != b'\'' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                b'"' => {
+                    i += 1;
+                    while i < b.len() && b[i] != b'"' {
+                        if b[i] == b'\\' {
+                            i += 1;
+                        } else if b[i..].starts_with(b"$(") {
+                            i = subst_end(b, i + 2);
+                            continue;
+                        }
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                b'`' => {
+                    i += 1;
+                    while i < b.len() && b[i] != b'`' {
+                        i += if b[i] == b'\\' { 2 } else { 1 };
+                    }
+                    i += 1;
+                }
+                b'$' if b.get(i + 1) == Some(&b'(') => i = subst_end(b, i + 2),
+                b'$' if b.get(i + 1) == Some(&b'{') => {
+                    while i < b.len() && b[i] != b'}' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+        }
+        rest = rest[i.min(rest.len())..].trim_start();
+    }
+}
+
+/// `NAME=value` on the line, literal values only (quotes removed).
+fn literal_assignments(cmd: &str) -> Vec<(String, String)> {
+    compiled(r#"(?:^|[\s;&|(])(?:export\s+|local\s+|declare\s+)?([A-Za-z_][A-Za-z0-9_]*)=('[^']*'|"[^"$`]*"|[^\s;&|()'"$`]*)(?=[\s;&|()]|$)"#)
+        .captures_iter(cmd)
+        .iter()
+        .filter_map(|c| {
+            let v = c.get(2)?.as_str();
+            Some((c.get(1)?.as_str().to_string(), v.trim_matches(|q| q == '\'' || q == '"').to_string()))
+        })
+        .collect()
+}
+
+/// A program word as the shell would see it, when the line alone tells.
+fn expand_program(word: &str, cfg: &GuardConfig, vars: &[(String, String)]) -> String {
+    let mut w = expand_vars(word, cfg);
+    for (name, value) in vars {
+        w = w.replace(&format!("${{{name}}}"), value).replace(&format!("${name}"), value);
+    }
+    w
+}
+
+/// The third reading: whole statements, not split at `$(`. A program word the guard cannot
+/// read (`$(echo rm)`, `$X`, `{rm,-rf,x}`, a glob) is refused, since it may be `rm`; a variable
+/// assigned a literal on the same line is substituted and the statement judged again. Text a
+/// shell reads on stdin (`echo ... | sh`, `sh <<< ...`) is judged as a command line.
+fn hard_delete_statements(cmd: &str, cfg: &GuardConfig, air: &mut AirCache, depth: usize) -> Decision {
+    if depth > MAX_UNIT_DEPTH {
+        return Decision::allow();
+    }
+    let (flat, docs) = split_heredocs(cmd);
+    for doc in &docs {
+        if heredoc_is_data(&doc.head, &doc.tail) {
+            continue;
+        }
+        let mut head = Vec::new();
+        collect_units(&doc.head, None, &[], 0, &Walk { deep: false, sole: false, strict: false }, &mut head);
+        let to_shell = head.iter().any(|u| SHELLS.contains(&u.prog()));
+        let to_remote = head
+            .iter()
+            .find_map(|u| if u.prog() == "ssh" { ssh_parts_argv(&u.argv).map(|(h, _)| h) } else { None });
+        if to_shell || to_remote.as_deref().is_some_and(|h| !air.is_air(h, cfg)) {
+            let d = hard_delete_statements(&doc.body, cfg, air, depth + 1);
+            if d.is_deny() {
+                return d;
+            }
+        }
+    }
+    let vars = literal_assignments(&flat);
+    let case_line = compiled(r"(?:^|[\s;&|(])case\s").is_match(&flat);
+    let (stmts, subs) = statements(&flat);
+    for body in &subs {
+        let d = hard_delete_statements(body, cfg, air, depth + 1);
+        if d.is_deny() {
+            return d;
+        }
+    }
+    // The earlier stages of the current pipeline: `echo ... | cat | sh` feeds sh from echo.
+    let mut pipeline: Vec<Vec<String>> = Vec::new();
+    for st in &stmts {
+        let whole = st.text.trim();
+        let first_raw = whole.split_whitespace().next().unwrap_or("").to_string();
+        // Leading `NAME=value` words are dropped as whole shell words first: shlex would split
+        // `L=$(ls -td /x/* | head -1)` into pieces and leave `/x/*` where the program goes.
+        let text = skip_assignments(whole);
+        let mut argv = shlex::split(text).unwrap_or_else(|| text.split_whitespace().map(str::to_string).collect());
+        strip_wrappers(&mut argv);
+        if !matches!(st.before.as_str(), "|" | "|&") {
+            pipeline.clear();
+        }
+        let feeders = pipeline.clone();
+        pipeline.push(argv.clone());
+        let Some(word) = argv.first() else { continue };
+        if first_raw == "case" || matches!(word.as_str(), "in" | "esac" | "for" | "select" | "function") {
+            continue;
+        }
+        let prog_word = expand_program(word, cfg, &vars);
+        let unreadable: &[char] = if case_line { &['$', '`', '{'] } else { &['$', '`', '{', '*', '?'] };
+        if prog_word.contains(unreadable) {
+            return hard_delete_deny(
+                &format!("the program word `{word}` is computed when the line runs, so the guard cannot tell it is not `rm`. Write the program name itself"),
+                None,
+            );
+        }
+        if prog_word != *word && depth < MAX_UNIT_DEPTH {
+            let rest: Vec<String> = argv[1..].iter().map(|a| quote_word(a)).collect();
+            let d = hard_delete_at(&format!("{prog_word} {}", rest.join(" ")), cfg, depth + 1);
+            if d.is_deny() {
+                return d;
+            }
+        }
+        let prog = base_name(&prog_word).to_string();
+        // Operands whole, with a substitution glued on: `rm -rf /tmp/$(echo ../x)` is not temp.
+        if DELETERS.contains(&prog.as_str()) {
+            let targets: Vec<&String> = argv[1..].iter().filter(|a| !a.starts_with('-')).collect();
+            if targets.iter().any(|t| !is_temp(t, cfg)) {
+                return hard_delete_deny(&format!("`{prog}` on a path that is not certainly temp"), None);
+            }
+        }
+        if SHELLS.contains(&prog.as_str()) {
+            if let Some(inner) = shell_c_arg(&argv) {
+                let d = hard_delete_statements(&inner, cfg, air, depth + 1);
+                if d.is_deny() {
+                    return d;
+                }
+                continue;
+            }
+            // A shell reading its script on stdin: a here-string, or a pipe into it.
+            let mut fed: Vec<String> = Vec::new();
+            if let Some(at) = argv.iter().position(|a| a == "<<<") {
+                fed.extend(argv.get(at + 1).cloned());
+            }
+            let script_file = argv[1..].iter().any(|a| !a.starts_with('-') && a != "<<<")
+                && !argv.iter().any(|a| a == "<<<");
+            if matches!(st.before.as_str(), "|" | "|&") && !script_file {
+                for feed in &feeders {
+                    fed.push(feed.iter().skip(1).cloned().collect::<Vec<_>>().join(" "));
+                }
+            }
+            for text in fed {
+                if depth < MAX_UNIT_DEPTH {
+                    let d = hard_delete_at(&text, cfg, depth + 1);
+                    if d.is_deny() {
+                        return d;
+                    }
+                }
+            }
+        } else if prog == "eval" && argv.len() > 1 {
+            let d = hard_delete_statements(&argv[1..].join(" "), cfg, air, depth + 1);
+            if d.is_deny() {
+                return d;
+            }
+        } else if prog == "ssh"
+            && let Some((host, rest)) = ssh_parts_argv(&argv)
+            && !rest.is_empty()
+            && !air.is_air(&host, cfg)
+        {
+            let d = hard_delete_statements(&rest.join(" "), cfg, air, depth + 1);
+            if d.is_deny() {
+                return Decision::deny("hard-delete", format!("{} (over ssh to {host})", d.reason));
+            }
+        }
+    }
+    Decision::allow()
+}
+
+fn hard_delete_legacy(cmd: &str, cfg: &GuardConfig) -> Decision {
     let cmd = strip_file_heredocs(cmd);
     // A search pattern or a commit message is text. Until 14 Nov 2026 a grep whose pattern named
     // a delete command between `\|` separators was refused as a delete.
     let cmd = neutralize_text_args(&cmd);
     if let Some((host, rest)) = ssh_parts(&cmd) {
         if cfg.is_air(&host) && rest.len() == 1 {
+            // The worker's remote text is its own: splitting it here at quoted separators would
+            // refuse `ssh worker 'cd b && rm -rf cache'`. The other two readings still judge what
+            // runs locally around it (`"$(...)"`); until 21 Nov 2026 this allowed the whole line.
             return Decision::allow();
         }
         // ssh joins its trailing arguments with spaces before the remote shell sees them, so
@@ -834,6 +1420,12 @@ struct Unit {
     /// True when it could not be read: nested too deep, or a quote that never closes. A guard
     /// whose subject is on the line denies when it sees one.
     unparsed: bool,
+    /// Read from text that is only guessed to be a command (a quoted word, a script string).
+    guessed: bool,
+    /// One of the speculative units that start at a later word of another command; `parent`
+    /// is that command's program.
+    later: bool,
+    parent: String,
 }
 
 impl Unit {
@@ -916,6 +1508,9 @@ fn walk_units(cmd: &str, deep: bool) -> Vec<Unit> {
                 carrier: false,
                 sep: String::new(),
                 unparsed: false,
+                guessed: true,
+                later: false,
+                parent: String::new(),
             });
             if deep {
                 let literal = compiled(r#""((?:[^"\\\n]|\\.)*)"|'((?:[^'\\\n]|\\.)*)'"#);
@@ -952,6 +1547,9 @@ fn collect_units(cmd: &str, remote: Option<&str>, inherited: &[String], depth: u
             carrier: false,
             sep: String::new(),
             unparsed: true,
+            guessed: !walk.strict,
+            later: false,
+            parent: String::new(),
         });
         return;
     }
@@ -1024,6 +1622,9 @@ fn collect_units(cmd: &str, remote: Option<&str>, inherited: &[String], depth: u
                         carrier: false,
                         sep: piece.sep.to_string(),
                         unparsed: false,
+                        guessed: !walk.strict,
+                        later: true,
+                        parent: prog.clone(),
                     });
                 }
             }
@@ -1036,6 +1637,9 @@ fn collect_units(cmd: &str, remote: Option<&str>, inherited: &[String], depth: u
             carrier,
             sep: piece.sep.to_string(),
             unparsed,
+            guessed: !walk.strict,
+            later: false,
+            parent: String::new(),
         });
     }
 }
@@ -1131,6 +1735,21 @@ fn segments(cmd: &str) -> Vec<&str> {
 }
 
 fn is_temp(path: &str, cfg: &GuardConfig) -> bool {
+    // `$TMPDIR` and `$HOME` are known; any other `$`, a backtick or a brace is expanded by the
+    // shell after the guard has looked, and `..` climbs out. Until 21 Nov 2026
+    // `/tmp/{a,../Users/agentkit-me/x}` and `/tmp/$X` passed as temp.
+    let mut path = path.trim().trim_matches(|c| c == '\'' || c == '"').to_string();
+    if let Some(tmp) = &cfg.tmpdir {
+        let tmp = tmp.to_string_lossy();
+        let tmp = tmp.trim_end_matches('/');
+        path = path.replace("${TMPDIR}", tmp).replace("$TMPDIR", tmp);
+    }
+    let path = expand_vars(&path, cfg);
+    // `{}` too: xargs -I puts its input there, which may be `../..`.
+    if path.contains(['$', '`', '{', '}']) || path.split('/').any(|c| c == "..") {
+        return false;
+    }
+    let path = path.as_str();
     let mut roots: Vec<String> = TEMP_ROOTS.iter().map(|s| (*s).to_string()).collect();
     if let Some(tmp) = &cfg.tmpdir {
         let mut real = resolve_path(&tmp.to_string_lossy(), cfg);
@@ -1346,10 +1965,158 @@ fn ssh_parts_argv(argv: &[String]) -> Option<(String, Vec<String>)> {
     Some((argv[i].clone(), argv[i + 1..].to_vec()))
 }
 
+/// The line with its paths in one spelling: `//` as `/`, `/./` as `/`, `dir/..` dropped, and a
+/// quoted `"$HOME"` bare, so `~/Documents//`, `~/./Documents`, `~/Documents/x/..` and
+/// `"$HOME"/Documents` read as the folder they name. Until 21 Nov 2026 they passed.
+fn icloud_normalize(cmd: &str) -> String {
+    let mut t = cmd.to_string();
+    for (from, to) in [("\"$HOME\"", "$HOME"), ("\"${HOME}\"", "$HOME"), ("'$HOME'", "$HOME"), ("${HOME}", "$HOME")] {
+        t = t.replace(from, to);
+    }
+    let slashes = compiled(r"/{2,}");
+    let dot = compiled(r#"/\.(?=/|["'\s;)|&]|$)"#);
+    let up = compiled(r#"/(?!\.\.(?:[/"'\s;)|&]|$))[^/\s"';|&()]+/\.\.(?=[/"'\s;)|&]|$)"#);
+    for _ in 0..16 {
+        let next = up.replace_all(&dot.replace_all(&slashes.replace_all(&t, "/"), ""), "");
+        if next == t {
+            break;
+        }
+        t = next;
+    }
+    t
+}
+
+/// Where a fleet tool sits in a command: as the program, or as the script an interpreter runs
+/// (`zsh ~/.local/bin/empty-bin`, `python3 -I ~/.local/bin/cred _values`).
+fn tool_position(u: &Unit, tool: &str) -> Option<usize> {
+    let first = u.argv.first()?;
+    if is_tool(first, tool) {
+        return Some(0);
+    }
+    // An interpreter's options take values (`python -W x`, `-X x`, `-m mod`, `sh -o opt`), so
+    // the script word is not simply the first non-option. Any word that is the tool counts as
+    // it: a false refusal is cheaper than running it with what follows.
+    if SHELLS.contains(&u.prog()) || runs_inline_script(u.prog()) {
+        return u.argv.iter().skip(1).position(|a| is_tool(a, tool)).map(|i| i + 1);
+    }
+    None
+}
+
+/// The file operands of `sed` / `perl -p` / `ruby`: without the values of `-e`/`-f`/`-i`
+/// (BSD `-i ''` takes a suffix word) and, when no `-e`/`-f` is given, without the script word.
+fn script_tool_files(argv: &[String]) -> Vec<&str> {
+    let mut files = Vec::new();
+    let mut script_given = false;
+    let mut unsure = false;
+    let mut i = 1;
+    while i < argv.len() {
+        let a = argv[i].as_str();
+        i += 1;
+        if matches!(a, "-e" | "-f" | "--expression" | "--file") {
+            script_given = true;
+            i += 1;
+        } else if a.starts_with("--expression=") || a.starts_with("--file=") {
+            script_given = true; // the script is inline; the next word is an operand
+        } else if a == "-i" && argv.get(i).is_some_and(|v| v.is_empty()) {
+            i += 1;
+        } else if a.starts_with('-') && !a.starts_with("--") && a.len() > 1 {
+            let body = &a[1..];
+            if body.starts_with('i') && body.len() > 1 {
+                // `-ie`, `-i.bak`: a suffix glued to -i; with e/f in it the reading is unsure
+                if body[1..].contains(['e', 'f']) {
+                    unsure = true;
+                }
+            } else if body.ends_with(['e', 'f']) {
+                // `-pe`, `-ne`, `-f`: the code or script file is the next word
+                script_given = true;
+                i += 1;
+            } else if body.contains(['e', 'f']) {
+                // `-es/a/b/`, `-pes/x/y/`: the script is attached; nothing more to skip
+                script_given = true;
+            }
+        } else if !a.starts_with('-') {
+            files.push(a);
+        }
+    }
+    // Only when it is certain that the first plain word is the script is it dropped; otherwise
+    // every plain word may be a file, as before.
+    if !script_given && !unsure && !files.is_empty() {
+        files.remove(0);
+    }
+    files
+}
+
+/// Could the line run the tool at all: its name on the line, or a path word that resolves to it.
+fn names_tool(cmd: &str, tool: &str) -> bool {
+    let bare = without_quoting(cmd);
+    cmd.contains(tool)
+        || bare.contains(tool)
+        || bare
+            .split(|c: char| c.is_whitespace() || ";&|()`<>".contains(c))
+            .any(|w| w.contains('/') && is_tool(w, tool))
+}
+
+/// The word names the tool: by its base name, or by what it resolves to on disk (a symlink
+/// or copy under another name).
+fn is_tool(word: &str, tool: &str) -> bool {
+    if base_name(word) == tool {
+        return true;
+    }
+    if !word.contains('/') {
+        return false;
+    }
+    let path = match (word.strip_prefix("~/"), std::env::var_os("HOME")) {
+        (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
+        _ => PathBuf::from(word),
+    };
+    fs::canonicalize(path).ok().is_some_and(|p| p.file_name().is_some_and(|n| n == tool))
+}
+
+/// `empty-bin` empties the whole Bin unless told otherwise; that is the owner's action (18 Nov
+/// 2026). An agent may run it only with `--verified-offloads` or `--dry-run`/`-n`, here or over
+/// ssh, under any wrapper. Fed its arguments by `xargs`, or a line that cannot be read, is refused.
+fn empty_bin(cmd: &str) -> Option<Decision> {
+    if !names_tool(cmd, "empty-bin") {
+        return None;
+    }
+    let deny = || {
+        Some(Decision::deny(
+            "icloud",
+            "BLOCKED: `empty-bin` with no option empties the whole Bin, which is the owner's action. The agent path is `empty-bin --verified-offloads` (only items the offload tool verified), or `--dry-run` to look.",
+        ))
+    };
+    let all = units_deep(cmd);
+    if any_unparsed(&all) {
+        return deny();
+    }
+    let vars = literal_assignments(cmd);
+    for u in &all {
+        if u.later && !EXECUTORS.contains(&u.parent.as_str()) {
+            continue;
+        }
+        let Some(at) = tool_position(u, "empty-bin") else { continue };
+        let args: Vec<String> = u.argv[at + 1..]
+            .iter()
+            .map(|a| vars.iter().fold(a.clone(), |t, (n, v)| t.replace(&format!("${{{n}}}"), v).replace(&format!("${n}"), v)))
+            .collect();
+        let ok = args.iter().any(|a| matches!(a.as_str(), "--verified-offloads" | "--dry-run" | "-n"));
+        if !ok || u.wrappers.iter().any(|w| w == "xargs") || args.iter().any(|a| a.contains(['$', '`'])) {
+            return deny();
+        }
+    }
+    None
+}
+
 fn icloud(cmd: &str) -> Decision {
-    if cmd.contains("ICLOUD_WIPE_APPROVED=1") {
+    if let Some(d) = empty_bin(cmd) {
+        return d;
+    }
+    // The owner's go-ahead is a leading assignment on a lone command, never a word anywhere on
+    // the line: until 21 Nov 2026 `ls # ICLOUD_WIPE_APPROVED=1` in a comment switched it off.
+    if simple_command(cmd).is_some_and(|argv| argv[0] == "ICLOUD_WIPE_APPROVED=1") {
         return Decision::allow();
     }
+    let cmd = &icloud_normalize(cmd);
     // Mail to another agent is text, when the mail is the whole line. Until 14 Nov 2026 a line
     // that merely began with `agent-mail send` was allowed whatever followed it.
     if simple_command(cmd).is_some_and(|argv| base_name(&argv[0]) == "agent-mail") {
@@ -1358,7 +2125,8 @@ fn icloud(cmd: &str) -> Decision {
     let root_names = r"(?:Documents|Desktop|Library/Mobile Documents/com~apple~CloudDocs|Library/Mobile\\ Documents/com~apple~CloudDocs)";
     let users_home: String = ['/', 'U', 's', 'e', 'r', 's', '/'].iter().collect();
     let prefix = format!(r#"(?:~/|\$HOME/|\$\{{HOME\}}/|{users_home}[^/\s\"']+/)"#);
-    let end = r#"(?=/?\*?(?:["'\s;)|&]|$))"#;
+    // The folder, or a glob of everything directly in it (`*`, `?*`, `[!.]*`, `.*`, `.[!.]*`).
+    let end = r#"(?=/?(?:\*|\?+\*?|\.?\[[^\]/\s]*\]\*?|\.\*|\.\?\?\*)?(?:["'\s;)|&]|$))"#;
     let root_ref = compiled(&format!(r#"[\"']?{prefix}{root_names}{end}"#));
     let bare_ref = compiled(&format!(
         r#"(?:(?<=[\s\"'])|^)(?:Documents|Desktop){end}"#
@@ -1367,13 +2135,13 @@ fn icloud(cmd: &str) -> Decision {
     if cmd.contains("osascript") && compiled(r"(?i)\bempty\s+(?:the\s+)?trash\b").is_match(cmd) {
         return Decision::deny(
             "icloud",
-            "BLOCKED iCloud-wide delete risk: emptying the Trash is permanent. On a Mac with iCloud Desktop & Documents it also purges iCloud Recently Deleted. Empty it only with the owner's go-ahead, then prefix ICLOUD_WIPE_APPROVED=1.",
+            "BLOCKED iCloud-wide delete risk: emptying the Trash is permanent. On a Mac with iCloud Desktop & Documents it also purges iCloud Recently Deleted. Empty it only with the owner's go-ahead, then start a lone command with ICLOUD_WIPE_APPROVED=1 (the first word, not elsewhere on the line).",
         );
     }
     if empties_trash(cmd) {
         return Decision::deny(
             "icloud",
-            "BLOCKED: emptying the Trash is permanent, on every Mac, the workers included (with iCloud Desktop & Documents it also purges iCloud Recently Deleted). Leave the Trash alone; to free space, report its size and let the owner empty it. With his go-ahead in this session, prefix ICLOUD_WIPE_APPROVED=1.",
+            "BLOCKED: emptying the Trash is permanent, on every Mac, the workers included (with iCloud Desktop & Documents it also purges iCloud Recently Deleted). Leave the Trash alone; to free space, report its size and let the owner empty it. With his go-ahead in this session, start a lone command with ICLOUD_WIPE_APPROVED=1 (the first word, not elsewhere on the line).",
         );
     }
     let loop_re = compiled(r"\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\s+([^;\n]*)");
@@ -1386,7 +2154,7 @@ fn icloud(cmd: &str) -> Decision {
     let verb = compiled(
         r#"(?:^|[\s;&|(`"'])(?:sudo\s+)?(?:mv|trash|rm|rmdir|srm|unlink)\s|-exec\s+(?:mv|rm|trash)\b|\s-delete\b"#,
     );
-    let rsync_delete = compiled(r"\brsync\b[^;&|]*--delete");
+    let rsync_delete = compiled(r"\brsync\b[^;&|]*--del");
     let seps = compiled(r"&&|\|\||;|\n|\|");
     for seg in seps.split(cmd) {
         let verb_hit = verb.is_match(seg);
@@ -1395,11 +2163,15 @@ fn icloud(cmd: &str) -> Decision {
             continue;
         }
         if rsync_hit && !verb_hit {
-            let last = seg.split_whitespace().last().unwrap_or("");
-            if has_root(&format!(" {last}")) {
+            // The destination is not always the last word (`... ~/Documents/ --exclude x`): any
+            // operand after the first (the source) that is a root counts.
+            let words = shlex::split(seg).unwrap_or_else(|| seg.split_whitespace().map(str::to_string).collect());
+            let at = words.iter().position(|w| base_name(w) == "rsync").map(|i| i + 1).unwrap_or(0);
+            let operands: Vec<&String> = words[at..].iter().filter(|w| !w.starts_with('-')).collect();
+            if operands.iter().skip(1).any(|w| has_root(&format!(" {w}"))) {
                 return Decision::deny(
                     "icloud",
-                    "BLOCKED iCloud-wide delete risk: `rsync --delete` into a whole Desktop/Documents/iCloud Drive folder. Sync a subfolder, or prefix ICLOUD_WIPE_APPROVED=1 after confirming iCloud Desktop & Documents is off.",
+                    "BLOCKED iCloud-wide delete risk: `rsync --delete` into a whole Desktop/Documents/iCloud Drive folder. Sync a subfolder, or start a lone command with ICLOUD_WIPE_APPROVED=1 (the first word, not elsewhere on the line) after confirming iCloud Desktop & Documents is off.",
                 );
             }
             continue;
@@ -1407,7 +2179,7 @@ fn icloud(cmd: &str) -> Decision {
         if has_root(seg) && !loop_re.is_match(seg) {
             return Decision::deny(
                 "icloud",
-                "BLOCKED iCloud-wide delete risk: moving or deleting a whole Desktop/Documents/iCloud Drive folder or all its contents. Move single items. A whole-folder wipe needs iCloud Desktop & Documents confirmed off and ICLOUD_WIPE_APPROVED=1.",
+                "BLOCKED iCloud-wide delete risk: moving or deleting a whole Desktop/Documents/iCloud Drive folder or all its contents. Move single items. A whole-folder wipe needs iCloud Desktop & Documents confirmed off and a lone command that starts with ICLOUD_WIPE_APPROVED=1.",
             );
         }
         for v in &tainted {
@@ -2216,6 +2988,877 @@ fn approval_files(cmd: &str, cfg: &GuardConfig) -> Decision {
     Decision::allow()
 }
 
+/// What a protected path is to the guard-config guard.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Guarded {
+    /// No agent writes it: agentkit's site config, the Codex and Cursor hook files.
+    Whole,
+    /// Claude's user settings: an edit that leaves `hooks` and `disableAllHooks` alone is fine.
+    ClaudeSettings,
+    /// Codex's config: an edit that leaves its `hooks` trust table and hook features alone is fine.
+    CodexConfig,
+}
+
+/// agentkit's config directories: the one this hook loaded, and the default under home.
+fn agentkit_config_dirs(cfg: &GuardConfig) -> Vec<String> {
+    let mut dirs = vec![resolve_path(&cfg.home.join(".config/agentkit").to_string_lossy(), cfg)];
+    if let Some(dir) = &cfg.config_dir {
+        let d = resolve_path(&dir.to_string_lossy(), cfg);
+        if !dirs.contains(&d) {
+            dirs.push(d);
+        }
+    }
+    dirs
+}
+
+/// The files the guards are wired through, resolved, with what each one is.
+fn guarded_files(cfg: &GuardConfig) -> Vec<(String, Guarded)> {
+    let at = |rel: &str| resolve_path(&cfg.home.join(rel).to_string_lossy(), cfg);
+    vec![
+        (at(".claude/settings.json"), Guarded::ClaudeSettings),
+        (at(".claude/settings.local.json"), Guarded::ClaudeSettings),
+        (at(".codex/hooks.json"), Guarded::Whole),
+        (at(".codex/config.toml"), Guarded::CodexConfig),
+        (at(".cursor/hooks.json"), Guarded::Whole),
+        (at(".gemini/config/hooks.json"), Guarded::Whole),
+    ]
+}
+
+/// Is a resolved path one the guard-config guard protects? In agentkit's config directory
+/// everything is, except what agents are meant to write there: the shared notebook (`memory/`),
+/// `skills/`, the prose rules (`rules/*.md`, `rules/projects/`) and `paused-providers`.
+fn guarded_kind(full: &str, cfg: &GuardConfig) -> Option<Guarded> {
+    let full = full.trim_end_matches('/');
+    for dir in agentkit_config_dirs(cfg) {
+        if full == dir {
+            return Some(Guarded::Whole);
+        }
+        if let Some(rel) = full.strip_prefix(&format!("{dir}/")) {
+            let open = rel.starts_with("memory/")
+                || rel == "memory"
+                || rel.starts_with("skills/")
+                || rel == "skills"
+                || rel == "paused-providers"
+                || rel.starts_with("rules/projects/")
+                || (rel.starts_with("rules/") && rel.ends_with(".md"));
+            return if open { None } else { Some(Guarded::Whole) };
+        }
+    }
+    if let Some(k) = guarded_files(cfg).into_iter().find(|(p, _)| p == full).map(|(_, k)| k) {
+        return Some(k);
+    }
+    // The decision ledger and its HMAC key (crate::ledger): an agent that could replace them
+    // (a FIFO, a symlink, a truncation) could stall the hook or erase its own record.
+    if ledger_files(cfg).iter().any(|f| full == f || full.starts_with(&format!("{f}."))) {
+        return Some(Guarded::Whole);
+    }
+    for dir in ledger_dirs(cfg) {
+        if full == dir {
+            return Some(Guarded::Whole);
+        }
+        if full.starts_with(&format!("{dir}/")) {
+            return Some(Guarded::Whole);
+        }
+    }
+    // The same files in any directory: a project's `.claude/settings.json` with
+    // `disableAllHooks` switches the guards off for every session there.
+    if full.ends_with("/.claude/settings.json") || full.ends_with("/.claude/settings.local.json") {
+        return Some(Guarded::ClaudeSettings);
+    }
+    if full.ends_with("/.codex/config.toml") {
+        return Some(Guarded::CodexConfig);
+    }
+    if full.ends_with("/.codex/hooks.json")
+        || full.ends_with("/.cursor/hooks.json")
+        || full.ends_with("/.gemini/config/hooks.json")
+    {
+        return Some(Guarded::Whole);
+    }
+    // doctor's record of the owner's accepted [guards] section (`agentkit doctor --accept-guards`).
+    if full.ends_with("/agentkit/guards-accepted.json") {
+        return Some(Guarded::Whole);
+    }
+    None
+}
+
+/// The ledger's protected folders and files, from the writer's own functions (crate::ledger).
+fn ledger_dirs(cfg: &GuardConfig) -> Vec<String> {
+    crate::ledger::protected_paths(&cfg.home).0.iter().map(|d| resolve_path(&d.to_string_lossy(), cfg)).collect()
+}
+
+fn ledger_files(cfg: &GuardConfig) -> Vec<String> {
+    crate::ledger::protected_paths(&cfg.home).1.iter().map(|d| resolve_path(&d.to_string_lossy(), cfg)).collect()
+}
+
+/// The whole protected set: the ledger's files and folders, resolved.
+fn ledger_protected(cfg: &GuardConfig) -> Vec<String> {
+    let mut all = ledger_files(cfg);
+    all.extend(ledger_dirs(cfg));
+    all
+}
+
+/// True when `top` is a protected ledger path or a folder above one, wherever it lives. Home
+/// and the folders above it are left to the other rules (a copy into `~` is not a replacement
+/// of `~/.local/state`); everything between home and the ledger counts.
+fn ledger_ancestor_hit(top: &str, cfg: &GuardConfig) -> bool {
+    let top = top.trim_end_matches('/');
+    if top.is_empty() {
+        return false;
+    }
+    let home = resolve_path(&cfg.home.to_string_lossy(), cfg);
+    let home = home.trim_end_matches('/');
+    let at_or_above_home = top == home || home.starts_with(&format!("{top}/"));
+    ledger_protected(cfg).iter().any(|p| {
+        let p = p.trim_end_matches('/');
+        p == top || (p.starts_with(&format!("{top}/")) && !at_or_above_home)
+    }) || same_inode_as_ledger(top, cfg)
+}
+
+/// The ledger or its key under another name: a hard link made earlier shares the inode.
+fn same_inode_as_ledger(path: &str, cfg: &GuardConfig) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(m) = fs::metadata(path) else { return false };
+    if !m.is_file() {
+        return false;
+    }
+    ledger_files(cfg).iter().any(|f| fs::metadata(f).is_ok_and(|n| n.dev() == m.dev() && n.ino() == m.ino()))
+}
+
+/// Programs that only read and have no option that writes a file or runs a program. Every
+/// other program given the ledger, its key, its folder (or an ancestor, or the ledger's inode)
+/// in any argument is treated as a write. (`rg` is not here: `--pre` runs a program.)
+const LEDGER_READERS: &[&str] = &["cat", "head", "tail", "wc", "ls", "stat", "grep", "jq"];
+
+/// The paths a word may name: the word itself and the value of `--opt=VALUE` or `name=VALUE`
+/// (`of=` for dd). Short options with a glued value (`-oVALUE`) are judged by substring in
+/// `ledger_write_hit`, never by slicing.
+fn word_paths(word: &str) -> Vec<String> {
+    let mut out = vec![word.to_string()];
+    if let Some((_, v)) = word.split_once('=') {
+        out.push(v.to_string());
+    }
+    out.retain(|w| !w.is_empty());
+    out
+}
+
+/// Names that, appearing anywhere in a word, may point at the ledger: each protected path's
+/// base name and the paths themselves.
+fn ledger_name_parts(cfg: &GuardConfig) -> Vec<String> {
+    let mut out = Vec::new();
+    for p in ledger_protected(cfg) {
+        if let Some(name) = std::path::Path::new(&p).file_name() {
+            out.push(name.to_string_lossy().into_owned());
+        }
+        out.push(p);
+    }
+    out.extend(ledger_needles(cfg));
+    out.retain(|w| !w.is_empty());
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The value glued to a short option (`-C~/x` -> `~/x`), cut on a character boundary.
+fn glued_value(word: &str) -> Option<&str> {
+    if !word.starts_with('-') || word.starts_with("--") {
+        return None;
+    }
+    let mut chars = word.char_indices().skip(1);
+    chars.next()?;
+    let (i, _) = chars.next()?;
+    word.get(i..).filter(|v| !v.is_empty())
+}
+
+/// A command whose structure the cwd tracking cannot follow: subshells, groups, compound
+/// statements, functions, substitutions, here-docs. Any cd in it leaves the folder unknown.
+fn cwd_untrackable(cmd: &str) -> bool {
+    if cmd.contains(['(', ')', '{', '}', '`', '<']) {
+        return true;
+    }
+    cmd.split(|c: char| c.is_whitespace() || c == ';' || c == '&' || c == '|')
+        .any(|w| matches!(w, "if" | "then" | "else" | "elif" | "fi" | "while" | "until" | "for" | "do" | "done" | "case" | "esac" | "function" | "select"))
+}
+
+/// Stat-only check, before any fast path: every word of every unit (and every redirect target),
+/// resolved against the working folder as unconditional `cd`/`pushd`/`popd` move it. A hit on
+/// the ledger's files or folders, an ancestor, or the ledger's inode denies unless the program
+/// only reads. A single-dash word, or any relative word once the folder is unknown (a `cd -`,
+/// a `cd` after `||`, in a pipe or a subshell, or to a target that cannot be resolved), is a hit
+/// when it contains a protected name. Defence in depth only: a same-user process can still
+/// rewrite the file, so the ledger is shipped every minute and the archive host's sequence
+/// check is the real control.
+fn ledger_write_hit(cmd: &str, cfg: &GuardConfig) -> bool {
+    // First, whole-command rules over every cd/pushd at any depth (tracked or not).
+    // (a) A target that resolves into or above the ledger's folder, with any program that is
+    //     not a reader (or any redirect), refuses the command.
+    // (b) A target known only at run time (`$(…)`, backticks, `cd -`, `+N`, a glob, an
+    //     unexpanded variable) refuses it only when the command also names a protected file,
+    //     folder or ancestor, or hands a glob, `.` or `..` to a non-reader or a redirect, or a
+    //     bare relative name to a redirect or a file-changing program (`: > *`,
+    //     `truncate -s0 decisions.jsonl`). Ordinary `cd "$dir" && make` stays allowed.
+    let units = units_deep(cmd);
+    let mut known_risky = false;
+    let mut runtime_cd = false;
+    for u in units.iter().filter(|u| u.remote.is_none() && matches!(u.prog(), "cd" | "pushd")) {
+        if u.text.contains('`') || u.text.contains("$(") || u.sep == "$(" || u.sep == "`" {
+            runtime_cd = true;
+            continue;
+        }
+        match u.argv.get(1).map(String::as_str) {
+            None => {}
+            Some(t) if t == "-" || t.starts_with('+') || (t.starts_with('-') && t.len() > 1) => runtime_cd = true,
+            Some(t) => {
+                let e = expand_vars(t, cfg);
+                if e.contains(['$', '`', '*', '?', '[']) {
+                    runtime_cd = true;
+                } else {
+                    let full = resolve_path(&e, cfg);
+                    if in_ledger_dir(&full, cfg) || ledger_ancestor_hit(&full, cfg) {
+                        known_risky = true;
+                    }
+                }
+            }
+        }
+    }
+    let is_writer = |prog: &str| !prog.is_empty() && !LEDGER_READERS.contains(&prog) && !matches!(prog, "cd" | "pushd" | "popd");
+    let any_redirect = units.iter().any(|u| !redirect_targets(&u.text).is_empty());
+    if known_risky && (any_redirect || units.iter().any(|u| is_writer(u.prog()))) {
+        return true;
+    }
+    if runtime_cd {
+        const CHANGERS: &[&str] = &["rm", "rmdir", "unlink", "mv", "cp", "ln", "link", "truncate", "tee", "dd", "shred",
+                                    "chmod", "chflags", "chown", "touch", "mkfifo", "install", "rsync", "sed", "perl", "srm", ":"];
+        let parts = ledger_name_parts(cfg);
+        let names_protected = units.iter().any(|u| u.argv.iter().chain(std::iter::once(&u.text)).any(|w| parts.iter().any(|p| w.contains(p.as_str()))));
+        let vague = |w: &str| w.contains(['*', '?', '[']) || w == "." || w == ".." || w == "./" || w == "../";
+        let bare = |w: &str| !w.starts_with('-') && !w.contains('/') && !w.contains('=') && !w.is_empty();
+        let hands_vague = units.iter().any(|u| {
+            let prog = u.prog();
+            let targets = redirect_targets(&u.text);
+            targets.iter().any(|t| vague(t) || bare(t))
+                || (is_writer(prog) && u.argv.iter().skip(1).any(|w| vague(w)))
+                || (CHANGERS.contains(&prog) && u.argv.iter().skip(1).any(|w| bare(w)))
+        });
+        if names_protected || hands_vague {
+            return true;
+        }
+    }
+    let mut local = cfg.clone();
+    let mut stack: Vec<PathBuf> = Vec::new();
+    let mut cwd_known = true;
+    let parts = ledger_name_parts(cfg);
+    let named = |w: &str| parts.iter().any(|p| w.contains(p.as_str()));
+    let untrackable = cwd_untrackable(cmd);
+    let hit = |t: &str, c: &GuardConfig, known: bool| {
+        if t.starts_with('-') && !t.starts_with("--") {
+            if named(t) {
+                return true;
+            }
+            if let Some(v) = glued_value(t) {
+                let full = resolve_path(&expand_vars(v, c), c);
+                if ledger_ancestor_hit(&full, c) || in_ledger_dir(&full, c) {
+                    return true;
+                }
+            }
+        }
+        if !known && !t.starts_with('/') && !t.starts_with('~') && named(t) {
+            return true;
+        }
+        word_paths(t).iter().any(|w| {
+            let full = resolve_path(&expand_vars(w, c), c);
+            ledger_ancestor_hit(&full, c) || in_ledger_dir(&full, c)
+        })
+    };
+    let mut prev_sep = String::new();
+    for u in units_deep(cmd) {
+        let sep_before = std::mem::replace(&mut prev_sep, u.sep.clone());
+        if u.remote.is_some() {
+            continue;
+        }
+        let prog = u.prog();
+        if matches!(prog, "cd" | "pushd" | "popd") {
+            // Tracked only as a plain top-level unit joined by ; && or a newline; anything else
+            // (carried by sh -c/eval/ssh, wrapped, inside any compound syntax) fails closed.
+            let unconditional = !untrackable && !u.guessed && !u.later && !u.carrier && u.wrappers.is_empty()
+                && matches!(sep_before.as_str(), "" | ";" | "&&" | "\n")
+                && matches!(u.sep.as_str(), "" | ";" | "&&" | "\n");
+            let target = u.argv.get(1).map(String::as_str);
+            let plain = |t: &str| !(t == "-" || t.starts_with('+') || (t.starts_with('-') && t.len() > 1) || t.contains(['$', '`', '*', '?']));
+            if !unconditional {
+                cwd_known = false;
+            } else if prog == "popd" {
+                match stack.pop() {
+                    Some(back) if target.is_none() => local.cwd = back,
+                    _ => cwd_known = false,
+                }
+            } else {
+                match target {
+                    Some(t) if plain(t) => {
+                        if prog == "pushd" {
+                            stack.push(local.cwd.clone());
+                        }
+                        local.cwd = PathBuf::from(resolve_path(&expand_vars(t, &local), &local));
+                    }
+                    Some(_) => cwd_known = false,
+                    None => local.cwd = local.home.clone(),
+                }
+            }
+            continue;
+        }
+        if redirect_targets(&u.text).iter().any(|t| hit(t, &local, cwd_known)) {
+            return true;
+        }
+        if LEDGER_READERS.contains(&prog) {
+            continue;
+        }
+        if u.argv.iter().skip(1).any(|w| hit(w, &local, cwd_known)) {
+            return true;
+        }
+    }
+    false
+}
+
+fn in_ledger_dir(full: &str, cfg: &GuardConfig) -> bool {
+    ledger_dirs(cfg).iter().any(|d| full == d || full.starts_with(&format!("{d}/")))
+}
+
+/// Words that must send a command past the keyword fast path: every protected path, each of its
+/// ancestors below home (absolute and `~/` forms), and their base names.
+fn ledger_needles(cfg: &GuardConfig) -> Vec<String> {
+    let home = resolve_path(&cfg.home.to_string_lossy(), cfg);
+    let home = home.trim_end_matches('/').to_string();
+    let mut out = Vec::new();
+    for p in ledger_protected(cfg) {
+        let mut cur = std::path::PathBuf::from(p.trim_end_matches('/'));
+        loop {
+            let s = cur.to_string_lossy().into_owned();
+            if s.is_empty() || s == "/" || s == home || home.starts_with(&format!("{s}/")) {
+                break;
+            }
+            if let Some(rel) = s.strip_prefix(&format!("{home}/")) {
+                out.push(format!("~/{rel}"));
+            }
+            if let Some(name) = cur.file_name() {
+                out.push(name.to_string_lossy().into_owned());
+            }
+            out.push(s);
+            if !cur.pop() {
+                break;
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The folders hook files live in.
+const HOOK_DIRS: &[&str] = &[".claude", ".codex", ".cursor"];
+
+/// How many keys named `disableAllHooks` (any case, escapes decoded) a JSON text has at any
+/// depth; None when it does not parse.
+fn json_disable_count(text: &str) -> Option<usize> {
+    fn walk(v: &Value) -> usize {
+        match v {
+            Value::Object(m) => m
+                .iter()
+                .map(|(k, child)| usize::from(k.eq_ignore_ascii_case("disableAllHooks")) + walk(child))
+                .sum(),
+            Value::Array(a) => a.iter().map(walk).sum(),
+            _ => 0,
+        }
+    }
+    if text.trim().is_empty() {
+        return Some(0);
+    }
+    serde_json::from_str::<Value>(text).ok().map(|v| walk(&v))
+}
+
+/// For text that is not strict JSON (comments, a partial file): `\uXXXX` escapes decoded,
+/// backslashes and case dropped, then the name counted.
+fn loose_disable_count(text: &str) -> usize {
+    let mut out = String::with_capacity(text.len());
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\\' && i + 5 < chars.len() && chars[i + 1] == 'u' {
+            let hex: String = chars[i + 2..i + 6].iter().collect();
+            if let Some(c) = u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                out.push(c);
+                i += 6;
+                continue;
+            }
+        }
+        if chars[i] != '\\' {
+            out.push(chars[i]);
+        }
+        i += 1;
+    }
+    out.to_ascii_lowercase().matches("disableallhooks").count()
+}
+
+fn disable_count(text: &str) -> usize {
+    json_disable_count(text).unwrap_or_else(|| loose_disable_count(text))
+}
+
+/// Words that name the guard config or a hook file, for a path the guard cannot resolve.
+const GUARDED_NAMES: &[&str] = &[
+    ".claude", ".codex", ".cursor", ".config", "agentkit.toml", "guards.toml", "settings.json", "settings.local.json",
+    "hooks.json", "config.toml",
+];
+
+/// A write target with a glob, an unresolved `$` or a backtick: could it land on a protected
+/// path? When what is literal names one, or its literal start lies on the way into or inside a
+/// protected folder (`~/.c*/...`, `~/.claude/sett*`), or it is relative and the shell is in one.
+fn guarded_dynamic(token: &str, cfg: &GuardConfig) -> bool {
+    let e = expand_vars(token, cfg);
+    let Some(at) = e.find(['*', '?', '[', '$', '`']) else { return false };
+    let prefix = &e[..at];
+    let homes = [cfg.home.to_string_lossy().into_owned(), resolve_path(&cfg.home.to_string_lossy(), cfg)];
+    // The names are looked for in what the token itself spells, not in the home it expands to.
+    let own = homes
+        .iter()
+        .find_map(|h| prefix.strip_prefix(h.trim_end_matches('/')))
+        .unwrap_or(prefix);
+    // Inside a worktree under `.claude/worktrees/NAME/` only what follows the worktree counts.
+    // `.` and `//` are collapsed first; a `..` anywhere could climb back out of the worktree,
+    // so with one present the worktree is not trusted.
+    let mut lit = own.to_string();
+    loop {
+        let next = lit.replace("//", "/").replace("/./", "/");
+        if next == lit {
+            break;
+        }
+        lit = next;
+    }
+    if let Some(i) = lit.find("/.claude/worktrees/") {
+        // the whole token, glob tail included (`…/worktrees/a/*/../../settings.json`)
+        if lit.split('/').any(|c| c == "..") || e.split('/').any(|c| c == "..") {
+            return true;
+        }
+        let rest = &lit[i + "/.claude/worktrees/".len()..];
+        lit = rest.find('/').map(|j| rest[j..].to_string()).unwrap_or_default();
+    }
+    if GUARDED_NAMES.iter().any(|n| lit.contains(n) || e[at..].contains(n)) {
+        return true;
+    }
+    // A component of the glob tail that could still become a hook folder (`*/.cl*/x`, `*/.?odex`).
+    let hook_folders = [".claude", ".codex", ".cursor", ".config"];
+    let tail_partial = e[at..].split('/').skip(1).any(|c| {
+        let literal = &c[..c.find(['*', '?', '[', '$', '`']).unwrap_or(c.len())];
+        literal.starts_with('.') && hook_folders.iter().any(|f| f.starts_with(literal))
+    });
+    if tail_partial {
+        return true;
+    }
+    // A hook folder as a literal component at any depth (`x/.claude/sett*`), or the component
+    // the glob or variable sits in could still become one (`proj/.c*/…`, `proj/.*`).
+    let comp_start = lit.rfind('/').map(|j| j + 1).unwrap_or(0);
+    let glob_comp = &lit[comp_start..];
+    let folders = [".claude", ".codex", ".cursor", ".config"];
+    let whole_comp = lit[..comp_start].split('/').any(|c| folders.contains(&c));
+    // the component the glob or variable sits in could still become one of them
+    let partial = glob_comp.starts_with('.') && folders.iter().any(|f| f.starts_with(glob_comp));
+    if whole_comp || partial {
+        return true;
+    }
+    // Each root with the length of the part that is not yet inside it (its home, or its parent).
+    let mut roots: Vec<(String, usize)> = Vec::new();
+    for h in &homes {
+        let h = h.trim_end_matches('/');
+        for r in [".claude", ".codex", ".cursor", ".config"] {
+            roots.push((format!("{h}/{r}"), h.len() + 1));
+        }
+    }
+    for d in agentkit_config_dirs(cfg) {
+        let parent = d.rfind('/').unwrap_or(0) + 1;
+        roots.push((d, parent));
+    }
+    let abs = if prefix.is_empty() {
+        resolve_path(&cfg.cwd.to_string_lossy(), cfg)
+    } else if prefix.starts_with('/') {
+        prefix.to_string()
+    } else {
+        format!("{}/{prefix}", cfg.cwd.to_string_lossy().trim_end_matches('/'))
+    };
+    if prefix.is_empty() {
+        return roots.iter().any(|(r, _)| abs == *r || abs.starts_with(&format!("{r}/")));
+    }
+    roots.iter().any(|(r, outside)| abs.starts_with(r.as_str()) || (r.starts_with(abs.as_str()) && abs.len() > *outside))
+}
+
+/// For a shell write: the path is protected, or is a folder under home that holds one
+/// (`mv ~/.codex /tmp/x`).
+fn guarded_shell_hit(token: &str, cfg: &GuardConfig) -> bool {
+    let t = expand_vars(token, cfg);
+    if t.is_empty() {
+        return false;
+    }
+    let full = resolve_path(&t, cfg);
+    if guarded_kind(&full, cfg).is_some() || ledger_ancestor_hit(&full, cfg) {
+        return true;
+    }
+    // A `.claude`, `.codex` or `.cursor` folder itself, in any directory: replacing, moving or
+    // removing it changes the hooks of everything under it.
+    if HOOK_DIRS.contains(&base_name(full.trim_end_matches('/'))) {
+        return true;
+    }
+    let home = resolve_path(&cfg.home.to_string_lossy(), cfg);
+    let top = full.trim_end_matches('/');
+    if top.len() <= home.len() || !top.starts_with(&format!("{home}/")) {
+        return false;
+    }
+    let inside = format!("{top}/");
+    guarded_files(cfg).iter().any(|(p, _)| p.starts_with(&inside))
+        || agentkit_config_dirs(cfg).iter().any(|d| d.starts_with(&inside))
+        || ledger_dirs(cfg).iter().chain(ledger_files(cfg).iter()).any(|d| d.starts_with(&inside))
+}
+
+const GUARD_CONFIG_REASON: &str = "agentkit's site config and the hook files that run the guards are not written by agents: a change there can switch every guard off. Site config is the owner's to change; `agentkit sync --apply` regenerates the hook files from it. For other Claude or Codex settings, use the Edit tool on the file and leave its hooks (and disableAllHooks) as they are; that is allowed.";
+
+fn guard_config_deny() -> Decision {
+    Decision::deny("guard-config", GUARD_CONFIG_REASON)
+}
+
+/// The file as a Write, Edit or MultiEdit would leave it; None when that cannot be known (the
+/// edit's text is not in the file, so the tool will fail).
+fn edited_contents(value: &Value, disk: &str) -> Option<String> {
+    let tool = tool_name_of(value)?;
+    let input = tool_input_of(value)?;
+    let apply = |text: &str, edit: &Value| -> Option<String> {
+        let old = edit
+            .get("old_string")
+            .or_else(|| edit.get("TargetContent"))
+            .or_else(|| edit.get("Target"))
+            .and_then(|s| s.as_str())?;
+        let new = edit
+            .get("new_string")
+            .or_else(|| edit.get("ReplacementContent"))
+            .or_else(|| edit.get("Replacement"))
+            .and_then(|s| s.as_str())
+            .unwrap_or("");
+        if old.is_empty() || !text.contains(old) {
+            return None;
+        }
+        let all = edit
+            .get("replace_all")
+            .or_else(|| edit.get("AllowMultiple"))
+            .and_then(|b| b.as_bool())
+            .unwrap_or(false);
+        Some(if all { text.replace(old, new) } else { text.replacen(old, new, 1) })
+    };
+    match tool {
+        "Write" | "write_to_file" | "write_file" => input
+            .get("content")
+            .or_else(|| input.get("CodeContent"))
+            .or_else(|| input.get("Content"))
+            .and_then(|c| c.as_str())
+            .map(str::to_string),
+        "Edit" | "replace_file_content" => apply(disk, input),
+        "edit_file" => {
+            let old = input.get("Target").and_then(|s| s.as_str())?;
+            let new = input.get("Replacement").and_then(|s| s.as_str()).unwrap_or("");
+            if old.is_empty() || !disk.contains(old) { return None; }
+            Some(disk.replace(old, new))
+        }
+        "MultiEdit" | "multi_replace_file_content" => {
+            let mut text = disk.to_string();
+            let list = input.get("edits").or_else(|| input.get("ReplacementChunks"))?.as_array()?;
+            for edit in list {
+                text = apply(&text, edit)?;
+            }
+            Some(text)
+        }
+        _ => None,
+    }
+}
+
+/// Every key of a Codex config whose path, at any depth, names hooks or features (the trust
+/// table, `[features]`, `[profiles.x.features]`), and the top-level profile selector.
+fn codex_hook_keys(v: &toml::Value) -> std::collections::BTreeMap<String, String> {
+    fn walk(v: &toml::Value, path: &str, hit: bool, out: &mut std::collections::BTreeMap<String, String>) {
+        match v.as_table() {
+            Some(t) => {
+                if hit {
+                    out.insert(path.to_string(), "{table}".into());
+                }
+                for (k, child) in t {
+                    let lower = k.to_ascii_lowercase();
+                    let next = if path.is_empty() { k.clone() } else { format!("{path}.{k}") };
+                    walk(child, &next, hit || lower.contains("hook") || lower.contains("feature"), out);
+                }
+            }
+            None => {
+                if hit {
+                    out.insert(path.to_string(), v.to_string());
+                }
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(v, "", false, &mut out);
+    if let Some(p) = v.get("profile") {
+        out.insert("profile".into(), p.to_string());
+    }
+    out
+}
+
+/// A Write, Edit or MultiEdit of a protected file, or of any JSON file that it would give a
+/// `disableAllHooks` it did not have.
+fn guard_config_file(path: &str, value: &Value, cfg: &GuardConfig) -> Decision {
+    let full = resolve_path(&expand_vars(path, cfg), cfg);
+    let kind = guarded_kind(&full, cfg);
+    if kind == Some(Guarded::Whole) {
+        return guard_config_deny();
+    }
+    if kind.is_none() && !full.to_ascii_lowercase().ends_with(".json") {
+        return Decision::allow();
+    }
+    let disk = fs::read_to_string(&full).unwrap_or_default();
+    if kind.is_none() {
+        // Claude reads settings from more places than the guard knows (managed settings,
+        // a settings file passed by flag); a new `disableAllHooks` key is refused in any JSON.
+        // Counted on parsed keys at every depth, so `"disableAllHooks"` is the same key;
+        // text that is not strict JSON (a tsconfig with comments) is counted loosely instead.
+        let tool = tool_name_of(value).unwrap_or("");
+        let added = match edited_contents(value, &disk) {
+            Some(after) => disable_count(&after) > disable_count(&disk),
+            None => tool == "NotebookEdit" && loose_disable_count(&value.to_string()) > 0,
+        };
+        return if added { guard_config_deny() } else { Decision::allow() };
+    }
+    let Some(kind) = kind else { return Decision::allow() };
+    let Some(after) = edited_contents(value, &disk) else {
+        // NotebookEdit, or an edit that will not apply: nothing a hook needs to allow here.
+        let tool = tool_name_of(value).unwrap_or("");
+        return if matches!(tool, "Edit" | "MultiEdit" | "replace_file_content" | "multi_replace_file_content" | "edit_file") { Decision::allow() } else { guard_config_deny() };
+    };
+    let same = match kind {
+        Guarded::ClaudeSettings => {
+            let before: Value = serde_json::from_str(&disk).unwrap_or(Value::Null);
+            match serde_json::from_str::<Value>(&after) {
+                Ok(next) => {
+                    let off = next.get("disableAllHooks").is_some_and(|v| !matches!(v, Value::Bool(false) | Value::Null));
+                    // `disableAllHooks` as a key at any depth, any case, escapes decoded.
+                    let added = json_disable_count(&after).unwrap_or(usize::MAX) > disable_count(&disk);
+                    !off && !added && next.get("hooks") == before.get("hooks")
+                }
+                Err(_) => false,
+            }
+        }
+        Guarded::CodexConfig => {
+            let before: Option<toml::Value> = toml::from_str(&disk).ok();
+            match toml::from_str::<toml::Value>(&after) {
+                Ok(next) => before.as_ref().map(codex_hook_keys).unwrap_or_default() == codex_hook_keys(&next),
+                Err(_) => false,
+            }
+        }
+        Guarded::Whole => false,
+    };
+    if same { Decision::allow() } else { guard_config_deny() }
+}
+
+/// Shell writes to the guard config and hook files: a redirect, `tee`, `sed -i`, `cp`/`mv`/`ln`
+/// onto them, moving or removing them (or a folder that holds them), `chmod`, a `git`
+/// checkout over them, an inline script that writes them. Reading them is fine.
+fn guard_config(cmd: &str, cfg: &GuardConfig) -> Decision {
+    let bare = without_quoting(cmd);
+    let dirs = agentkit_config_dirs(cfg);
+    let mut needles: Vec<String> = [
+        ".config", "agentkit.toml", "guards.toml", "settings.json", "settings.local.json", "hooks.json", "config.toml",
+        ".claude", ".codex", ".cursor", "accept-guards", "guards-accepted",
+        "decisions.jsonl", "ledger.key", "state/agentkit", ".local",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
+    needles.extend(cfg.config_dir.iter().filter_map(|d| d.file_name().map(|n| n.to_string_lossy().into_owned())));
+    needles.extend(ledger_needles(cfg));
+    let here = resolve_path(&cfg.cwd.to_string_lossy(), cfg);
+    let home = resolve_path(&cfg.home.to_string_lossy(), cfg);
+    let roots: Vec<String> = [".claude", ".codex", ".cursor", ".config"]
+        .iter()
+        .map(|r| format!("{home}/{r}"))
+        .chain(dirs.iter().cloned())
+        .chain(ledger_dirs(cfg))
+        .collect();
+    let in_root = |d: &str| roots.iter().any(|r| d == r || d.starts_with(&format!("{r}/")));
+    // A glob or a variable can name these files without any of the words (`~/.c*/a*/a*.toml`).
+    let dynamic = cmd.contains(['*', '?', '[', '$', '`']);
+    // A copy can carry a hook folder in its source without naming one (`rsync -a /tmp/x/ ~/`).
+    let copies = compiled(r"\b(?:cp|rsync|ditto|install|rclone|mv|ln|gcp)\b").is_match(cmd);
+    // Before any fast path: a write aimed at the ledger, its key, its folder, or the ledger
+    // under another name (a hard link made earlier, found by inode).
+    if ledger_write_hit(cmd, cfg) {
+        return guard_config_deny();
+    }
+    if !dynamic && !copies && !needles.iter().any(|n| cmd.contains(n.as_str()) || bare.contains(n.as_str())) && !in_root(&here) {
+        return Decision::allow();
+    }
+    let all = units_deep(cmd);
+    let vars = literal_assignments(cmd);
+    let subst = |t: &str| vars.iter().fold(t.to_string(), |acc, (n, v)| acc.replace(&format!("${{{n}}}"), v).replace(&format!("${n}"), v));
+    let mut local = cfg.clone();
+    let mut stack: Vec<PathBuf> = Vec::new();
+    let named_in_text = |text: &str, c: &GuardConfig| file_words(text, &vars).iter().any(|w| guarded_shell_hit(w, c));
+    let accepts = bare.contains("accept-guards");
+    if any_unparsed(&all) && (named_in_text(cmd, &local) || in_root(&here) || accepts) {
+        return guard_config_deny();
+    }
+    for u in &all {
+        let prog = u.prog();
+        let operands = u.operands();
+        // `agentkit doctor --accept-guards` is the owner's acceptance of a guard switched off;
+        // an agent running it would launder its own config change. A search for the words, a
+        // commit message or mail that names it is text.
+        let computed_doctor_flag = prog == "agentkit"
+            && u.argv.iter().any(|a| a == "doctor")
+            && (u.argv.iter().any(|a| subst(a).contains(['$', '`'])) || matches!(u.sep.as_str(), "$(" | "`"));
+        if computed_doctor_flag
+            || (accepts
+                && !matches!(prog, "grep" | "egrep" | "rg" | "git" | "agent-mail")
+                && u.argv.iter().any(|a| subst(a).contains("accept-guards")))
+        {
+            return Decision::deny(
+                "guard-config",
+                "`agentkit doctor --accept-guards` is the owner's step: it accepts guards switched off in site config. Do not run it; tell the owner what doctor reports and that the acceptance is his to give.",
+            );
+        }
+        if matches!(prog, "cd" | "pushd" | "popd") && u.remote.is_none() {
+            if prog == "popd" {
+                if let Some(back) = stack.pop() {
+                    local.cwd = back;
+                }
+            } else if let Some(target) = operands.first() {
+                if prog == "pushd" {
+                    stack.push(local.cwd.clone());
+                }
+                local.cwd = PathBuf::from(resolve_path(&expand_vars(&subst(target), &local), &local));
+            }
+            continue;
+        }
+        // A literal assignment on the line is substituted; a target the guard still cannot
+        // resolve (a glob, `$`, a backtick) counts when it could land on a protected path.
+        let hit = |t: &str| {
+            let t = subst(t);
+            guarded_shell_hit(&t, &local) || guarded_dynamic(&t, &local)
+        };
+        // Output and extract-directory options aimed at a protected path: `curl -o`,
+        // `unzip -d`, `tar -C ... -x`, `sort -o`. Programs that only read are left out.
+        let out_flag = (!READERS.contains(&prog) || prog == "sort")
+            && !matches!(prog, "git" | "ssh" | "grep" | "rg" | "find" | "du" | "jq" | "agentkit")
+            && u.argv.iter().enumerate().skip(1).any(|(i, a)| {
+                let value = if matches!(a.as_str(), "-o" | "-O" | "-d" | "-C" | "--output" | "--output-document" | "--output-dir" | "--directory") {
+                    u.argv.get(i + 1).map(String::as_str)
+                } else if let Some((name, v)) = a.split_once('=') {
+                    matches!(name, "--output" | "--output-document" | "--output-dir" | "--directory").then_some(v)
+                } else if a.starts_with("-o") && !a.starts_with("--") && a.len() > 2 {
+                    Some(&a[2..])
+                } else {
+                    None
+                };
+                value.is_some_and(|v| hit(v))
+            });
+        let any = operands.iter().any(|t| hit(t));
+        // Copy-type writers. The destination is `-t DIR` / `--target-directory[=]DIR` when
+        // given; otherwise any operand after the first may be it (flags and their values move
+        // the last word). What each source would leave behind is judged too: a `.claude`
+        // folder (or one inside the source) landing where one already is, or on a protected
+        // path, is a write to hooks (`cp -r /tmp/x/.claude proj/`, `rsync -a /tmp/x/ ~/`).
+        let onto = {
+            let mut target: Option<String> = None;
+            let mut i = 1;
+            while i < u.argv.len() {
+                let a = u.argv[i].as_str();
+                if a == "-t" || a == "--target-directory" {
+                    target = u.argv.get(i + 1).cloned();
+                    i += 1;
+                } else if let Some(v) = a.strip_prefix("--target-directory=") {
+                    target = Some(v.to_string());
+                } else if let Some(v) = a.strip_prefix("-t").filter(|v| !v.is_empty() && !a.starts_with("--")) {
+                    target = Some(v.to_string());
+                }
+                i += 1;
+            }
+            let (sources, dests): (Vec<String>, Vec<String>) = match &target {
+                Some(t) => (operands.iter().filter(|o| **o != t.as_str()).map(|s| s.to_string()).collect(), vec![t.clone()]),
+                None if operands.len() >= 2 => (
+                    operands[..operands.len() - 1].iter().map(|s| s.to_string()).collect(),
+                    operands[1..].iter().map(|s| s.to_string()).collect(),
+                ),
+                None => (Vec::new(), operands.iter().map(|s| s.to_string()).collect()),
+            };
+            dests.iter().any(|d| hit(d))
+                || dests.iter().any(|dest| {
+                    let d = resolve_path(&expand_vars(&subst(dest), &local), &local);
+                    let d = d.trim_end_matches('/');
+                    sources.iter().filter(|s| *s != dest).any(|src| {
+                        let raw = subst(src);
+                        let contents = raw.ends_with('/') || raw.ends_with("/.");
+                        let s = resolve_path(&expand_vars(&raw, &local), &local);
+                        let s = s.trim_end_matches('/');
+                        let base = base_name(s);
+                        // Where the source, and any hook folder inside it, would land.
+                        let mut landings: Vec<String> = Vec::new();
+                        if !contents {
+                            landings.push(format!("{d}/{base}"));
+                        }
+                        for h in HOOK_DIRS.iter().chain([".config"].iter()) {
+                            if Path::new(&format!("{s}/{h}")).exists() {
+                                landings.push(format!("{d}/{h}"));
+                                if !contents {
+                                    landings.push(format!("{d}/{base}/{h}"));
+                                }
+                            }
+                        }
+                        let home = resolve_path(&local.home.to_string_lossy(), &local);
+                        let configs = agentkit_config_dirs(&local);
+                        landings.iter().any(|to| {
+                            let parent = to.rfind('/').map(|j| &to[..j]).unwrap_or("");
+                            // a protected file, a hook folder merged into one that is there (or
+                            // made at home), or over agentkit's config folder or its parent
+                            guarded_kind(to, &local).is_some()
+                                || (HOOK_DIRS.contains(&base_name(to)) && (Path::new(to).exists() || parent == home))
+                                || configs.iter().any(|c| c == to || c.starts_with(&format!("{to}/")))
+                        })
+                    })
+                })
+        };
+        let git_rewrites = prog == "git"
+            && u.argv.iter().any(|a| {
+                matches!(a.as_str(), "checkout" | "restore" | "reset" | "stash" | "apply" | "am" | "pull" | "merge" | "rebase" | "clean" | "mv" | "rm" | "switch" | "cherry-pick" | "revert")
+            })
+            && (any
+                || u.argv.windows(2).any(|w| w[0] == "-C" && dirs.iter().any(|d| resolve_path(&expand_vars(&subst(&w[1]), &local), &local) == *d))
+                || (u.remote.is_none() && dirs.iter().any(|d| local.cwd.to_string_lossy() == *d || resolve_path(&local.cwd.to_string_lossy(), &local).starts_with(&format!("{d}/")))));
+        let wrote = redirect_targets(&u.text).iter().any(|t| hit(t))
+            || out_flag
+            || git_rewrites
+            || match prog {
+                "tee" | "truncate" | "mv" | "trash" | "rm" | "rmdir" | "unlink" | "shred" | "srm" | "sponge" | "chmod"
+                | "chflags" | "chown" | "xattr" | "mkfifo" | "mknod" => any,
+                // the files, not the script: `sed -i '' '1978s/.*/x/' f` names one file
+                "sed" | "gsed" | "perl" | "ruby" => edits_in_place(&u.argv) && script_tool_files(&u.argv).iter().any(|t| hit(t)),
+                // A link or copy whose SOURCE is the ledger, its key or its state folder makes a
+                // second name for it (`ln decisions.jsonl notes.jsonl && : > notes.jsonl`).
+                "ln" | "link" | "cp" | "gcp" | "install" | "rsync" | "ditto" | "rclone"
+                    if operands.iter().any(|t| {
+                        let full = resolve_path(&expand_vars(&subst(t), &local), &local);
+                        ledger_ancestor_hit(&full, &local) || guarded_kind(&full, &local).is_some_and(|_| in_ledger_dir(&full, &local))
+                    }) => true,
+                "cp" | "install" | "ln" | "rsync" | "ditto" | "rclone" => onto,
+                "link" => any,
+                "dd" => u.argv.iter().any(|a| a.strip_prefix("of=").is_some_and(|t| hit(t))),
+                _ => false,
+            }
+            || (runs_inline_script(prog) && script_writes(&u.text) && named_in_text(&u.text, &local));
+        if wrote {
+            return guard_config_deny();
+        }
+    }
+    Decision::allow()
+}
+
 /// The backup client's cleanup that deletes from the backup whatever is no longer on the Mac,
 /// which is exactly what an offload leaves behind. Denied when a command would start it: an
 /// AppleScript that names it, the client's own program or an `open` with it as an argument, or
@@ -2256,13 +3899,14 @@ fn idrive_cleanup(cmd: &str, cfg: &GuardConfig) -> Decision {
     Decision::allow()
 }
 
-/// The path a file-reading tool call names: Claude `Read` (`file_path`) or `Grep` (`path`).
+/// The path a file-reading tool call names: Claude `Read` (`file_path`) / `Grep` (`path`), or Antigravity `view_file`/`read_file`/`grep_search`.
 fn read_target(value: &Value) -> Option<String> {
-    let tool = value.get("tool_name").and_then(|t| t.as_str())?;
-    let input = value.get("tool_input")?;
+    let tool = tool_name_of(value)?;
+    let input = tool_input_of(value)?;
     let get = |f: &str| input.get(f).and_then(|p| p.as_str()).filter(|p| !p.is_empty()).map(str::to_string);
     match tool {
         "Read" => get("file_path"),
+        "view_file" | "read_file" => get("AbsolutePath").or_else(|| get("Path")),
         // A Grep whose glob aims at ssh's folder or a key name reads keys wherever it starts.
         // Grep (ripgrep) skips dot folders unless its glob reaches into one. A glob with a
         // segment that can match a dot name, or a key name, is judged as a search of ~/.ssh.
@@ -2272,6 +3916,7 @@ fn read_target(value: &Value) -> Option<String> {
             }) => Some("~/.ssh".into()),
             _ => Some(get("path").unwrap_or_else(|| ".".into())),
         },
+        "grep_search" => Some(get("SearchPath").unwrap_or_else(|| ".".into())),
         _ => None,
     }
 }
@@ -2333,37 +3978,111 @@ fn names_secret(word: &str, cfg: &GuardConfig) -> bool {
     }
     // The shell expands a glob against the disk, so the disk decides: dot files included,
     // which is stricter than the shell.
-    glob_matches(&full, 200).iter().any(|m| is_private_key(m, cfg))
+    // A glob too long to judge is refused, not waved through: the hook must answer in time.
+    if word.chars().count() > MAX_GLOB_LEN {
+        return true;
+    }
+    // A glob that matches the folder itself (`.ss?`) takes every key in it too.
+    glob_matches(&full, 200).iter().any(|m| is_private_key(m, cfg) || resolve_path(m, cfg) == ssh)
 }
 
-/// Shell-style glob match of one path segment (`*`, `?`, `[...]`).
-fn seg_match(pat: &[char], s: &[char]) -> bool {
-    match (pat.first(), s.first()) {
-        (None, None) => true,
-        (Some('*'), _) => seg_match(&pat[1..], s) || (!s.is_empty() && seg_match(pat, &s[1..])),
-        (Some('?'), Some(_)) => seg_match(&pat[1..], &s[1..]),
-        (Some('['), Some(c)) => match pat.iter().position(|&x| x == ']') {
-            Some(end) if end > 1 => {
-                let set = &pat[1..end];
-                let (neg, set) = if set[0] == '!' || set[0] == '^' { (true, &set[1..]) } else { (false, set) };
-                let mut hit = false;
-                let mut i = 0;
-                while i < set.len() {
-                    if i + 2 < set.len() && set[i + 1] == '-' {
-                        hit |= set[i] <= *c && *c <= set[i + 2];
-                        i += 3;
-                    } else {
-                        hit |= set[i] == *c;
-                        i += 1;
-                    }
+/// Longest glob word the secrets guard matches against the disk.
+const MAX_GLOB_LEN: usize = 512;
+
+enum GlobTok {
+    Star,
+    Any,
+    Class(bool, Vec<char>),
+    Lit(char),
+    /// A `[` with no usable `]`: matches nothing.
+    Never,
+}
+
+fn glob_tokens(pat: &[char]) -> Vec<GlobTok> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < pat.len() {
+        match pat[i] {
+            '*' => {
+                // A run of stars is one star.
+                if !matches!(out.last(), Some(GlobTok::Star)) {
+                    out.push(GlobTok::Star);
                 }
-                hit != neg && seg_match(&pat[end + 1..], &s[1..])
+                i += 1;
             }
-            _ => false,
-        },
-        (Some(p), Some(c)) => p == c && seg_match(&pat[1..], &s[1..]),
-        _ => false,
+            '?' => {
+                out.push(GlobTok::Any);
+                i += 1;
+            }
+            '[' => match pat[i..].iter().position(|&x| x == ']') {
+                Some(end) if end > 1 => {
+                    let set = &pat[i + 1..i + end];
+                    let (neg, set) = if set[0] == '!' || set[0] == '^' { (true, &set[1..]) } else { (false, set) };
+                    out.push(GlobTok::Class(neg, set.to_vec()));
+                    i += end + 1;
+                }
+                _ => {
+                    out.push(GlobTok::Never);
+                    i += 1;
+                }
+            },
+            c => {
+                out.push(GlobTok::Lit(c));
+                i += 1;
+            }
+        }
     }
+    out
+}
+
+fn glob_tok_matches(tok: &GlobTok, c: char) -> bool {
+    match tok {
+        GlobTok::Any => true,
+        GlobTok::Lit(p) => *p == c,
+        GlobTok::Class(neg, set) => {
+            let mut hit = false;
+            let mut i = 0;
+            while i < set.len() {
+                if i + 2 < set.len() && set[i + 1] == '-' {
+                    hit |= set[i] <= c && c <= set[i + 2];
+                    i += 3;
+                } else {
+                    hit |= set[i] == c;
+                    i += 1;
+                }
+            }
+            hit != *neg
+        }
+        GlobTok::Star | GlobTok::Never => false,
+    }
+}
+
+/// Shell-style glob match of one path segment (`*`, `?`, `[...]`). Iterative, with one
+/// backtrack point, so time is at most pattern × name: until 21 Nov 2026 it recursed on every
+/// `*` and `/etc/*****…z` held the hook past its timeout, which lets the command run.
+fn seg_match(pat: &[char], s: &[char]) -> bool {
+    let toks = glob_tokens(pat);
+    let (mut p, mut i) = (0usize, 0usize);
+    let mut star: Option<(usize, usize)> = None;
+    while i < s.len() {
+        if p < toks.len() && matches!(toks[p], GlobTok::Star) {
+            star = Some((p, i));
+            p += 1;
+        } else if p < toks.len() && glob_tok_matches(&toks[p], s[i]) {
+            p += 1;
+            i += 1;
+        } else if let Some((sp, si)) = star {
+            p = sp + 1;
+            i = si + 1;
+            star = Some((sp, si + 1));
+        } else {
+            return false;
+        }
+    }
+    while p < toks.len() && matches!(toks[p], GlobTok::Star) {
+        p += 1;
+    }
+    p == toks.len()
 }
 
 /// Paths an absolute glob matches on disk, dot files included, at most `cap` per level.
@@ -2429,6 +4148,151 @@ fn file_words(text: &str, vars: &[(String, String)]) -> Vec<String> {
         .collect::<Vec<_>>()
 }
 
+/// `cred` subcommands an agent may type: lookups by name and store upkeep. `_values` prints
+/// every stored password as JSON, `fill` puts one in another program's argv, and any other
+/// `_`-prefixed or unknown subcommand is internal; those are refused. (chrome-bg reads cred's
+/// logins in-process and does not shell out.)
+const CRED_ALLOWED: &[&str] = &["list", "add", "import", "rm", "-h", "--help"];
+
+fn cred_dump(cmd: &str) -> Option<Decision> {
+    if !names_tool(cmd, "cred") {
+        return None;
+    }
+    let deny = || {
+        Some(Decision::deny(
+            "secrets",
+            "BLOCKED: that `cred` subcommand prints or hands out passwords. Agents use a login by NAME (`cred list` shows them); chrome-bg and the browser tools put the value in without the model seeing it.",
+        ))
+    };
+    let all = units_deep(cmd);
+    let vars = literal_assignments(cmd);
+    let mentions = all.iter().any(|u| tool_position(u, "cred").is_some());
+    if mentions && any_unparsed(&all) {
+        return deny();
+    }
+    for u in &all {
+        if u.later && !EXECUTORS.contains(&u.parent.as_str()) {
+            continue;
+        }
+        let Some(at) = tool_position(u, "cred") else { continue };
+        let sub = u.argv.get(at + 1).map(|a| {
+            vars.iter().fold(a.clone(), |t, (n, v)| t.replace(&format!("${{{n}}}"), v).replace(&format!("${n}"), v))
+        });
+        let fed = u.wrappers.iter().any(|w| w == "xargs");
+        match sub {
+            // bare `cred` prints its usage, unless xargs supplies the subcommand
+            None => {
+                if fed {
+                    return deny();
+                }
+            }
+            Some(s) if CRED_ALLOWED.contains(&s.as_str()) && !fed => {}
+            Some(_) => return deny(),
+        }
+    }
+    None
+}
+
+/// Is `full` the ssh folder's parent or above (the home, `/Users`, `/`)?
+fn holds_ssh_dir(full: &str, cfg: &GuardConfig) -> bool {
+    let ssh = ssh_dir(cfg);
+    let top = full.trim_end_matches('/');
+    top.is_empty() || ssh.starts_with(&format!("{top}/"))
+}
+
+/// For an archiver or a recursive reader: the config to read its members with (tar's `-C`
+/// directory as cwd), and whether a member it reads holds ~/.ssh (`~`, `.` under `-C ~`, `/`).
+fn tree_reader(u: &Unit, cfg: &GuardConfig, vars: &[(String, String)]) -> (Option<GuardConfig>, bool) {
+    let prog = u.prog();
+    let argv = &u.argv;
+    let subst = |a: &str| vars.iter().fold(a.replace("${HOME}", "$HOME"), |t, (n, v)| t.replace(&format!("${{{n}}}"), v).replace(&format!("${n}"), v));
+    let holds = |w: &str, c: &GuardConfig| holds_ssh_dir(&key_path(&subst(w), c), c);
+    let short_flags = |a: &str| a.starts_with('-') && !a.starts_with("--") && a.len() > 1;
+    if matches!(prog, "tar" | "bsdtar" | "gtar") {
+        let mut dir: Option<String> = None;
+        let mut members: Vec<&str> = Vec::new();
+        let mut i = 1;
+        while i < argv.len() {
+            let a = argv[i].as_str();
+            i += 1;
+            let cluster = if short_flags(a) {
+                Some(&a[1..])
+            } else if i == 2 && !a.contains('/') && a.chars().all(|c| c.is_ascii_alphabetic()) {
+                Some(a) // old style: `tar cf x dir`
+            } else {
+                None
+            };
+            if let Some(body) = cluster {
+                // Each value flag in the cluster takes the next word, or the rest of the cluster.
+                for (at, c) in body.char_indices() {
+                    if matches!(c, 'f' | 'C' | 'T' | 'X' | 'b' | 's' | 'I') {
+                        let attached = &body[at + c.len_utf8()..];
+                        let value = if attached.is_empty() {
+                            let v = argv.get(i).cloned();
+                            i += 1;
+                            v
+                        } else {
+                            Some(attached.to_string())
+                        };
+                        if c == 'C' {
+                            dir = value;
+                        }
+                        if !attached.is_empty() {
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+            if let Some(v) = a.strip_prefix("--directory=") {
+                dir = Some(v.to_string());
+                continue;
+            }
+            if a == "--directory" || a == "--file" || a == "--exclude" || a == "--files-from" {
+                if a == "--directory" {
+                    dir = argv.get(i).cloned();
+                }
+                i += 1;
+                continue;
+            }
+            if a.starts_with('-') {
+                continue;
+            }
+            members.push(a);
+        }
+        let member_cfg = dir.map(|d| {
+            let mut c = cfg.clone();
+            c.cwd = PathBuf::from(key_path(&subst(&d), cfg));
+            c
+        });
+        let base = member_cfg.as_ref().unwrap_or(cfg);
+        let tree = members.iter().any(|m| holds(m, base) || names_secret(&subst(m), base));
+        return (member_cfg, tree);
+    }
+    let has_short = |letters: &[char]| argv.iter().skip(1).any(|a| short_flags(a) && a[1..].contains(letters));
+    let has_long = |names: &[&str]| argv.iter().skip(1).any(|a| names.contains(&long_name(a)));
+    let ops = u.operands();
+    let (recursive, read): (bool, Vec<&str>) = match prog {
+        "zip" => (has_short(&['r', 'R']) || has_long(&["--recurse-paths"]), ops.iter().skip(1).copied().collect()),
+        "7z" | "7za" | "7zz" => (true, ops.iter().skip(2).copied().collect()),
+        "ditto" | "rsync" | "rclone" | "restic" | "borg" | "kopia" | "pax" => {
+            (true, ops[..ops.len().saturating_sub(1)].to_vec())
+        }
+        "cp" | "scp" | "gcp" => (
+            has_short(&['r', 'R', 'a']) || has_long(&["--recursive", "--archive"]),
+            ops[..ops.len().saturating_sub(1)].to_vec(),
+        ),
+        "grep" | "egrep" | "fgrep" | "ggrep" => (has_short(&['r', 'R']) || has_long(&["--recursive", "--dereference-recursive"]), ops.clone()),
+        "rg" | "ag" => (has_short(&['u', '.']) || has_long(&["--hidden", "--unrestricted"]), ops.clone()),
+        "find" => (
+            argv.iter().any(|a| matches!(a.as_str(), "-exec" | "-execdir" | "-ok" | "-okdir" | "-fprint" | "-fls")),
+            find_roots(argv),
+        ),
+        _ => (false, Vec::new()),
+    };
+    (None, recursive && read.iter().any(|w| holds(w, cfg)))
+}
+
 /// Exfiltration of keys, not their use. Any command that names a private key (or ~/.ssh, or a
 /// glob that reaches one) is denied unless its program uses keys in place: ssh, git, ssh-add,
 /// ssh-keygen, chmod, ls, stat, trash; cp/mv that stay inside ~/.ssh; scp/rsync/sftp to a fleet
@@ -2442,6 +4306,9 @@ fn secrets(cmd: &str, cfg: &GuardConfig) -> Decision {
     ];
     const COPIERS: &[&str] = &["scp", "rsync", "sftp"];
     let deny = || Decision::deny("secrets", SECRETS_REASON);
+    if let Some(d) = cred_dump(cmd) {
+        return d;
+    }
     let all = units(cmd);
     let vars = assignments(&without_quoting(cmd));
     let mut local = cfg.clone();
@@ -2462,7 +4329,12 @@ fn secrets(cmd: &str, cfg: &GuardConfig) -> Decision {
             }
         }
         let words = file_words(&u.text, &vars);
-        if !words.iter().any(|w| names_secret(w, &local)) {
+        // `tar -C ~ -cf x .ssh` names `.ssh` relative to its -C directory; `tar -cf x ~`,
+        // `grep -r k ~`, `zip -r x ~` take the whole home, ~/.ssh included.
+        let (member_cfg, tree) = tree_reader(u, &local, &vars);
+        let named = words.iter().any(|w| names_secret(w, &local))
+            || member_cfg.as_ref().is_some_and(|m| words.iter().any(|w| names_secret(w, m)));
+        if !named && !tree {
             continue;
         }
         // A key read on stdin (`prog < key`, `$(<key)`) is data whatever the program is.
@@ -2590,5 +4462,11 @@ pub fn self_test(cfg: &GuardConfig) -> Result<(), String> {
     expect("idrive-cleanup", idrive_cleanup("grep -i 'archive cleanup' notes.md", &stock), false, "a search for the words")?;
     expect("secrets", secrets("cat ~/.ssh/id_ed25519", cfg), true, "printing a private key")?;
     expect("secrets", secrets("ssh-keygen -y -f ~/.ssh/id_ed25519", cfg), false, "reading a key's public half")?;
+    expect("secrets", secrets("tar -C ~ -cf /tmp/agentkit-self-test.tar .ssh", cfg), true, "archiving ~/.ssh from -C ~")?;
+    let site_file = cfg.home.join(".config/agentkit/agentkit.toml");
+    expect("guard-config", guard_config(&format!("echo x >> '{}'", site_file.display()), cfg), true, "a write to the site config")?;
+    expect("guard-config", guard_config(&format!("cat '{}'", site_file.display()), cfg), false, "reading the site config")?;
+    expect("hard-delete", hard_delete("$(echo rm) -rf /var/agentkit-self-test/important", cfg), true, "a computed program word")?;
+    expect("hard-delete", hard_delete("rsync -a --delete /tmp/agentkit-self-test/ /var/agentkit-self-test/important/", cfg), true, "rsync --delete outside temp")?;
     Ok(())
 }

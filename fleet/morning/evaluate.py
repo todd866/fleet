@@ -14,7 +14,7 @@ RANK = {"pass": 0, "warn": 1, "fail": 2}
 # A sleeping laptop is info once its snapshot is older than 3 h. Warn only after 48 h.
 SNAPSHOT_INFO_S = 3 * 3600
 SNAPSHOT_WARN_S = 48 * 3600
-ORDER = ("host", "disk", "backup", "sync", "update", "job", "thermal", "capacity", "agent", "project", "check", "place", "kit", "upstream")
+ORDER = ("host", "disk", "backup", "sync", "update", "job", "thermal", "capacity", "agent", "project", "check", "place", "cloud", "kit", "upstream")
 REGISTERED = re.compile(r"^[0-9a-f]{64}$")
 # macOS volumes that live in the boot disk's container: the internal disk again, not another one.
 SYSTEM_VOLUMES = frozenset((
@@ -60,6 +60,7 @@ def evaluate(snapshot, config, now):
     rows.extend(_agents(snapshot.get("board"), now))
     rows.extend(_projects(snapshot.get("projects") or [], _reported_jobs(snapshot.get("hosts") or {}), prefixes))
     rows.extend(_placement(snapshot.get("placement"), rows, now))
+    rows.extend(_cloud(snapshot.get("cloud"), now))
     rows.extend(_coverage(snapshot.get("coverage"), now))
     rows.extend(_agentkit(snapshot.get("agentkit")))
     rows.extend(_job_reviews(snapshot.get("job_reviews"), now))
@@ -256,6 +257,8 @@ def _backups(name, host, config, now):
         rows.extend(_offload_autopilot(name, host["offload_queue"].get("autopilot"), now))
     if isinstance(host.get("free_space_guard"), dict):
         rows.append(_free_space_guard(name, host["free_space_guard"], now))
+    if isinstance(host.get("mac_setup"), dict):
+        rows.append(_mac_setup(name, host["mac_setup"], now))
     if host.get("home_mirror") is not None:
         rows.append(_home_mirror(name, host["home_mirror"], cfg, now))
     if "drive_mirror_epoch" in host:
@@ -602,6 +605,7 @@ def _capacity(capacity, config, now, tz):
     cfg = config.get("capacity") or {}
     near_pct = float(cfg.get("near_empty_pct", 10))
     near_jobs = float(cfg.get("near_empty_jobs", 5))
+    paused = {str(p).lower() for p in (capacity.get("paused") or cfg.get("paused") or [])}
     rows = []
     for pool in capacity.get("pools") or []:
         engine = str(pool.get("engine") or "pool")
@@ -612,6 +616,10 @@ def _capacity(capacity, config, now, tz):
         fresh = not pool.get("stale") and (reset is None or int(reset) > now)
         key = f"capacity:{engine}:{name}"
         label = f"{engine} {name}"
+        if pool.get("paused") or engine.lower() in paused:
+            rows.append(_row(key, "pass", "capacity", label, "paused", "paused",
+                             "provider is paused in paused-providers"))
+            continue
         if pool.get("absent") and not pool.get("stale"):
             rows.append(_row(key, "pass", "capacity", label, "none", "no such window",
                              "the provider reports no such window for this account"))
@@ -753,15 +761,20 @@ def _projects(projects, reported=frozenset(), prefixes=("com.example.",)):
 
 
 PLACEMENT_STALE_S = 3 * 3600
+UNCLAIMED_WARN_GB = 50
+MAP_STALE_S = 26 * 3600
 _PERSONAL_CODES = {"personal-copies", "offsite"}
 
 
 def _placement(placement, existing, now=None):
     """Placement gaps, condensed: one row per data set naming every gap (and the hosts where a
     gap is host-specific), and one row for all personal sets that only lack their encrypted
-    second copy and off-site copy. A status row gives the result's age; past 3 h it is stale."""
+    second copy and off-site copy. A status row gives the result's age; past 3 h it is stale.
+    `unclaimed` is a separate reading (placement-unclaimed --write): one row per Mac."""
     if not placement:
         return []
+    if placement.get("measured_only"):
+        return _unclaimed_rows(placement.get("unclaimed"), now)
     covered = {row.name.split(" ", 1)[0] for row in existing if row.area == "disk"}
     rows = []
     try:
@@ -794,11 +807,14 @@ def _placement(placement, existing, now=None):
             _gb(free) if isinstance(free, (int, float)) else "—", state,
             f"{ident} {free} GB {state}",
         ))
+    google_covered = _gdrive_covered_datasets(placement)
     sets = {}
     for viol in placement.get("violations") or []:
         if not isinstance(viol, dict):
             continue
         name = str(viol.get("dataset") or viol.get("host") or "placement")
+        if str(viol.get("code") or "") == "offsite" and name in google_covered:
+            continue
         sets.setdefault(name, []).append(viol)
     personal = [name for name, viols in sets.items() if _personal_only(viols)]
     if len(personal) < 2:
@@ -813,13 +829,379 @@ def _placement(placement, existing, now=None):
         if name in personal:
             continue
         gaps = _gap_labels(viols)
-        rows.append(_row(f"place:{name}", "fail", "place", name, "gap", gaps, f"{name}: {gaps}"))
+        detail = f"{name}: {gaps}"
+        if name in google_covered:
+            detail += " (encrypted offsite on Google)"
+        rows.append(_row(f"place:{name}", "fail", "place", name, "gap", gaps, detail))
+    rows.extend(_unclaimed_rows(placement.get("unclaimed"), now))
     return rows
+
+
+def _unclaimed_rows(doc, now):
+    """One row per Mac. Under 50 GB is ok; 50 GB and over warns. Older than 26 h is stale."""
+    if not isinstance(doc, dict) or not doc:
+        return []
+    hosts = doc.get("hosts") if isinstance(doc.get("hosts"), dict) else {}
+    stale, when = _map_age(doc.get("generated"), now)
+    if not hosts:
+        if not stale:
+            return []
+        return [_row("place:unclaimed", "warn", "place", "unclaimed", "stale", when,
+                     f"unclaimed folders are stale ({when})")]
+    rows = []
+    for host in sorted(hosts):
+        entry = hosts[host] if isinstance(hosts[host], dict) else {}
+        if stale:
+            rows.append(_row(
+                f"place:unclaimed:{host}", "warn", "place", str(host), "stale", when,
+                f"unclaimed folders on {host} are stale ({when})",
+            ))
+            continue
+        total = _gb_total(entry)
+        top = sorted(
+            (item for item in (entry.get("top") or []) if isinstance(item, dict)),
+            key=lambda item: -_float(item.get("gb")),
+        )
+        status = "warn" if total >= UNCLAIMED_WARN_GB else "pass"
+        rows.append(_row(
+            f"place:unclaimed:{host}", status, "place", str(host),
+            f"{_num(total)} GB unclaimed", _home_datum(top),
+            f"{_num(total)} GB on {host} is not in placement.toml (warn at {UNCLAIMED_WARN_GB:g} GB)",
+        ))
+    return rows
+
+
+def _cloud(cloud, now=None):
+    """One row per remote: total, largest folder, and folders no dataset offsite or path claims."""
+    if not isinstance(cloud, dict) or not cloud:
+        return []
+    remotes = cloud.get("remotes") if isinstance(cloud.get("remotes"), dict) else {}
+    claims = [str(item).strip() for item in (cloud.get("claims") or []) if str(item).strip()]
+    stale, when = _map_age(cloud.get("generated"), now)
+    if not remotes:
+        if not stale:
+            return []
+        return [_row("cloud:inventory", "warn", "cloud", "cloud", "stale", when,
+                     f"cloud inventory is stale ({when})")]
+    rows = []
+    for name in sorted(remotes):
+        entry = remotes[name] if isinstance(remotes[name], dict) else {}
+        if stale:
+            rows.append(_row(f"cloud:{name}", "warn", "cloud", str(name), "stale", when,
+                             f"{name} inventory is stale ({when})"))
+            continue
+        error = str(entry.get("error") or "").strip()
+        if error:
+            rows.append(_row(f"cloud:{name}", "warn", "cloud", str(name), "unread", error.splitlines()[0], error))
+            continue
+        folders = [item for item in (entry.get("folders") or []) if isinstance(item, dict)]
+        total = entry.get("total_gb")
+        if isinstance(total, bool) or not isinstance(total, (int, float)):
+            total = sum(_float(item.get("gb")) for item in folders if "/" not in str(item.get("path") or "").strip("/"))
+        missing = _unclaimed_cloud(str(name), entry, folders, claims)
+        rows.append(_row(
+            f"cloud:{name}", "warn" if missing else "pass", "cloud", str(name),
+            _gb(total), _cloud_datum(folders, missing),
+            _cloud_detail(str(name), total, folders, missing),
+        ))
+    return rows
+
+
+def _map_age(generated, now):
+    """(stale, datum). Age is not judged when the caller passed no `now`."""
+    if now is None:
+        return False, ""
+    try:
+        generated = int(generated)
+    except (TypeError, ValueError):
+        generated = 0
+    if not generated:
+        return True, "no time"
+    age = (int(now) - generated) / 3600
+    if age * 3600 > MAP_STALE_S:
+        return True, _hours(age)
+    return False, ""
+
+
+def _gb_total(entry):
+    total = entry.get("gb_total")
+    if isinstance(total, bool) or not isinstance(total, (int, float)):
+        return sum(_float(item.get("gb")) for item in (entry.get("top") or []) if isinstance(item, dict))
+    return float(total)
+
+
+def _float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _home_datum(top):
+    parts = []
+    for item in list(top)[:2]:
+        path = str(item.get("path") or "").strip("/")
+        if path.startswith("~") or path.startswith("/"):
+            shown = path
+        else:
+            shown = f"~/{path}"
+        parts.append(f"{shown} {_num(_float(item.get('gb')))} GB")
+    return ", ".join(parts)
+
+
+def _cloud_datum(folders, missing):
+    ranked = sorted(folders, key=lambda item: -_float(item.get("gb")))
+    if ranked:
+        path = str(ranked[0].get("path") or "").strip("/")
+        head = f"{path} {_num(_float(ranked[0].get('gb')))} GB"
+    else:
+        head = "no folders"
+    if missing:
+        return head + ", unclaimed: " + ", ".join(missing)
+    return head
+
+
+def _cloud_detail(name, total, folders, missing):
+    text = f"{name} {_num(_float(total))} GB"
+    if missing:
+        text += "; unclaimed: " + ", ".join(missing)
+    elif folders:
+        text += "; every folder is claimed"
+    return text
+
+
+def _unclaimed_cloud(name, entry, folders, claims):
+    paths = [str(item.get("path") or "").strip("/") for item in folders]
+    paths = [path for path in paths if path]
+    size = {str(item.get("path") or "").strip("/"): _float(item.get("gb")) for item in folders}
+    missing = []
+    for path in paths:
+        if _cloud_claimed(name, entry, path, claims):
+            continue
+        if any(other != path and path.startswith(other + "/") and not _cloud_claimed(name, entry, other, claims)
+               for other in paths):
+            continue
+        missing.append(path)
+    missing.sort(key=lambda path: (-size.get(path, 0), path))
+    return missing
+
+
+def _cloud_claimed(name, entry, path, claims):
+    ids = {name}
+    stem = str(entry.get("remote") or "").split(":", 1)[0].strip()
+    if stem:
+        ids.add(stem)
+    for claim in claims:
+        remote, claim_path, whole = _parse_claim(claim, ids)
+        if remote and remote not in ids:
+            continue
+        if whole or _path_covers(path, claim_path):
+            return True
+    return False
+
+
+def _parse_claim(claim, ids):
+    claim = claim.strip().strip("/")
+    if ":" in claim:
+        remote, path = claim.split(":", 1)
+        path = path.strip().strip("/")
+        return remote.strip(), path, path == ""
+    if claim in ids:
+        return claim, "", True
+    return None, claim, False
+
+
+def _path_covers(path, claim_path):
+    if not claim_path:
+        return False
+    return path == claim_path or path.startswith(claim_path + "/") or claim_path.startswith(path + "/")
+
+
+def _norm_rel(path):
+    text = str(path or "").strip()
+    if text.startswith("~/"):
+        text = text[2:]
+    return text.strip("/")
+
+
+def _under(path, root):
+    path = str(path or "").rstrip("/")
+    root = str(root or "").rstrip("/")
+    return bool(root) and (path == root or path.startswith(root + "/"))
+
+
+def _gdrive_run_ok(rec):
+    if not isinstance(rec, dict):
+        return False
+    ok = rec.get("last_ok")
+    return not isinstance(ok, bool) and isinstance(ok, (int, float)) and ok > 0
+
+
+def _gdrive_pack_ok(rec):
+    """A pack counts only with last_ok and (when shards are recorded) non-empty shards with none partial."""
+    if not _gdrive_run_ok(rec):
+        return False
+    shards = rec.get("shards")
+    if shards is not None:
+        if not isinstance(shards, dict) or not shards:
+            return False
+        for shard in shards.values():
+            if not isinstance(shard, dict) or shard.get("partial"):
+                return False
+    return True
+
+
+def _gdrive_path_covered(entry, dest, rel_path):
+    """True when one host's Google Drive backup receipts cover DEST without gaps or partial packs."""
+    if not isinstance(entry, dict):
+        return False
+    receipts = entry.get("receipts")
+    if not isinstance(receipts, dict) or not receipts:
+        return False
+    dest = str(dest or "").rstrip("/")
+    rel_path = _norm_rel(rel_path)
+    sources = [s for s in (entry.get("sources") or []) if isinstance(s, dict)]
+
+    # Configured sources (prefer longest matching root first, mirroring gdrive-backup/proof.py).
+    matching = []
+    for src in sources:
+        root = str(src.get("path") or "").rstrip("/")
+        if root and _under(dest, root):
+            matching.append((len(root), src, root))
+    matching.sort(key=lambda item: item[0], reverse=True)
+
+    for _length, src, root in matching:
+        name = str(src.get("name") or "")
+        packs = {str(p).strip("/") for p in (src.get("packs") or []) if str(p).strip("/")}
+        prefix = f"{name}:pack:"
+        for key in receipts:
+            if isinstance(key, str) and key.startswith(prefix):
+                rel = key[len(prefix):].strip("/")
+                if rel:
+                    packs.add(rel)
+
+        # Packs decide when DEST is inside a pack; packs inside DEST must all be complete.
+        enclosing = []
+        inner_incomplete = False
+        for pack_rel in packs:
+            pack_abs = f"{root}/{pack_rel}"
+            done = _gdrive_pack_ok(receipts.get(f"{name}:pack:{pack_rel}"))
+            if _under(dest, pack_abs):
+                enclosing.append((len(pack_abs), done))
+            elif _under(pack_abs, dest) and not done:
+                inner_incomplete = True
+        if enclosing:
+            enclosing.sort(key=lambda item: item[0], reverse=True)
+            if enclosing[0][1]:
+                return True
+            continue
+        if inner_incomplete:
+            continue
+
+        # Priority requests (req:PATH) cover DEST when finished (and no inner pack is incomplete).
+        for key, rec in receipts.items():
+            if isinstance(key, str) and key.startswith("req:"):
+                req_root = key[4:].rstrip("/")
+                if _under(dest, req_root) and _gdrive_run_ok(rec):
+                    return True
+
+        # Source-level file sync covers unmasked paths.
+        masks = [str(m).strip("/") for m in (src.get("masks") or []) if str(m).strip("/")]
+        if any(_under(dest, f"{root}/{m}") for m in masks):
+            continue
+        if _gdrive_run_ok(receipts.get(name)):
+            return True
+
+    # Standalone req:PATH or pack receipts when no source config was attached for this host.
+    if not matching:
+        if not sources and rel_path:
+            enclosing = []
+            inner_incomplete = False
+            for key, rec in receipts.items():
+                if not isinstance(key, str) or ":pack:" not in key:
+                    continue
+                pack_rel = key.split(":pack:", 1)[1].strip("/")
+                if not pack_rel:
+                    continue
+                done = _gdrive_pack_ok(rec)
+                if _under(rel_path, pack_rel):
+                    enclosing.append((len(pack_rel), done))
+                elif _under(pack_rel, rel_path) and not done:
+                    inner_incomplete = True
+            if enclosing:
+                enclosing.sort(key=lambda item: item[0], reverse=True)
+                return enclosing[0][1]
+            if inner_incomplete:
+                return False
+        for key, rec in receipts.items():
+            if isinstance(key, str) and key.startswith("req:"):
+                req_root = key[4:].rstrip("/")
+                if _under(dest, req_root) and _gdrive_run_ok(rec):
+                    return True
+    return False
+
+
+def _gdrive_dataset_covered(dataset, gdrive):
+    """True when every path of DATASET has a finished, non-partial Google copy on a host holding it."""
+    paths = [_norm_rel(p) for p in (dataset.get("paths") or []) if _norm_rel(p)]
+    if not paths:
+        return False
+    master = str(dataset.get("master_host") or "")
+    volumes = []
+    for vol in [dataset.get("master_volume"), *(dataset.get("replica_volumes") or [])]:
+        text = str(vol or "").strip()
+        if text and text not in volumes:
+            volumes.append(text)
+    keep = [str(h) for h in (dataset.get("keep") or []) if str(h)]
+    if "*" in keep:
+        holders = list(gdrive.keys())
+    else:
+        holders = []
+        for host in [*keep, master]:
+            if host and host in gdrive and host not in holders:
+                holders.append(host)
+        if not holders and not master and not keep:
+            holders = list(gdrive.keys())
+    if not holders:
+        return False
+    for rel_path in paths:
+        covered = False
+        for host in holders:
+            entry = gdrive.get(host)
+            if not isinstance(entry, dict):
+                continue
+            home = str(entry.get("home") or "").rstrip("/")
+            candidates = []
+            if home:
+                candidates.append(f"{home}/{rel_path}")
+            if host == master:
+                for vol in volumes:
+                    candidates.append(f"/Volumes/{vol}/{rel_path}")
+            if not candidates:
+                candidates.append(rel_path)
+            if any(_gdrive_path_covered(entry, cand, rel_path) for cand in candidates):
+                covered = True
+                break
+        if not covered:
+            return False
+    return True
+
+
+def _gdrive_covered_datasets(placement):
+    datasets = placement.get("datasets") or []
+    gdrive = placement.get("gdrive") or {}
+    if not isinstance(datasets, list) or not isinstance(gdrive, dict) or not gdrive:
+        return set()
+    return {
+        str(ds["name"])
+        for ds in datasets
+        if isinstance(ds, dict) and ds.get("name") and _gdrive_dataset_covered(ds, gdrive)
+    }
 
 
 def _personal_only(viols):
     codes = {str(v.get("code") or "") for v in viols}
-    if not codes or not codes <= _PERSONAL_CODES:
+    if codes != _PERSONAL_CODES:
         return False
     return all(str(v.get("detail") or "").startswith("0 ") for v in viols if v.get("code") == "personal-copies")
 
@@ -1328,6 +1710,32 @@ def _free_space_guard(name, status, now):
         level = "warn" if level == "pass" else level
         value, detail = "stale", f"guard last ran {age / 3600:.0f} h ago. " + detail
     return _row(key, level, "disk", title, value, datum, detail)
+
+
+def _mac_setup(name, status, now):
+    """One row per Mac: how far its setup has drifted from the reference Mac (mac-setup). No drift passes;
+    drift warns and names the first items; a pass older than an hour, or a daily package pass older than
+    36 hours on a follower, is stale."""
+    key, title = f"kit:{name}:setup", f"{name} setup"
+    drift = [str(d) for d in (status.get("drift") or [])]
+    age = now - int(status.get("checked_at") or 0)
+    pkg_at = status.get("packages_checked_at")
+    level, value = ("pass", "matches") if not drift else ("warn", f"{len(drift)} drift")
+    datum = "same as the reference" if not drift else (status.get("packages_deferred") or "see status file")
+    detail = (f"{name} setup matches the reference Mac." if not drift else
+              f"{name} differs from the reference Mac: " + "; ".join(d[:160] for d in drift[:4])
+              + (f"; and {len(drift) - 4} more" if len(drift) > 4 else "")
+              + f". Full list: `mac-setup status` on {name}.")
+    if status.get("packages_installed"):
+        detail += f" Installed today: {', '.join(status['packages_installed'][:8])}."
+    if age > 3600 or age < -300:
+        level, value = "warn", "stale"
+        detail = f"mac-setup last ran {age / 3600:.0f} h ago (its 5-minute launchd job). " + detail
+    elif status.get("role") == "follower" and (pkg_at is None or now - int(pkg_at) > 36 * 3600):
+        level, value = "warn", "packages stale"
+        detail = ("the daily package pass has not run yet (its daily launchd job). " + detail) if pkg_at is None else (
+            f"the daily package pass last ran {(now - int(pkg_at)) / 3600:.0f} h ago (its daily launchd job). " + detail)
+    return _row(key, level, "kit", title, value, datum, detail)
 
 
 def _ai_usage(summary, now):

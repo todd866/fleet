@@ -1,0 +1,19 @@
+# Cloud folder sizes. Copy to ~/.config/fleet/cloud-inventory.toml and edit.
+# `remote` is the rclone remote, colon included, plus a bucket path when the
+# remote is a whole account. `depth` is how many folder levels to size (default 2).
+# A remote `rclone listremotes` does not have is skipped. Names here are examples.
+
+[[remote]]
+name = "archive"
+remote = "archive:"
+depth = 2
+
+[[remote]]
+name = "drive"
+remote = "gdrive:"
+depth = 2
+
+[[remote]]
+name = "drive-crypt"
+remote = "gcrypt:"
+depth = 2

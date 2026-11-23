@@ -219,6 +219,9 @@ pub struct FileAttr {
     pub is_dir: bool,
     pub mount_point: bool,
     pub symlink: bool,
+    /// Hard links to the file. Each link is charged an equal share, so a file
+    /// linked from several directories is counted once in their common total.
+    pub links: u32,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -246,6 +249,8 @@ pub fn account_entries(entries: &[(&str, FileAttr)]) -> DirAccount {
             continue;
         }
         let (local, dataless) = split_bytes(attr.allocated, attr.logical, attr.flags);
+        let links = u64::from(attr.links.max(1));
+        let (local, dataless) = (local / links, dataless / links);
         out.own_bytes = out.own_bytes.saturating_add(local);
         out.own_dataless = out.own_dataless.saturating_add(dataless);
         out.files += 1;
@@ -323,7 +328,8 @@ fn parent_rel(path: &str) -> String {
 }
 
 /// Collapse a batch of FSEvents into directory rescans.
-/// `MustScanSubDirs` (and a root change) covers every descendant.
+/// `MustScanSubDirs` (and a root change) covers every descendant; directories
+/// named by events beneath it are still rescanned on their own.
 /// File events rescan the parent directory. Duplicate paths merge.
 pub fn coalesce(events: &[RawEvent]) -> Vec<ScanReq> {
     let mut subtree: BTreeSet<String> = BTreeSet::new();
@@ -351,13 +357,12 @@ pub fn coalesce(events: &[RawEvent]) -> Vec<ScanReq> {
     for path in drop_sub {
         subtree.remove(&path);
     }
-    let drop_dirs: Vec<String> = dirs
-        .iter()
-        .filter(|path| subtree.iter().any(|sub| is_under(path, sub)))
-        .cloned()
-        .collect();
-    for path in drop_dirs {
-        dirs.remove(&path);
+    // A directory named by its own event is kept even when a whole-subtree rescan
+    // covers it. The subtree rescan waits in a hold and, for a dropped-events flag on a
+    // high directory, can take days to reach the far side of the volume; the named
+    // directory (a deletion, a rename) is applied now.
+    for sub in &subtree {
+        dirs.remove(sub);
     }
     let mut out: Vec<ScanReq> = subtree.into_iter().map(ScanReq::Subtree).collect();
     out.extend(dirs.into_iter().map(ScanReq::Dir));

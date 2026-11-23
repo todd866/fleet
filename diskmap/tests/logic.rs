@@ -9,6 +9,7 @@ fn file(allocated: u64, logical: u64, flags: u32) -> FileAttr {
         is_dir: false,
         mount_point: false,
         symlink: false,
+        links: 1,
     }
 }
 
@@ -35,6 +36,7 @@ fn mount_points_are_not_walked_as_children() {
         is_dir: true,
         mount_point: true,
         symlink: false,
+        links: 1,
     };
     let acc = account_entries(&[("Volumes", dir)]);
     assert!(acc.subdirs.is_empty());
@@ -87,7 +89,7 @@ fn config_file_overrides_one_floor_and_keeps_the_rest() {
 }
 
 #[test]
-fn fsevents_coalesce_to_one_subtree_and_file_parents() {
+fn fsevents_coalesce_to_one_subtree_named_dirs_and_file_parents() {
     let events = [
         RawEvent { path: "a/b/c".into(), flags: 0, id: 1 },
         RawEvent { path: "a/b/c".into(), flags: 0, id: 2 },
@@ -99,7 +101,12 @@ fn fsevents_coalesce_to_one_subtree_and_file_parents() {
     let scans = coalesce(&events);
     assert_eq!(
         scans,
-        vec![ScanReq::Subtree("a/b".into()), ScanReq::Dir("z".into())]
+        vec![
+            ScanReq::Subtree("a/b".into()),
+            ScanReq::Dir("a/b/c".into()),
+            ScanReq::Dir("a/b/d".into()),
+            ScanReq::Dir("z".into()),
+        ]
     );
 }
 

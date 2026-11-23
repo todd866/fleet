@@ -3,6 +3,7 @@
 No du, no find, no writes. Syncthing is a localhost GET. The API key stays in this process.
 """
 import datetime
+import fnmatch
 import json
 import os
 import pathlib
@@ -13,6 +14,12 @@ import subprocess
 import time
 import urllib.parse
 import urllib.request
+import xml.parsers.expat
+
+try:
+    import tomllib
+except ImportError:  # pragma: no cover - Python <3.11 fallback
+    tomllib = None
 
 HOME = pathlib.Path.home()
 
@@ -55,6 +62,10 @@ def _gather():
         "syncthing": _syncthing(),
         "owner_active": _owner_active(),
         "placement": _json(HOME / ".local/state/placement/status.json"),
+        "placement_datasets": _placement_datasets(),
+        "unclaimed": _json(HOME / ".local/state/placement/unclaimed.json"),
+        "cloud": _json(HOME / ".local/state/placement/cloud.json"),
+        "gdrive_backup": _gdrive_backup(),
         "coverage": _json(_drives_project() / "coverage.json"),
         "idrive_epoch": idrive.get("last_epoch"),
         "idrive": idrive,
@@ -65,6 +76,8 @@ def _gather():
         "offload_queue": _json(HOME / str(_site().get("offload_status_path") or ".local/state/offload/status.json")),
         # free-space-guard's last run on this Mac (storage/free-space-guard).
         "free_space_guard": _json(HOME / ".local/state/fleet/free-space-guard/status.json"),
+        # mac-setup's last pass on this Mac: drift from the reference Mac's setup (bin/mac-setup).
+        "mac_setup": _json(HOME / ".local/state/fleet/mac-setup/status.json"),
         "icloud": _icloud(),
         # Full Disk Access and the trees diskmap leaves unmeasured without it (diskmap summary).
         "diskmap_access": _diskmap_access(),
@@ -364,7 +377,7 @@ def _jobs():
         try:
             with path.open("rb") as handle:
                 plist = plistlib.load(handle)
-        except (OSError, plistlib.InvalidFileException):
+        except (OSError, plistlib.InvalidFileException, xml.parsers.expat.ExpatError):
             continue
         label = plist.get("Label") or path.stem
         specs.append((label, plist))
@@ -775,6 +788,147 @@ def _jsonl(path, limit):
         except ValueError:
             continue
     return rows
+
+
+def _expand_home(raw, home):
+    text = str(raw or "").strip()
+    if text == "~":
+        return str(home)
+    if text.startswith("~/"):
+        return str(home / text[2:])
+    return text
+
+
+def _pack_pruner(src, home):
+    """Match gdrive-backup's exclude/exclude_from rules when expanding parent/* packs."""
+    pats = []
+    lines = []
+    ex_from = src.get("exclude_from")
+    if ex_from:
+        ex_path = pathlib.Path(_expand_home(ex_from, home))
+        try:
+            lines = ex_path.read_text(errors="replace").splitlines()
+        except OSError:
+            lines = []
+    lines += [str(e).replace("/**", "/") for e in (src.get("exclude") or [])]
+    for line in lines:
+        if not line or line.startswith("#"):
+            continue
+        anchored = line.startswith("/")
+        cleaned = line.strip("/").replace("**", "*")
+        pats.append((anchored, cleaned))
+    exact_rel = {p for a, p in pats if a and not any(c in p for c in "*?[")}
+    exact_name = {p for a, p in pats if not a and not any(c in p for c in "*?[") and "/" not in p}
+    globs = [(a, p) for a, p in pats if any(c in p for c in "*?[") or (not a and "/" in p)]
+
+    def skip(rel):
+        base = os.path.basename(rel)
+        if rel in exact_rel or base in exact_name:
+            return True
+        for anchored, pat in globs:
+            if anchored and fnmatch.fnmatchcase(rel, pat):
+                return True
+            if not anchored and (fnmatch.fnmatchcase(base, pat) or fnmatch.fnmatchcase(rel, "*/" + pat)):
+                return True
+        return False
+
+    return skip
+
+
+def _gdrive_backup(home=None):
+    """Encrypted Google Drive backup receipts and configured sources/packs on this Mac."""
+    home = pathlib.Path(home) if home is not None else HOME
+    receipts = _json(home / ".local/state/gdrive-backup/receipts.json")
+    if not isinstance(receipts, dict) or not receipts:
+        return None
+    site_cfg = _json(home / ".config/fleet/gdrive-backup.json")
+    if not isinstance(site_cfg, dict):
+        site_cfg = {}
+    raw_sources = site_cfg.get("sources")
+    if not isinstance(raw_sources, list) or not raw_sources:
+        ingest_cfg = _json(home / ".config/fleet/idrive-ingest.json")
+        raw_sources = ingest_cfg.get("sources") if isinstance(ingest_cfg, dict) else []
+    sources = []
+    for src in raw_sources or []:
+        if not isinstance(src, dict):
+            continue
+        root = _expand_home(src.get("path"), home).rstrip("/")
+        if not root:
+            continue
+        name = str(src.get("name") or os.path.basename(root))
+        masks = []
+        for item in list(src.get("mask") or []) + list(src.get("masks") or []):
+            val = item.get("path", "") if isinstance(item, dict) else str(item)
+            val = str(val).strip("/")
+            if val:
+                masks.append(val)
+        for item in (site_cfg.get("extra_masks") or {}).get(name) or []:
+            val = str(item).strip("/")
+            if val:
+                masks.append(val)
+        mask_set = set(masks)
+        skip = _pack_pruner(src, home)
+        packs = set()
+        raw_packs = list(src.get("pack") or []) + list((site_cfg.get("extra_packs") or {}).get(name) or [])
+        for item in raw_packs:
+            p = (item.get("path", "") if isinstance(item, dict) else str(item)).strip("/")
+            if not p:
+                continue
+            if p.endswith("/*"):
+                parent = p[:-2]
+                parent_abs = os.path.join(root, parent)
+                try:
+                    kids = sorted(os.listdir(parent_abs))
+                except OSError:
+                    kids = []
+                for kid in kids:
+                    rel = f"{parent}/{kid}"
+                    full = os.path.join(root, rel)
+                    if os.path.isdir(full) and not os.path.islink(full) and rel not in mask_set and not skip(rel):
+                        packs.add(rel)
+            else:
+                packs.add(p)
+        prefix = f"{name}:pack:"
+        for key in receipts:
+            if isinstance(key, str) and key.startswith(prefix):
+                rel = key[len(prefix):].strip("/")
+                if rel:
+                    packs.add(rel)
+        sources.append({
+            "name": name,
+            "path": root,
+            "masks": sorted(mask_set),
+            "packs": sorted(packs),
+        })
+    return {"home": str(home), "sources": sources, "receipts": receipts}
+
+
+def _placement_datasets(home=None):
+    """Dataset definitions (name, class, paths, holders) from placement.toml."""
+    if tomllib is None:
+        return None
+    home = pathlib.Path(home) if home is not None else HOME
+    try:
+        cfg = tomllib.loads((home / ".config/fleet/placement.toml").read_text())
+    except (OSError, ValueError):
+        return None
+    rows = []
+    for ds in cfg.get("dataset") or []:
+        if not isinstance(ds, dict) or not ds.get("name"):
+            continue
+        paths = [str(p).strip() for p in (ds.get("paths") or []) if isinstance(p, str) and p.strip()]
+        keep = [str(h).strip() for h in (ds.get("keep") or []) if isinstance(h, str) and h.strip()]
+        replicas = [str(v).strip() for v in (ds.get("replica_volumes") or []) if isinstance(v, str) and v.strip()]
+        rows.append({
+            "name": str(ds["name"]),
+            "class": str(ds.get("class") or ""),
+            "paths": paths,
+            "master_host": str(ds.get("master_host") or ""),
+            "master_volume": str(ds.get("master_volume") or ""),
+            "replica_volumes": replicas,
+            "keep": keep,
+        })
+    return rows or None
 
 
 def _json(path):

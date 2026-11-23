@@ -65,7 +65,7 @@ denies `git push --force`.
 
 | Binary | Answer |
 |---|---|
-| `guard-hard-delete` | deny `rm` / `find -delete` / `git clean -f` / inline `os.remove` outside temp and scratchpad |
+| `guard-hard-delete` | deny `rm` / `find -delete` (every start point, `-exec`/`-execdir`/`-ok`) / `git clean -f` / `rsync --del*` / inline `os.remove` outside temp and scratchpad; a program word it cannot read (`$(echo rm)`, `$X` not assigned a literal on the line, `{rm,…}`, a glob); text a shell reads on stdin (`echo … \| sh`, `sh <<< …`); `mv`/`ln` of a non-temp path into temp on a line that deletes there. A temp path with `$` (other than `$HOME`/`$TMPDIR`), a backtick, a brace (`{}` of `xargs -I` included) or `..` is not temp. `rsync --delete`: every operand after the source must be temp or on the worker |
 | `guard-icloud` | deny emptying Trash and wiping a whole Desktop, Documents, or iCloud Drive root |
 | `guard-offload-heavy` | deny a heavy command when `offload-target` names a worker; fail open if it does not |
 | `guard-cd-outside` | deny `cd` to an absolute path outside `guards.allowed_cd` |
@@ -85,21 +85,49 @@ have no binary of their own:
 | `approval-files` | deny creating an `APPROVE_*` marker file from a shell (`touch`, redirect, `tee`, `cp`, `mv`, `install`, over ssh too) or with `Write`/`Edit`; the owner creates those |
 | `idrive-cleanup` | deny starting IDrive's Archive Cleanup (AppleScript, the client's program, a cleanup script); the patterns are `guards.idrive_cleanup_patterns` |
 | `secrets` | deny any command that names a private key (a file in `~/.ssh` that is not public material, an `id_<type>` key anywhere, a `guards.secret_paths` entry), the `~/.ssh` folder, or a glob that reaches one on disk, unless its program uses keys in place: `ssh`, git, `ssh-add`, `ssh-keygen`, `chmod`, `ls`, `stat`, `trash`, `echo`/`agent-mail` (text only), `cp`/`mv` within `~/.ssh`, and `scp`/`rsync`/`sftp` to a fleet Mac with no `-o`/`-F`/`-J`/`-S`/`-e`/`--rsh`. Quotes, `$VAR` assignments and `cd` on the line are followed. Also `Read` and `Grep` of a key or the folder, and a decrypted keychain dump. Deny only, never ask. A tripwire for an agent talked into it, not a sandbox: a script file the agent writes and then runs is not read |
+| `guard-config` | deny writes to agentkit's site config (`~/.config/agentkit` and the loaded `AGENTKIT_CONFIG` directory, except `memory/`, `skills/`, `rules/*.md`, `rules/projects/` and `paused-providers`) and to the hook files the guards run through (`~/.codex/hooks.json`, `~/.cursor/hooks.json`): shell writes (redirect, `tee`, `sed -i`, `cp`/`mv`/`ln` onto, moving or removing them or a folder that holds them, `chmod`, a `git` checkout over them, an inline script) and `Write`/`Edit`. `.claude/settings*.json` and `.codex/config.toml` (in any directory, a project's included) take a `Write`/`Edit` that leaves `hooks` and `disableAllHooks` as they are, and for Codex every key at any depth that names hooks or features, and the `profile` selector; `.codex/hooks.json` and `.cursor/hooks.json` in any directory are not written. Shell writes to any of them are denied, and so is a write whose target has a glob, an unresolved `$` or a backtick that could land on one (`~/.c*/…`, `$D/hooks.json`), an output or extract option aimed at one (`-o`, `-O`, `-d`, `-C`, `--output`), with same-line assignments, `cd` and `pushd`/`popd` followed. Any JSON `Write`/`Edit` that adds a `disableAllHooks` is denied |
 
 `secrets`, known gaps (review of 16 Nov 2026; evasions by an agent working around the
 guard, not normal use): a Grep is judged by its glob's text, not by whether its root holds
 `~/.ssh` (multiple globs, `type`, `!` forms); git's path lists read from a file or stdin
 are only caught when the line also names a key; `cp`/`mv` with `-t`/`--target-directory`
-take the last word as the destination. A shell folder above `~/.ssh` (`find ~`,
-`grep -r … ~`) is left open on purpose. Closing these is fine if it costs ordinary work
-nothing.
+take the last word as the destination. Since 21 Nov 2026 an archiver or recursive reader
+whose operand holds `~/.ssh` is denied: `tar` members read against its `-C` directory
+(`tar -C ~ -cf x .ssh`, `tar -cf x ~`), `zip -r`, `cp -r|-a`, `rsync`/`ditto` to a non-fleet
+destination, `grep -r`, `rg --hidden|-u`, `find ~ … -exec`. `find ~` without `-exec`, `du ~`
+and `ls -R ~` stay allowed. A glob word longer than 512 characters is refused.
 
 The `icloud` guard denies emptying the Trash on every host, an exempt worker included.
 `slot-holder`, `slot-files`, `approval-files` and `idrive-cleanup` work with no site
 configuration; `guards.slot_state_dir`, `guards.slot_files`, `guards.approval_file_patterns`
 and `guards.idrive_cleanup_patterns` change their defaults. Claude's hook also receives
-`Write`, `Edit`, `MultiEdit` and `NotebookEdit` calls, which only `slot-files` and
-`approval-files` judge. Codex and Cursor hooks see shell commands only.
+`Write`, `Edit`, `MultiEdit` and `NotebookEdit` calls, which only `slot-files`,
+`approval-files` and `guard-config` judge. Codex and Cursor hooks see shell commands only.
+`secrets` also refuses `cred` with any subcommand but `list`, `add`, `import`, `rm` and
+`--help` (`_values` prints every password, `fill` hands one to another program), as the
+program or as an interpreter's script, over ssh, under wrappers, or fed by `xargs`. `icloud`
+refuses `empty-bin` unless it is given `--verified-offloads` or `--dry-run`/`-n`. The worker
+exemption of `hard-delete` holds only for a plain `ssh <worker>` whose options are among
+`-t -T -q -v -4 -6 -C -n -p PORT`: with any other option, `user@`, a nested `ssh` in the remote
+text, or `rsync -e` / `RSYNC_RSH` / `RSYNC_CONNECT_PROG` / `RSYNC_PROXY`, the remote text is
+checked like local text. For an interpreter (`python3 -W x cred`, `zsh -o opt empty-bin`), any
+word that is the tool, by name or by the file it resolves to, counts as it.
+
+A guard named in `[guards] disabled` fails `agentkit doctor` until the owner accepts it with
+`agentkit doctor --accept-guards` at a terminal (stdin and stdout both a TTY, and he types
+`accept`; from a hook or an agent's shell it records nothing), which prints what changed in `[guards]` and records a
+SHA-256 of the section (keys sorted, layout ignored) in `<state>/guards-accepted.json`. While
+that hash matches, the disable is a warning that names the guard; any later change to
+`[guards]` while something is disabled fails again until accepted. Agents may not run
+`--accept-guards` or write the record: `guard-config` refuses both.
+
+`guard-config` also counts `disableAllHooks` as a parsed key at any depth and in any case,
+escapes decoded (loosely, on decoded text, for JSON that does not parse strictly). It treats a
+`.claude`, `.codex` or `.cursor` folder itself as protected anywhere, checks where a copy's
+source would land (a hook folder merged onto one that exists, or onto home), takes
+`-t`/`--target-directory` or any operand after the first as a copy's possible destination
+(so a protected file as a second source is refused too), and flags a glob or variable whose
+literal part has a hook folder component at any depth, or whose glob component could become one.
 
 How the guards read a command line:
 
@@ -115,11 +143,13 @@ How the guards read a command line:
   `printf` are never text to it.
 - A `Write`, `Edit`, `MultiEdit` or `NotebookEdit` call is judged by its path alone, by
   `slot-files` and `approval-files`; its content is not read, and a missing path allows.
+  `guard-config` reads the content only for Claude's settings and Codex's config, to see
+  whether the edit leaves the hooks alone.
 
 A headless worker where Trash is not a recovery path is `guards.air_aliases` /
 `guards.air_hosts` in the site. The binary has no built-in hostname. One whole
-`ssh <alias> '<command>'` may hard-delete there. Anything after it on the same
-line is still checked.
+`ssh <alias> '<command>'` may hard-delete there. Anything else on the line, before or
+after it, and a `"$(...)"` that runs locally inside it, is still checked.
 
 Project-only rules (shared-tree `git add -A`, a worktree `db:seed`) stay in that
 project's own hook. This crate does not replace them.

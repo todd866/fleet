@@ -514,7 +514,7 @@ pub fn walk_worker(roots: &Roots) -> Result<(), String> {
                         return Ok(());
                     };
                     let now = unix_now();
-                    // Once per map: drop rows for directories deleted before scans did that.
+                    // Once a day: drop rows for directories deleted without a rescan noticing.
                     if let Err(err) = engine::prune_missing(&vol.mount, &db_path, now, cfg.event_min_bytes, PRUNE_MIN_BYTES) {
                         eprintln!("diskmap: prune {}: {err}", vol.name);
                     }

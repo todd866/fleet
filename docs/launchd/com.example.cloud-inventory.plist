@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Daily at 03:10Z (UTC) through utc-daily, on the unmetered hub. launchd only ticks
+	     every five minutes. A calendar schedule with an hour is local time, in the zone
+	     the Mac booted in; do not use one. Do not bootstrap this from a worktree.
+	     The template label is com.example; the installed label matches the jobs.tsv line. -->
+	<key>Label</key>
+	<string>com.example.cloud-inventory</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/zsh</string>
+		<string>REPLACE_HOME/.local/bin/utc-daily</string>
+		<string>--label</string>
+		<string>com.example.cloud-inventory</string>
+		<string>--at</string>
+		<string>03:10</string>
+		<string>--</string>
+		<string>REPLACE_HOME/.local/bin/cloud-inventory</string>
+	</array>
+	<key>StartInterval</key>
+	<integer>300</integer>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>LowPriorityIO</key>
+	<true/>
+	<key>Nice</key>
+	<integer>5</integer>
+	<key>StandardOutPath</key>
+	<string>REPLACE_HOME/.local/state/placement/cloud-inventory.stdout.log</string>
+	<key>StandardErrorPath</key>
+	<string>REPLACE_HOME/.local/state/placement/cloud-inventory.stderr.log</string>
+</dict>
+</plist>

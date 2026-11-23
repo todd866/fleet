@@ -418,6 +418,15 @@ def hub_attach(path=None, run=subprocess.run, ismount=os.path.ismount, exists=os
         print("hub-attach: no password from password_cmd", file=sys.stderr)
         return 1
     image = cfg["image"]
+    root = cfg.get("volumes_root", "/Volumes")
+    rel = os.path.relpath(image, root)
+    if not rel.startswith(".."):
+        # The image lives on a drive. If that drive is not mounted, a stale empty folder of its name
+        # would make "missing image" look true and hdiutil would create a new image on the boot disk.
+        drive = os.path.join(root, rel.split(os.sep)[0])
+        if not ismount(drive):
+            print(f"hub-attach: {drive} is not mounted; not creating or attaching the image", file=sys.stderr)
+            return 1
     if not exists(image):
         made = run(["/usr/bin/hdiutil", "create", "-size", cfg.get("size", "1000g"), "-type", "SPARSEBUNDLE",
                     "-fs", "APFS", "-encryption", "AES-256", "-stdinpass", "-volname", cfg["volname"], image],

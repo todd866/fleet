@@ -16,6 +16,9 @@ pub const WALK_BATCH: usize = 10_000;
 
 const BATCH_MAX: Duration = Duration::from_secs(2);
 
+/// One rescan in this many is taken oldest-first once the baseline is done.
+const OLDEST_EVERY: usize = 8;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Pending {
     path: String,
@@ -179,7 +182,12 @@ fn run_walk(
             }
             Pace::Limit => break,
         }
-        let Some(item) = store::pending_pop(db)? else {
+        // After the first map, the first rescan of every slice and one in
+        // OLDEST_EVERY after it is the one that has waited longest, so a rescan
+        // queued days ago (a deleted tree's parent) still runs while newer ones
+        // keep arriving.
+        let oldest = baseline && scanned % OLDEST_EVERY == 0;
+        let Some(item) = store::pending_pop(db, oldest)? else {
             break;
         };
         scan_one(root, db, &item.0, item.1, now, event_min, baseline, churn)?;
@@ -199,6 +207,7 @@ fn prepare_queue(db: &Db, now: i64, churn: &[String]) -> Result<bool, String> {
     let baseline = store::meta_get(db, "baseline")?.as_deref() == Some("1");
     if baseline {
         migrate_churn_backlog(db, now, churn)?;
+        requeue_for_links(db)?;
     }
     if store::pending_len(db)? == 0 && !baseline {
         store::pending_push(db, "", true)?;
@@ -237,6 +246,8 @@ fn close_batch(db: &Db, was_baseline: bool) -> Result<bool, String> {
     let empty = store::pending_len(db)? == 0;
     let baseline = if empty && !was_baseline {
         store::meta_set(db, "baseline", "1")?;
+        // A map made now already shares hard links out.
+        store::meta_set(db, LINKS_KEY, "1")?;
         true
     } else {
         was_baseline
@@ -326,6 +337,10 @@ fn scan_one(
 }
 
 const PRUNED_KEY: &str = "pruned_missing";
+/// How often the missing-directory repair runs. FSEvents can drop a deletion (a
+/// dropped-events flag folds it into a whole-subtree rescan that may take days), so
+/// the repair is a standing check, not a one-off.
+const PRUNE_EVERY_SECS: i64 = 86_400;
 
 /// True only when the path is known not to exist. A folder this process may not look into
 /// (another user's home, a privacy-protected folder) is not missing.
@@ -354,13 +369,14 @@ fn drop_missing_children(
     Ok(touched)
 }
 
-/// One-off repair for maps made before missing children were dropped: remove every row whose
-/// directory no longer exists. Returns how many top-level stale directories were removed.
+/// Daily repair: remove every row whose directory no longer exists. Returns how many
+/// top-level stale directories were removed (0 when it already ran in the last day).
 /// Only rows of at least `min_bytes` are checked; smaller leftovers go when their parent is
 /// next scanned.
 pub fn prune_missing(root: &Path, db_path: &Path, now: i64, event_min: i64, min_bytes: i64) -> Result<usize, String> {
     let db = store::open(db_path)?;
-    if store::meta_get(&db, PRUNED_KEY)?.is_some() {
+    let last = store::meta_get(&db, PRUNED_KEY)?.and_then(|v| v.parse::<i64>().ok());
+    if last.is_some_and(|t| now >= t && now - t < PRUNE_EVERY_SECS) {
         return Ok(0);
     }
     let mut rows = store::dirs_at_least(&db, min_bytes)?;
@@ -449,6 +465,7 @@ fn file_attr(e: &Entry) -> FileAttr {
         is_dir: e.is_dir,
         mount_point: e.mount_point,
         symlink: e.symlink,
+        links: e.links,
     }
 }
 
@@ -548,6 +565,24 @@ fn route_churn(db: &Db, tree: &str, now: i64) -> Result<(), String> {
     } else {
         store::hold_push(db, tree, kind.code(), tree, false, now)
     }
+}
+
+/// Set once directories measured before hard links were shared out are queued again.
+const LINKS_KEY: &str = "links_v1";
+/// Directories holding at least this much of their own are rescanned for hard links.
+const LINKS_MIN_OWN: i64 = 10_000_000;
+
+/// Maps made before hard links were shared out counted a file once per link (Spotlight's
+/// eight-way linked journals: 51 GB for 7.6 GB on disk). Queue one rescan of every
+/// directory holding enough of its own to matter, so the map corrects itself.
+fn requeue_for_links(db: &Db) -> Result<(), String> {
+    if store::meta_get(db, LINKS_KEY)?.is_some() {
+        return Ok(());
+    }
+    for path in store::paths_with_own_at_least(db, LINKS_MIN_OWN)? {
+        store::pending_push(db, &path, false)?;
+    }
+    store::meta_set(db, LINKS_KEY, "1")
 }
 
 /// Bumped whenever `CHURN_TREES` grows, so queued rescans inside new trees collapse too.

@@ -8,9 +8,11 @@ in evaluate, from `collected_at`.
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import time
+import tomllib
 from datetime import datetime
 from pathlib import Path
 
@@ -34,6 +36,7 @@ def collect(config, *, here, now, state=None, run=None, home=None, gather=None, 
     live = collect_local(config, here=here, now=now, home=home, run=run, gather=gather)
     merged = merge_snapshots(read_snapshots(folder), live)
     merged["placement"] = _placement(home, merged.get("hosts") or {}, here)
+    merged["cloud"] = _cloud(home, merged.get("hosts") or {}, here)
     merged["coverage"] = _coverage(home, {})
     merged["capacity"] = _capacity(home, config, now, run)
     merged["board"] = _board(home, run)
@@ -232,9 +235,11 @@ def _host_snapshot(name, raw, registry_host, config, health, now, registered=Non
             idrive = int(latest["observed_mtime"])
     if "idrive" in raw or name in (backups.get("idrive_hosts") or []) or idrive is not None or _has_kind(health_host, "idrive"):
         row["idrive"] = raw.get("idrive") if "idrive" in raw else (None if idrive is None else {"last_epoch": idrive})
-    for key in ("idrive_ingest", "home_mirror", "offload_queue", "free_space_guard", "placement", "diskmap_access"):
+    for key in ("idrive_ingest", "home_mirror", "offload_queue", "free_space_guard", "mac_setup", "placement", "unclaimed", "cloud", "diskmap_access", "gdrive_backup"):
         if isinstance(raw.get(key), dict) and raw[key]:
             row[key] = raw[key]
+    if isinstance(raw.get("placement_datasets"), list) and raw["placement_datasets"]:
+        row["placement_datasets"] = raw["placement_datasets"]
     if name in (backups.get("mirror_hosts") or []):
         row["drive_mirror_epoch"] = raw.get("drive_mirror_epoch")
     hdd = raw.get("hdd_backup_epoch")
@@ -317,17 +322,28 @@ def _capacity(home, config, now, run):
     except ValueError:
         return {"pools": [{"engine": "capacity", "pool": "read", "remaining_pct": None, "jobs_left": None, "reset_epoch": None, "stale": True}]}
     stale_h = float((config.get("capacity") or {}).get("stale_h") or 3)
+    paused = set()
+    paused_file = home / ".config/agentkit/paused-providers"
+    if paused_file.is_file():
+        try:
+            for line in paused_file.read_text(errors="replace").splitlines():
+                token = line.split("#", 1)[0].strip().lower()
+                if token:
+                    paused.add(token)
+        except OSError:
+            pass
     pools = []
     services = document.get("services") or {}
     if not isinstance(services, dict):
         return None
     for engine, service in services.items():
+        is_paused = str(engine).lower() in paused
         for pool in (service or {}).get("pools") or []:
             if not isinstance(pool, dict):
                 continue
             as_of = _epoch(pool.get("asOf") or pool.get("as_of"))
             stale = bool(pool.get("stale")) or (as_of is not None and now - as_of > stale_h * 3600)
-            pools.append({
+            entry = {
                 "engine": engine,
                 "pool": pool.get("pool") or "",
                 "remaining_pct": pool.get("remainingPct", pool.get("remaining_pct")),
@@ -335,8 +351,16 @@ def _capacity(home, config, now, run):
                 "reset_epoch": _epoch(pool.get("reset")),
                 "stale": stale,
                 "absent": pool.get("freshness") == "none",
-            })
-    return {"pools": pools} if pools else None
+            }
+            if is_paused:
+                entry["paused"] = True
+            pools.append(entry)
+    if not pools:
+        return None
+    out = {"pools": pools}
+    if paused:
+        out["paused"] = sorted(paused)
+    return out
 
 
 def _board(home, run):
@@ -402,9 +426,74 @@ def _git(path, run):
     }
 
 
-def _git_out(run, path, *args):
+# Keys a repo's own config may hold and still be read. Anything else (filters, fsmonitor, textconv, helpers,
+# includes, aliases, any *command/*program) means the repo is skipped: its name came from a synced file.
+# (section name, key) pairs; a subsection (a branch or remote name) may be anything. core.hookspath is allowed
+# because _git_out overrides it on the command line, which beats the repo's config.
+_SAFE = {
+    "core": {"repositoryformatversion", "filemode", "bare", "logallrefupdates", "ignorecase", "precomposeunicode",
+             "symlinks", "autocrlf", "eol", "abbrev", "hookspath"},
+    "remote": {"url", "pushurl", "fetch", "push", "tagopt", "prune", "mirror"},
+    "branch": {"remote", "merge", "rebase", "pushremote", "description", "vscode-merge-base"},
+    "user": {"name", "email"}, "pull": {"rebase", "ff"}, "push": {"default", "autosetupremote"},
+    "init": {"defaultbranch"}, "fetch": {"prune"}, "gc": {"auto"}, "lfs": {"repositoryformatversion"},
+    "extensions": {"objectformat", "refstorage", "worktreeconfig"},
+}
+
+
+def _config_is_safe(cfg):
+    """git itself parses the file (reading a config file runs nothing; includes are not followed), so there is no
+    parser differential; every `section[.subsection].key` must be on the allow-list."""
     try:
-        result = run(["git", "-C", str(path), *args], capture_output=True, text=True, timeout=8)
+        r = subprocess.run(["git", "config", "--no-includes", "--file", str(cfg), "--null", "--name-only", "--list"],
+                           capture_output=True, timeout=5,
+                           env={"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "GIT_CONFIG_NOSYSTEM": "1",
+                                "GIT_CONFIG_GLOBAL": "/dev/null"})
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if r.returncode != 0:
+        return False
+    for name in r.stdout.decode("utf-8", "replace").split("\0"):
+        if not name:
+            continue
+        parts = name.lower().split(".")
+        if len(parts) < 2 or parts[-1] not in _SAFE.get(parts[0], ()):
+            return False
+    return True
+
+
+def _config_runs_programs(path):
+    """True (skip the repo) unless its git dir is a plain .git folder whose one config file holds only safe keys.
+    Fails closed: a .git file (worktree/submodule), commondir, a per-worktree config, or an unreadable config."""
+    git = Path(path) / ".git"
+    if not git.is_dir() or git.is_symlink():
+        return True
+    if (git / "commondir").exists():
+        return True
+    if not ((git / "HEAD").is_file() and (git / "objects").is_dir() and (git / "refs").is_dir()):
+        return True                                # not a plain git dir: git might go looking elsewhere
+    for name in ("config", "config.worktree"):
+        f = git / name
+        if name == "config.worktree" and not f.exists():
+            continue
+        if not f.is_file() or f.is_symlink() or not _config_is_safe(f):
+            return True
+    return False
+
+
+def _git_out(run, path, *args):
+    if _config_runs_programs(path):
+        return None
+    try:
+        # A project folder is named by a synced registry file, so its repo config is not trusted: no fsmonitor or
+        # hook program may run from it (security review 21 Nov 2026: core.fsmonitor ran under `git status`).
+        # Repo-config programs are refused above; also no optional index locks/refresh, and the repo's own
+        # .gitattributes cannot pick a filter because none may be defined.
+        # git is pinned to exactly the .git folder checked above (no discovery), with no attributes file of ours.
+        result = run(["git", "--no-optional-locks", "--git-dir", str(Path(path) / ".git"), "--work-tree", str(path),
+                      "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null", "-c", "core.untrackedCache=false",
+                      "-c", "core.attributesFile=/dev/null", *args],
+                     capture_output=True, text=True, timeout=8)
     except (OSError, subprocess.TimeoutExpired):
         return None
     if result.returncode != 0:
@@ -569,17 +658,103 @@ def _glancebar(document):
 
 
 def _placement(home, hosts, here=None):
-    """The newest placement status: this Mac's own file or one a Mac's snapshot carried.
+    """The newest placement status, plus the newest unclaimed-folder reading.
 
     `placement status` runs hourly on the Mac that holds the peer caches; its snapshot brings
-    the result to the Mac that writes the digest. `source` names the Mac it came from.
+    the result to the Mac that writes the digest. The same job writes `unclaimed.json`
+    (`placement-unclaimed --write`). `source` names the Mac the status came from. Each file
+    is chosen on its own `generated` time, so a fresh unclaimed reading is not hidden by an
+    older status, and the reverse.
     """
+    status = _newest_doc(home, hosts, here, "status.json", "placement")
+    unclaimed = _newest_doc(home, hosts, here, "unclaimed.json", "unclaimed")
+    if status is None and unclaimed is None:
+        return None
+    if status is None:
+        doc = {"measured_only": True, "source": unclaimed.get("source", "")}
+    else:
+        doc = status
+        datasets = _placement_datasets(home, hosts, doc.get("source"))
+        if datasets:
+            doc["datasets"] = datasets
+        gdrive = _placement_gdrive(home, hosts, here)
+        if gdrive:
+            doc["gdrive"] = gdrive
+    if unclaimed:
+        doc["unclaimed"] = {key: value for key, value in unclaimed.items() if key != "source"}
+    return doc
+
+
+def _placement_datasets(home, hosts, preferred=None):
+    """Dataset definitions for placement evaluation: prefer the host that produced status.json,
+    then any other host snapshot that sent them, then this Mac's own placement.toml."""
+    if preferred and isinstance((hosts or {}).get(preferred), dict):
+        rows = hosts[preferred].get("placement_datasets")
+        if isinstance(rows, list) and rows:
+            return rows
+    for reading in (hosts or {}).values():
+        if isinstance(reading, dict):
+            rows = reading.get("placement_datasets")
+            if isinstance(rows, list) and rows:
+                return rows
+    from fleet.morning.probe import _placement_datasets as read_local
+    return read_local(home) or []
+
+
+def _placement_gdrive(home, hosts, here=None):
+    """Per-host Google Drive backup receipts and source specs from snapshots plus this Mac."""
+    found = {}
+    for name, reading in (hosts or {}).items():
+        if not isinstance(reading, dict):
+            continue
+        gd = reading.get("gdrive_backup")
+        if isinstance(gd, dict) and gd:
+            found[str(name)] = gd
+    if here and str(here) not in found:
+        from fleet.morning.probe import _gdrive_backup as read_local
+        local = read_local(home)
+        if isinstance(local, dict) and local:
+            found[str(here)] = local
+    return found
+
+
+def _cloud(home, hosts, here=None):
+    """Newest cloud inventory, with this Mac's dataset claims attached for the morning rows."""
+    doc = _newest_doc(home, hosts, here, "cloud.json", "cloud")
+    if not doc:
+        return None
+    doc["claims"] = _dataset_claims(Path(home) / ".config/fleet/placement.toml")
+    return doc
+
+
+def _dataset_claims(path):
+    """Dataset `offsite` values and paths. Sync folders are not claims."""
+    try:
+        cfg = tomllib.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return []
+    claims = []
+    for dataset in cfg.get("dataset") or []:
+        if not isinstance(dataset, dict):
+            continue
+        offsite = str(dataset.get("offsite") or "").strip().strip("/")
+        if offsite:
+            claims.append(offsite)
+        for item in dataset.get("paths") or []:
+            if isinstance(item, str) and item.strip():
+                claims.append(item.strip().strip("/"))
+    return claims
+
+
+def _newest_doc(home, hosts, here, filename, snapshot_key):
     found = []
-    local = _read_json(home / ".local/state/placement/status.json")
+    local = _read_json(Path(home) / ".local/state/placement" / filename)
     if isinstance(local, dict) and local:
         found.append((str(here or ""), local))
     for name, reading in (hosts or {}).items():
-        doc = (reading or {}).get("placement") if isinstance(reading, dict) else None
+        if not isinstance(reading, dict):
+            continue
+        doc = reading.get(snapshot_key)
         if isinstance(doc, dict) and doc:
             found.append((str(name), doc))
     if not found:

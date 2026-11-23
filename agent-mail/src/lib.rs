@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const USAGE: &str = "\
 #   agent-mail send HOST[:PROJECT[:ROLE]] \"text\"
 #   agent-mail send HOST[:PROJECT[:ROLE]] \"text\" --to-provider P --to-session ID
-#   agent-mail unread [--mark|--hook] [--provider claude|codex|cursor|other] [--json] [--role ROLE] [--session ID]
+#   agent-mail unread [--mark|--hook] [--provider claude|codex|cursor|agy|gemini|zai|other] [--json] [--role ROLE] [--session ID]
 #   agent-mail wait [--timeout SEC] [--provider P] [--role ROLE] [--session ID]
 #   agent-mail status HOST [ID]     who has read it? (legacy read.txt still counts)
 #   agent-mail log [N]              the last N messages here, read or not
@@ -85,6 +85,7 @@ For one session, send with paired `--to-provider P --to-session ID`; readers sup
 Codex: at session start and before finishing, run `agent-mail unread --provider codex`.
 Claude Code and Claude-compatible launchers use the installed hook (`agent-mail unread --hook`).
 Cursor agents run `agent-mail unread --provider cursor` the same way.
+Antigravity / Gemini agents run `agent-mail unread --provider agy --json`.
 Any other agent or script runs `agent-mail unread --provider other --json`.
 A background watcher runs `agent-mail wait` until new mail for this project arrives.
 "
@@ -593,7 +594,7 @@ struct MailFlags {
 }
 
 fn provider_name_ok(name: &str) -> bool {
-    matches!(name, "claude" | "codex" | "cursor" | "other")
+    matches!(name, "claude" | "codex" | "cursor" | "agy" | "gemini" | "zai" | "other")
 }
 
 fn parse_mail_flags(args: &[String]) -> Result<MailFlags, ()> {

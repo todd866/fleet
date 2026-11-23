@@ -1,4 +1,5 @@
 """Per-repo `.fleet/check` discovery, and where a check is allowed to run."""
+import re
 import shlex
 import tomllib
 from dataclasses import dataclass
@@ -106,8 +107,8 @@ def _descriptions(path):
             continue
         parts = line.split("\t")
         name = parts[0].strip()
-        if not name:
-            continue
+        if not name or not re.fullmatch(r"[A-Za-z0-9._-]+", name) or name in (".", ".."):
+            continue                                   # a project name is one plain folder name, nothing else
         status = parts[2].strip().lower() if len(parts) > 2 else ""
         rows[name] = {"status": status}
     return rows

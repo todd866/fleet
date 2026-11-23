@@ -155,7 +155,7 @@ fn a_deleted_directory_leaves_the_map_and_its_ancestors_totals() {
 }
 
 #[test]
-fn prune_repairs_a_map_that_still_holds_deleted_directories_once() {
+fn prune_repairs_a_map_that_still_holds_deleted_directories_at_most_daily() {
     let dir = scratch("prune");
     let root = dir.join("vol");
     fs::create_dir_all(root.join("a/old/inner")).unwrap();
@@ -175,7 +175,7 @@ fn prune_repairs_a_map_that_still_holds_deleted_directories_once() {
     assert_eq!(total_of(&db, "a/old/inner"), None);
     assert_eq!(total_of(&db, "a"), Some(live));
     assert_eq!(total_of(&db, ""), Some(live));
-    // the repair runs once per map
+    // the repair runs at most once a day
     fs::remove_dir_all(root.join("a/live")).unwrap();
     assert_eq!(prune_missing(&root, &db, 1_700_000_300, EVENT_MIN_BYTES, 1).unwrap(), 0);
     let _ = fs::remove_dir_all(&dir);

@@ -111,6 +111,7 @@ def _main(argv=None, notify=None, gather=None, run=None):
     shared = base / ".local" / "state" / "mac-sync"
     if not args.state and shared.is_dir():
         _write(shared / "fleet-morning" / "summary.json", body)
+        _write(shared / "fleet-morning" / "latest.md", text)
     board = Path(args.board).expanduser() if args.board else work_path(base / ".local" / "state")
     _write_items(board, findings, now)
     _sync_cowork(findings)
@@ -167,7 +168,7 @@ def follow(argv):
     import argparse
     parser = argparse.ArgumentParser(prog="fleet morning follow")
     parser.add_argument("--state", default=None)
-    parser.add_argument("--engines", default="claude,codex,cursor")
+    parser.add_argument("--engines", default="gemini,cursor,zai")
     args = parser.parse_args(argv)
     state = Path(args.state).expanduser() if args.state else Path.home() / ".local" / "state" / "fleet"
     summary_path = state / "morning" / "summary.json"

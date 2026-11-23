@@ -15,12 +15,16 @@ Install: `cargo install --path placement` (binary name `placement`). Put it on `
 | `placement plan` | Dry run. One row per action: host, keep / move / sync / ignore / clear / refuse, bytes, reason. |
 | `placement apply` | This Mac only. Copy, verify size and SHA-256, move the source to Trash, write `name.OFFLOADED.txt` and a ledger row. Exit 75 if focus-guard is active or a volume `.writer` lock is live. |
 | `placement status` | One row per host (free, floor, band) and one row per data gap. Writes `~/.local/state/placement/status.json`. Other Macs' drives and free space come from diskmap's peer caches (`diskmap peers`); this Mac's own files win for its host, and `peers` in the JSON gives each cache's age. |
+| `placement-unclaimed` | Big folders diskmap measured that no data set claims. `--write` stores `~/.local/state/placement/unclaimed.json`. |
+| `cloud-inventory` | Folder sizes for each rclone remote in `~/.config/fleet/cloud-inventory.toml`. Writes `~/.local/state/placement/cloud.json`. |
 | `placement init --from-drive-registry` | Write site config from `drives.json` and `datasets.json`. |
 
 ```text
 placement plan [--config FILE] [--diskmap DIR] [--replicas FILE] [--json]
 placement apply [--config FILE] [--host ID] [--home DIR] [--trash DIR] [--ledger FILE] [--volumes DIR]
 placement status [--config FILE] [--diskmap DIR] [--out FILE] [--json]
+placement-unclaimed [--min-gb 2] [--host ID] [--json] [--depth 4] [--write] [--out FILE]
+cloud-inventory [--config FILE] [--out FILE] [--rclone PATH]
 placement init --from-drive-registry [--drives FILE] [--datasets FILE] [--out FILE]
 ```
 
@@ -29,6 +33,8 @@ placement init --from-drive-registry [--drives FILE] [--datasets FILE] [--out FI
 | Config | `~/.config/fleet/placement.toml` (`PLACEMENT_CONFIG`) |
 | Disk map | `~/.local/state/diskmap` (`DISKMAP_STATE`) |
 | Status | `~/.local/state/placement/status.json` |
+| Unclaimed | `~/.local/state/placement/unclaimed.json` |
+| Cloud | `~/.local/state/placement/cloud.json` |
 | Verified replicas | `~/.local/state/placement/replicas.json` |
 | Ledger | `~/.config/fleet/placement-ledger.md` (`PLACEMENT_LEDGER`) |
 | Drives file | `~/.config/fleet/drives.json` |
@@ -67,7 +73,7 @@ Copy `~/.cargo/bin/placement` to `~/.local/bin/placement` on each Mac. Do not sc
 1. On one Mac, with `~/.config/fleet/drives.json` and a data-set file present: `placement init --from-drive-registry --out ~/.config/fleet/placement.toml`. Read it. Copy that file to the other Macs (it is site config, not a secret, and it does not belong in git).
 2. diskmap should already be writing `summary.json`. Last access is `access.json` in the same directory, or `newest_mtime` on a `where.json` row.
 3. `placement plan` on each Mac (`--host primary`, `hub`, or `shared`, or your own ids). The rows are the change. Nothing moves.
-4. `placement status` writes the JSON fleet-health and mac-registry read. Schedule it hourly on the Mac that runs fleet morning's placement row with `docs/launchd/com.example.placement-status.plist`, which runs `diskmap peers` first so a master on another Mac's drive is seen.
+4. `placement status` writes the JSON fleet-health and mac-registry read. Schedule it hourly on the Mac that runs fleet morning's placement row with `docs/launchd/com.example.placement-status.plist`, which runs `diskmap peers` first so a master on another Mac's drive is seen, then `placement-unclaimed --write`. `cloud-inventory` is a separate daily job on the unmetered hub (`docs/launchd/com.example.cloud-inventory.plist`, 03:10Z through `utc-daily`). What the three tools are for, and the rule that every move of 1 GB or more is a row in `OFFLOADS.md` and every new long-lived folder is a data set: [docs/storage-policy.md](../docs/storage-policy.md).
 5. When the plan is acceptable and the machine is idle: `placement apply --host <id>`. Personal rows stay put until two encrypted copies are verified. Syncthing then honours the `.stignore` apply wrote into each sync folder. Do not add `(?d)` by hand.
 6. Confirmed replicas land in `replicas.json`. The next status stops calling an empty directory a copy.
 

@@ -147,6 +147,10 @@ fn canonical_pool(service: &str, pool_id: &str) -> Option<String> {
         ("codex", "codex:primary") | ("codex", "primary") => Some("codex:primary".into()),
         ("cursor", "api") => Some("cursor:api".into()),
         ("cursor", "cursor") => Some("cursor:grok-composer".into()),
+        ("zai", "5h") => Some("zai:5h".into()),
+        ("zai", "week") => Some("zai:weekly".into()),
+        ("gemini", "5h") => Some("gemini:5h".into()),
+        ("gemini", "week") => Some("gemini:weekly".into()),
         _ => None,
     }
 }
@@ -260,7 +264,12 @@ pub fn paused_providers() -> Vec<String> {
 }
 
 fn compute_route(pools: &HashMap<String, PoolPosture>) -> RouteLine {
-    let candidates: [(&str, &[&str]); 3] = [
+    // Z.ai GLM Coding Plan first (owner, 19 Nov 2026: Max yearly), then Gemini AI Ultra
+    // (owner, 23 Nov 2026: Claude & Codex paused; Gemini Ultra + Cursor + Z.ai primary),
+    // then Cursor (preserving monthly Cursor allowance when Z.ai and Gemini are both FULL).
+    let candidates: [(&str, &[&str]); 5] = [
+        ("zai", &["zai:5h", "zai:weekly"]),
+        ("gemini", &["gemini:5h", "gemini:weekly"]),
         ("cursor", &["cursor:api", "cursor:grok-composer"]),
         ("codex", &["codex:primary"]),
         ("claude", &["claude:5h", "claude:weekly"]),
@@ -305,7 +314,7 @@ pub fn compute_from_capacity_json(capacity: &Value, now_ms: f64) -> PostureFile 
         .cloned()
         .unwrap_or_else(|| capacity.clone());
     let mut pools = HashMap::new();
-    for service in ["codex", "claude", "cursor"] {
+    for service in ["codex", "claude", "cursor", "zai", "gemini"] {
         let Some(node) = services.get(service) else {
             continue;
         };
@@ -377,6 +386,8 @@ pub fn provider_pool_keys(provider: &str) -> &'static [&'static str] {
         "claude" => &["claude:5h", "claude:weekly"],
         "codex" => &["codex:primary"],
         "cursor" => &["cursor:api", "cursor:grok-composer"],
+        "zai" => &["zai:5h", "zai:weekly"],
+        "gemini" => &["gemini:5h", "gemini:weekly"],
         _ => &[],
     }
 }
@@ -429,5 +440,53 @@ mod tests {
         let doc = compute_from_capacity_json(&cap, 0.0);
         assert_eq!(doc.pools["claude:5h"].tier, "unknown");
         assert!(doc.pools["claude:5h"].stale);
+    }
+
+    #[test]
+    fn gemini_capacity_maps_5h_and_week_pools() {
+        let cap = json!({
+            "generatedAt": "2026-11-20T11:00:00.000Z",
+            "services": {
+                "gemini": {"pools": [
+                    {"pool":"5h","remainingPct":80,"resetAt":"2026-11-20T15:00:00.000Z","freshness":"fresh","windowMinutes":300},
+                    {"pool":"week","remainingPct":70,"resetAt":"2026-11-26T08:00:00.000Z","freshness":"fresh","windowMinutes":10080}
+                ]}
+            }
+        });
+        let now = parse_reset_iso("2026-11-20T11:00:00.000Z").unwrap() * 1000.0;
+        let doc = compute_from_capacity_json(&cap, now);
+        assert!(doc.pools.contains_key("gemini:5h"), "{:?}", doc.pools.keys());
+        assert!(doc.pools.contains_key("gemini:weekly"), "{:?}", doc.pools.keys());
+        assert_ne!(doc.pools["gemini:5h"].tier, "unknown");
+        assert_ne!(doc.pools["gemini:weekly"].tier, "unknown");
+    }
+
+    #[test]
+    fn provider_pool_keys_lists_gemini_windows() {
+        assert_eq!(
+            provider_pool_keys("gemini"),
+            &["gemini:5h", "gemini:weekly"][..]
+        );
+    }
+
+    #[test]
+    fn gemini_is_routable_when_it_has_more_headroom_than_zai() {
+        let cap = json!({
+            "generatedAt": "2026-11-20T11:00:00.000Z",
+            "services": {
+                "gemini": {"pools": [
+                    {"pool":"5h","remainingPct":80,"resetAt":"2026-11-20T15:00:00.000Z","freshness":"fresh","windowMinutes":300},
+                    {"pool":"week","remainingPct":70,"resetAt":"2026-11-26T08:00:00.000Z","freshness":"fresh","windowMinutes":10080}
+                ]},
+                "zai": {"pools": [
+                    {"pool":"5h","remainingPct":5,"resetAt":"2026-11-20T15:00:00.000Z","freshness":"fresh","windowMinutes":300},
+                    {"pool":"week","remainingPct":5,"resetAt":"2026-11-26T08:00:00.000Z","freshness":"fresh","windowMinutes":10080}
+                ]}
+            }
+        });
+        let now = parse_reset_iso("2026-11-20T11:00:00.000Z").unwrap() * 1000.0;
+        let doc = compute_from_capacity_json(&cap, now);
+        assert_eq!(doc.pools["zai:5h"].tier, "HOLD");
+        assert_eq!(doc.route.build, "gemini");
     }
 }

@@ -22,6 +22,7 @@ const ATTR_CMN_ERROR: u32 = 0x2000_0000;
 const ATTR_CMN_RETURNED_ATTRS: u32 = 0x8000_0000;
 const ATTR_VOL_UUID: u32 = 0x0004_0000;
 const ATTR_DIR_MOUNTSTATUS: u32 = 0x0000_0004;
+const ATTR_FILE_LINKCOUNT: u32 = 0x0000_0001;
 const ATTR_FILE_ALLOCSIZE: u32 = 0x0000_0004;
 const ATTR_FILE_DATALENGTH: u32 = 0x0000_0200;
 const FSOPT_PACK_INVAL_ATTRS: u64 = 0x8;
@@ -132,6 +133,8 @@ pub struct Entry {
     pub logical: u64,
     pub flags: u32,
     pub mtime: i64,
+    /// Hard links to this file (1 for a directory or when unknown).
+    pub links: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -373,7 +376,7 @@ fn read_dir_bulk(path: &Path) -> Result<Vec<Entry>, BulkFail> {
             | ATTR_CMN_MODTIME,
         volattr: 0,
         dirattr: ATTR_DIR_MOUNTSTATUS,
-        fileattr: ATTR_FILE_ALLOCSIZE | ATTR_FILE_DATALENGTH,
+        fileattr: ATTR_FILE_LINKCOUNT | ATTR_FILE_ALLOCSIZE | ATTR_FILE_DATALENGTH,
         forkattr: 0,
     };
     let mut buf = vec![0u8; 256 * 1024];
@@ -448,6 +451,7 @@ fn parse_record(rec: &[u8]) -> Option<Entry> {
     let mut mtime = 0i64;
     let mut flags = 0u32;
     let mut mount = 0u32;
+    let mut links = 1u32;
     let mut allocated = 0u64;
     let mut logical = 0u64;
     if common & ATTR_CMN_ERROR != 0 {
@@ -477,6 +481,10 @@ fn parse_record(rec: &[u8]) -> Option<Entry> {
     if dirattr & ATTR_DIR_MOUNTSTATUS != 0 {
         mount = take_u32(rec, &mut cur)?;
     }
+    // File attributes run low bit to high: link count, then sizes.
+    if fileattr & ATTR_FILE_LINKCOUNT != 0 {
+        links = take_u32(rec, &mut cur)?.max(1);
+    }
     if fileattr & ATTR_FILE_ALLOCSIZE != 0 {
         allocated = take_i64(rec, &mut cur)?.max(0) as u64;
     }
@@ -497,6 +505,7 @@ fn parse_record(rec: &[u8]) -> Option<Entry> {
         logical,
         flags,
         mtime,
+        links,
     })
 }
 
@@ -558,6 +567,7 @@ fn read_dir_std(path: &Path) -> Result<Vec<Entry>, String> {
             logical: meta.len(),
             flags: st_flags(&meta),
             mtime: meta.mtime(),
+            links: if is_dir { 1 } else { (meta.nlink() as u32).max(1) },
         });
     }
     Ok(out)
@@ -916,4 +926,29 @@ fn gethostname_fallback() -> String {
     CStr::from_bytes_until_nul(&buf)
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "localhost".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bulk read itself must return the link count and sizes; a parse error would fall
+    /// back to a stat per file without any test noticing.
+    #[test]
+    fn bulk_read_returns_link_count_and_sizes() {
+        let dir = std::env::temp_dir().join(format!("diskmap-bulk-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::write(dir.join("one"), vec![1u8; 5_000]).unwrap();
+        fs::write(dir.join("two"), vec![2u8; 9_000]).unwrap();
+        fs::hard_link(dir.join("two"), dir.join("sub/two")).unwrap();
+        let Ok(entries) = read_dir_bulk(&dir) else { panic!("bulk read failed") };
+        let get = |name: &str| entries.iter().find(|e| e.name == name).unwrap().clone();
+        let (one, two, sub) = (get("one"), get("two"), get("sub"));
+        assert_eq!((one.links, one.logical), (1, 5_000));
+        assert_eq!((two.links, two.logical), (2, 9_000));
+        assert_eq!(two.allocated, fs::metadata(dir.join("two")).unwrap().blocks() * 512);
+        assert!(sub.is_dir && sub.links == 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

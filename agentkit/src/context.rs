@@ -161,9 +161,13 @@ fn capacity_block() -> String {
     let Some(v) = capacity_json() else {
         return "unavailable".into();
     };
-    let services = v.get("services").cloned().unwrap_or(v);
+    capacity_from_value(&v)
+}
+
+fn capacity_from_value(v: &Value) -> String {
+    let services = v.get("services").cloned().unwrap_or_else(|| v.clone());
     let mut provider_bits = Vec::new();
-    for name in ["codex", "claude", "cursor"] {
+    for name in ["codex", "claude", "cursor", "zai", "gemini"] {
         if let Some(bit) = provider_capacity(name, services.get(name)).0 {
             provider_bits.push(bit);
         }
@@ -186,6 +190,9 @@ fn provider_capacity(name: &str, node: Option<&Value>) -> (Option<String>, Optio
     let mut best_score = -1i64;
     for pool in pools {
         let id = pool.get("pool").and_then(|p| p.as_str()).unwrap_or("");
+        if name == "gemini" && !matches!(id, "week" | "5h") {
+            continue;
+        }
         let fresh = pool.get("freshness").and_then(|p| p.as_str()).unwrap_or("unknown");
         let short = id.rsplit(':').next().unwrap_or(id);
         let detail = if fresh != "fresh" {
@@ -258,16 +265,30 @@ fn fleet_board_path() -> PathBuf {
         .unwrap_or_else(|| home().join(".local/state/fleet/morning/board.json"))
 }
 
+fn pick_newest_existing(candidates: &[PathBuf]) -> Option<PathBuf> {
+    candidates
+        .iter()
+        .filter(|p| p.is_file())
+        .max_by_key(|p| {
+            fs::metadata(p)
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+        })
+        .cloned()
+}
+
 fn fleet_line() -> String {
     let board = fleet_board_path();
     let path = if board.is_file() {
         board
     } else {
-        let alt = home().join(".local/state/fleet/morning/summary.json");
-        if alt.is_file() {
-            alt
-        } else {
-            return fleet_health_fallback();
+        let candidates = [
+            home().join(".local/state/fleet/morning/summary.json"),
+            home().join(".local/state/mac-sync/fleet-morning/summary.json"),
+        ];
+        match pick_newest_existing(&candidates) {
+            Some(p) => p,
+            None => return fleet_health_fallback(),
         }
     };
     let Ok(text) = fs::read_to_string(path) else {
@@ -391,6 +412,77 @@ mod tests {
     }
 
     #[test]
+    fn gemini_provider_renders_gemini_posture_not_unknown_unknown() {
+        let mut pools = HashMap::new();
+        pools.insert(
+            "gemini:5h".into(),
+            PoolPosture {
+                tier: "LEAN".into(),
+                pct: Some(21.0),
+                resets_at: None,
+                stale: false,
+            },
+        );
+        pools.insert(
+            "gemini:weekly".into(),
+            PoolPosture {
+                tier: "FULL".into(),
+                pct: Some(45.0),
+                resets_at: None,
+                stale: false,
+            },
+        );
+        let doc = PostureFile {
+            as_of: "t".into(),
+            pools,
+            route: RouteLine {
+                build: "zai".into(),
+                review: "cursor".into(),
+                why: String::new(),
+            },
+        };
+        let line = posture_line("gemini", Some(&doc));
+        assert!(
+            line.contains("gemini:5h LEAN 21%"),
+            "gemini posture missing from: {line}"
+        );
+        assert!(
+            line.contains("gemini:weekly FULL 45%"),
+            "gemini weekly posture missing from: {line}"
+        );
+        assert!(
+            !line.contains("unknown"),
+            "gemini session still unknown: {line}"
+        );
+        let out = render(&Snapshot {
+            now: "Fri 20 Nov 19:00 AWST".into(),
+            posture: line,
+            capacity: "zai 5h 83% · gemini 5h 21%".into(),
+            mail: "0 unread".into(),
+            fleet: "0 fail 0 warn".into(),
+            pointers: "registry missing".into(),
+        });
+        assert!(out.contains("* posture"));
+        assert!(out.contains("gemini:5h LEAN 21%"));
+        assert!(!out.contains("unknown unknown"));
+    }
+
+    #[test]
+    fn capacity_summary_includes_zai_and_gemini_when_present() {
+        let v = json!({
+            "services": {
+                "codex": {"pools":[{"pool":"primary","remainingPct":27.0,"freshness":"fresh"}]},
+                "zai": {"pools":[{"pool":"5h","remainingPct":83.0,"freshness":"fresh"}]},
+                "gemini": {"pools":[{"pool":"5h","remainingPct":21.0,"freshness":"fresh"}]}
+            }
+        });
+        assert_eq!(
+            capacity_from_value(&v),
+            "codex primary 27% · zai 5h 83% · gemini 5h 21%"
+        );
+    }
+
+    #[test]
     fn hold_adds_handoff_for_another_provider() {
         let mut pools = HashMap::new();
         pools.insert(
@@ -441,5 +533,24 @@ mod tests {
         assert_eq!(fleet_summary(&v, 1000 + 9 * 3600), "7 fail (job 3, backup 1, disk 1, project 1, +1) 1 warn · report 9 h old");
         assert_eq!(fleet_summary(&v, 1000 + 72 * 3600), "7 fail (job 3, backup 1, disk 1, project 1, +1) 1 warn · report 3 d old");
         assert_eq!(fleet_summary(&json!({"ok": true, "counts": {"fail": 0, "warn": 0}}), 5), "0 fail 0 warn");
+    }
+
+    #[test]
+    fn pick_newest_existing_prefers_fresher_summary() {
+        let dir = env::temp_dir().join(format!("agentkit-ctx-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let older = dir.join("old.json");
+        let newer = dir.join("new.json");
+        let missing = dir.join("missing.json");
+        fs::write(&older, "{}").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&newer, "{}").unwrap();
+        assert_eq!(
+            pick_newest_existing(&[older.clone(), newer.clone(), missing]),
+            Some(newer.clone())
+        );
+        assert_eq!(pick_newest_existing(&[dir.join("nope.json")]), None);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -53,13 +53,11 @@ DEFAULT_FILES = [
     "/etc/ssh/sshd_config", "/etc/ssh/sshd_config.d",
 ]
 DEFAULT_MUST_CONTAIN = [
-    ["~/.claude/settings.json", "agentkit hook"],
-    ["~/.codex/hooks.json", "agentkit hook"],
+    ["~/.gemini/config/hooks.json", "agentkit hook"],
     ["~/.cursor/hooks.json", "agentkit hook"],
 ]
 LAUNCHD_DIRS = ["~/Library/LaunchAgents", "/Library/LaunchAgents", "/Library/LaunchDaemons"]
-DEFAULT_SUMMON = ["claude", "-p", "{brief}", "--max-turns", "40",
-                  "--allowedTools", "Bash", "Read", "Glob", "Grep", "Write"]
+DEFAULT_SUMMON = ["glm-opinion", "--timeout", "900", "{brief}"]
 
 HOLD_FILES = ["~/.ssh/authorized_keys"]
 NEVER_PAUSE = ["sshd", "launchd"]

@@ -503,6 +503,16 @@ pub fn photo_dirs(db: &Db, library: &str) -> Result<Vec<DirRow>, String> {
     Ok(out)
 }
 
+pub fn paths_with_own_at_least(db: &Db, min_bytes: i64) -> Result<Vec<String>, String> {
+    let stmt = db.prepare("SELECT path FROM dirs WHERE own_bytes >= ?1 AND scanned_at > 0")?;
+    stmt.bind_i64(1, min_bytes)?;
+    let mut out = Vec::new();
+    while stmt.step()? {
+        out.push(stmt.text(0));
+    }
+    Ok(out)
+}
+
 pub fn dirs_at_least(db: &Db, min_bytes: i64) -> Result<Vec<DirRow>, String> {
     let stmt = db.prepare(&format!(
         "SELECT {DIR_COLS} FROM dirs WHERE total_bytes >= ?1 ORDER BY total_bytes DESC"
@@ -610,9 +620,17 @@ pub fn pending_push(db: &Db, path: &str, deep: bool) -> Result<(), String> {
     Ok(())
 }
 
-pub fn pending_pop(db: &Db) -> Result<Option<(String, bool)>, String> {
+/// Take the newest rescan (depth first), or with `oldest` the one that has waited
+/// longest. Newest-first alone starves the bottom of the queue for good once
+/// rescans arrive as fast as they are done.
+pub fn pending_pop(db: &Db, oldest: bool) -> Result<Option<(String, bool)>, String> {
     let (path, deep) = {
-        let stmt = db.prepare("SELECT path, deep FROM pending ORDER BY seq DESC LIMIT 1")?;
+        let sql = if oldest {
+            "SELECT path, deep FROM pending ORDER BY seq ASC LIMIT 1"
+        } else {
+            "SELECT path, deep FROM pending ORDER BY seq DESC LIMIT 1"
+        };
+        let stmt = db.prepare(sql)?;
         if !stmt.step()? {
             return Ok(None);
         }

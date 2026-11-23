@@ -1326,5 +1326,35 @@ class SnapshotPush(unittest.TestCase):
             self.assertTrue(any(line.startswith("? ") and "shared" in line for line in host_lines), text)
 
 
+class ProbeJobsResilience(unittest.TestCase):
+    def test_malformed_xml_plist_is_skipped_not_fatal(self):
+        from unittest import mock
+        from fleet.morning import probe
+
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            agents = home / "Library/LaunchAgents"
+            agents.mkdir(parents=True)
+            (agents / "com.example.broken.plist").write_text(
+                '<?xml version="1.0" encoding="UTF-8"?>\n'
+                '<plist version="1.0"><dict>'
+                '<key>Label</key><string>com.example.broken</string>'
+                '<key>ProgramArguments</key><array><string>cmd 2>&1</string></array>'
+                '</dict></plist>\n'
+            )
+            (agents / "com.example.good.plist").write_text(
+                '<?xml version="1.0" encoding="UTF-8"?>\n'
+                '<plist version="1.0"><dict>'
+                '<key>Label</key><string>com.example.good</string>'
+                '<key>ProgramArguments</key><array><string>/usr/bin/true</string></array>'
+                '</dict></plist>\n'
+            )
+            with mock.patch.object(probe, "HOME", home), \
+                 mock.patch.object(probe, "_launchctl", return_value={"com.example.good": 0}), \
+                 mock.patch.object(probe, "_launchctl_print", return_value={"com.example.good": {"state": "not running"}}):
+                rows = probe._jobs()
+            self.assertEqual([r["label"] for r in rows], ["com.example.good"])
+
+
 if __name__ == "__main__":
     unittest.main()

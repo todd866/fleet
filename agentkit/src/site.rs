@@ -37,6 +37,9 @@ pub struct GuardConfig {
     pub idrive_cleanup_patterns: Vec<String>,
     /// More private-key or credential files the secrets guard keeps from being printed or sent.
     pub secret_paths: Vec<String>,
+    /// agentkit's config directory when it was loaded from `AGENTKIT_CONFIG` or a test tree.
+    /// The guard-config guard protects it and `<home>/.config/agentkit` both.
+    pub config_dir: Option<PathBuf>,
 }
 
 pub const DEFAULT_SLOT_FILES: &[&str] = &["limit", "cool"];
@@ -66,6 +69,7 @@ impl Default for GuardConfig {
             approval_file_patterns: DEFAULT_APPROVAL_FILE_PATTERNS.iter().map(|s| (*s).to_string()).collect(),
             idrive_cleanup_patterns: DEFAULT_IDRIVE_CLEANUP_PATTERNS.iter().map(|s| (*s).to_string()).collect(),
             secret_paths: Vec::new(),
+            config_dir: None,
         }
     }
 }
@@ -115,12 +119,18 @@ impl GuardConfig {
     }
 }
 
+pub const ALL_PROVIDERS: &[&str] = &["claude", "codex", "cursor", "agy"];
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Site {
     #[serde(default = "one")]
     pub schema: u32,
     #[serde(default)]
     pub manage_model: bool,
+    /// Providers managed by `agentkit sync` / `doctor`. When empty, all known providers
+    /// except any listed in `paused-providers` are managed.
+    #[serde(default)]
+    pub providers: Vec<String>,
     #[serde(default)]
     pub projects: Vec<Project>,
     /// File names under `~/.cursor/rules` that the generated global rule replaces. Each is
@@ -210,6 +220,45 @@ pub struct Models {
     pub cursor_model: String,
 }
 
+pub fn validate_providers(providers: &[String]) -> Result<(), String> {
+    for name in providers {
+        if !ALL_PROVIDERS.contains(&name.as_str()) {
+            return Err(format!(
+                "unknown provider {:?} in providers (known: {})",
+                name,
+                ALL_PROVIDERS.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn paused_providers_in(config: &Path) -> Vec<String> {
+    let Ok(text) = fs::read_to_string(config.join("paused-providers")) else {
+        return Vec::new();
+    };
+    text.lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim().to_ascii_lowercase())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+pub fn active_providers(config: &Path, site: &Site) -> Vec<&'static str> {
+    let paused = paused_providers_in(config);
+    let base: Vec<&'static str> = if site.providers.is_empty() {
+        ALL_PROVIDERS.to_vec()
+    } else {
+        ALL_PROVIDERS
+            .iter()
+            .copied()
+            .filter(|p| site.providers.iter().any(|s| s == p))
+            .collect()
+    };
+    base.into_iter()
+        .filter(|p| !paused.iter().any(|q| q == p))
+        .collect()
+}
+
 impl Site {
     pub fn load(dir: &Path) -> Result<Self, String> {
         let path = dir.join("agentkit.toml");
@@ -218,6 +267,7 @@ impl Site {
         if site.schema != 1 {
             return Err(format!("unsupported schema {} (this agentkit reads 1)", site.schema));
         }
+        validate_providers(&site.providers)?;
         validate_disabled(&site.guards.disabled)?;
         Ok(site)
     }
@@ -231,6 +281,7 @@ pub fn guard_config_from_env() -> GuardConfig {
     let config = env::var_os("AGENTKIT_CONFIG")
         .map(PathBuf::from)
         .unwrap_or_else(|| cfg.home.join(".config/agentkit"));
+    cfg.config_dir = Some(config.clone());
     // heavy-slot's own override; a site value below takes precedence.
     if let Some(dir) = env::var_os("HEAVY_SLOT_DIR").filter(|d| !d.is_empty()) {
         cfg.slot_state_dir = Some(PathBuf::from(dir));
@@ -248,6 +299,7 @@ pub fn guard_config_from_env() -> GuardConfig {
 }
 
 pub(crate) fn apply_guards(cfg: &mut GuardConfig, config: &Path, guards: &GuardFile) {
+    cfg.config_dir = Some(config.to_path_buf());
     cfg.air_hosts = guards.air_hosts.clone();
     cfg.air_aliases = guards.air_aliases.clone();
     if !guards.allowed_cd.is_empty() {

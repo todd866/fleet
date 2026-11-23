@@ -95,6 +95,32 @@ class Container(unittest.TestCase):
         self.assertEqual(M.spec_hash(cfg(), one), M.spec_hash(cfg(), list(one)))
 
 
+class UnmountableMask(unittest.TestCase):
+    """21 Nov 2026: after a reboot the VM could not open ~/.Trash; every create failed on that
+    tmpfs mask and each tick stopped the VM, so the backup never ran."""
+
+    ERR = ('docker: Error response from daemon: failed to create task for container: container init: '
+           'error mounting "tmpfs" to rootfs at "/backup/home/.Trash": create mountpoint for '
+           '/backup/home/.Trash mount: openat2 /backup/home/.Trash: operation not permitted')
+
+    def test_reads_the_mask_from_docker_error(self):
+        self.assertEqual(M.unmountable_mask(self.ERR), "home/.Trash")
+
+    def test_other_failures_are_not_masks(self):
+        self.assertIsNone(M.unmountable_mask('Conflict. The container name "/idrive-ingest" is already in use'))
+        self.assertIsNone(M.unmountable_mask(""))
+        self.assertIsNone(M.unmountable_mask(None))
+
+    def test_set_aside_mask_leaves_the_container_args(self):
+        srcs = [{"name": "home", "path": "/home/u", "masks": [".Trash", ".cache"]},
+                {"name": "drive", "path": "/mnt/drive", "masks": [".Trash"]}]
+        M.drop_masks(srcs, {"home/.Trash"})
+        joined = " ".join(M.container_args(cfg(), srcs)[0])
+        self.assertNotIn("destination=/backup/home/.Trash,", joined)
+        self.assertIn("destination=/backup/home/.cache,", joined)
+        self.assertIn("destination=/backup/drive/.Trash,", joined)   # only that source's mask goes
+
+
 class Runs(unittest.TestCase):
     def test_runs_newest_first_with_counts(self):
         logs = {"1794707038_Success_Manual": "Files considered for backup : 3\nFiles already present in your account : 3\n",
@@ -187,6 +213,25 @@ class PartialSuccess(unittest.TestCase):
         self.assertIsNone(M.accepted(row, self.ACCEPT[:1]))      # the Icon file is not covered
         self.assertIsNone(M.accepted(row, []))                    # nothing accepted by default
         self.assertIsNone(M.accepted(dict(row, failed=3), self.ACCEPT))  # a failure the log did not name
+
+    def test_permission_denied_entries_do_not_swallow_icon_failure(self):
+        """23 Nov 2026: hub-home ended Success* with 1 failed file (Icon\\r) followed by hundreds of
+        ']. Reason: Permission denied' lines (not counted in 'Files failed to backup'). re.S gobbled
+        those lines into a second bogus failure so accepted() rejected the run and looped."""
+        log = ("[ERROR REPORT]\n--------------\n"
+               "[Sun Nov 22 23:14:37 2026] [FAILED] [/backup/hub-home/Applications/Chrome Apps.localized/Icon\r]\n"
+               "[Sun Nov 22 23:13:19 2026] [FAILED] [/backup/hub-home/.lock]. Reason: Permission denied\n"
+               "[Sun Nov 22 23:13:22 2026] [FAILED] [/backup/hub-home/Library/Containers/x/.meta.plist]. Reason: Permission denied\n\n"
+               "[INFORMATION]\n-------------\n"
+               "[Sun Nov 22 23:13:19 2026] [INFORMATION] [/backup/hub-home/.lock]. Reason: Permission denied\n\n"
+               "[SUMMARY:] \n---------\nFiles considered for backup : 10\n"
+               "Files backed up now : 1 [Added(1) / modified(0)] [Size of backed up files: 1 KB]\n"
+               "Files already present in your account : 8\nFiles failed to backup : 1\n")
+        row = M.parse_runs(["1795388640_Success*_Manual"], {"1795388640_Success*_Manual": log}.get)[0]
+        self.assertEqual(len(row["failures"]), 1)
+        self.assertEqual(row["failures"][0]["path"], "/backup/hub-home/Applications/Chrome Apps.localized/Icon\r")
+        ok = M.accepted(row, self.ACCEPT)
+        self.assertEqual((ok["status"], ok["failed"], len(ok["accepted_failures"])), ("Success", 0, 1))
 
     def test_accepted_failures_complete_the_file_count(self):
         import tempfile, json

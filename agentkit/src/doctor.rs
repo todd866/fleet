@@ -41,9 +41,9 @@ pub fn run(
     };
     let planned = generate::plan(paths, &site)?;
     let names: Vec<&str> = match provider {
-        Some(p) if matches!(p, "claude" | "codex" | "cursor") => vec![p],
-        Some(p) => return Err(format!("unknown provider {p} (claude, codex, cursor)")),
-        None => vec!["claude", "codex", "cursor"],
+        Some(p) if matches!(p, "claude" | "codex" | "cursor" | "agy") => vec![p],
+        Some(p) => return Err(format!("unknown provider {p} (claude, codex, cursor, agy)")),
+        None => site::active_providers(&paths.config, &site),
     };
     let mut cfg = guard_cfg(&paths.home, &paths.config, &site);
     cfg.offload_worker = Some("worker".into());
@@ -69,6 +69,24 @@ pub fn run(
     if let Err(e) = &self_test {
         issues.push(format!("guard self-test: {e}"));
     }
+    // A guard switched off in site config: until 21 Nov 2026 one write of `disabled = [...]`
+    // turned guards off and doctor stayed green. Now a disable the owner has accepted
+    // (`agentkit doctor --accept-guards`, which records a hash of [guards]) is a warning that
+    // names it; a disable with no accepted baseline, or after [guards] changed, fails.
+    if !site.guards.disabled.is_empty() {
+        let names = site.guards.disabled.join(", ");
+        match guards_baseline_state(paths) {
+            GuardsBaseline::Accepted => warnings.push(format!(
+                "guards disabled by site config, accepted by the owner: {names}"
+            )),
+            GuardsBaseline::Changed => issues.push(format!(
+                "guards disabled by site config ({names}) and [guards] changed since the owner accepted it; the owner reviews and runs `agentkit doctor --accept-guards`"
+            )),
+            GuardsBaseline::Missing => issues.push(format!(
+                "guards disabled by site config ({names}) with no accepted baseline; the owner reviews and runs `agentkit doctor --accept-guards`"
+            )),
+        }
+    }
     if !memory_ok {
         issues.push("memory: notebook INDEX.md is not readable".into());
     }
@@ -93,6 +111,7 @@ pub fn run(
         "generated": now(),
         "ok": ok,
         "issues": issues,
+        "warnings": warnings,
         "providers": json_providers,
         "conformance": conformance::to_json(&conformance_rows),
     });
@@ -175,7 +194,7 @@ fn provider_row(name: &str, planned: &[Planned], site: &Site, memory_ok: bool, s
                     }
                 }
             }
-            if text.contains("agent-context") {
+            if text.contains("agent-context") || (name == "agy" && text.contains("agy-session-start")) {
                 context_on = true;
             }
         }
@@ -225,6 +244,7 @@ fn name_title(name: &str) -> &'static str {
         "claude" => "Claude",
         "codex" => "Codex",
         "cursor" => "Cursor",
+        "agy" => "Antigravity",
         _ => "",
     }
 }
@@ -267,4 +287,98 @@ fn write_report(paths: &Paths, value: &Value) -> Result<(), String> {
     let mut text = serde_json::to_string_pretty(value).map_err(|e| e.to_string())?;
     text.push('\n');
     fs::write(paths.state.join("doctor.json"), text).map_err(|e| e.to_string())
+}
+
+/// Where the owner's accepted `[guards]` baseline lives. guard-config denies agents writing it.
+pub const GUARDS_BASELINE_FILE: &str = "guards-accepted.json";
+
+enum GuardsBaseline {
+    Accepted,
+    Changed,
+    Missing,
+}
+
+/// The site's `[guards]` section in one canonical text (keys sorted), whatever its layout.
+fn guards_section(paths: &Paths) -> Result<String, String> {
+    let path = paths.config.join("agentkit.toml");
+    let text = fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let doc: toml::Value = toml::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))?;
+    let guards = doc.get("guards").cloned().unwrap_or(toml::Value::Table(Default::default()));
+    let mut wrapper = toml::map::Map::new();
+    wrapper.insert("guards".into(), sort_toml(&guards));
+    toml::to_string(&toml::Value::Table(wrapper)).map_err(|e| e.to_string())
+}
+
+fn sort_toml(v: &toml::Value) -> toml::Value {
+    match v {
+        toml::Value::Table(t) => {
+            let mut keys: Vec<&String> = t.keys().collect();
+            keys.sort();
+            let mut out = toml::map::Map::new();
+            for k in keys {
+                out.insert(k.clone(), sort_toml(&t[k]));
+            }
+            toml::Value::Table(out)
+        }
+        toml::Value::Array(a) => toml::Value::Array(a.iter().map(sort_toml).collect()),
+        other => other.clone(),
+    }
+}
+
+fn sha256_hex(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(text.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn read_baseline(paths: &Paths) -> Option<Value> {
+    let text = fs::read_to_string(paths.state.join(GUARDS_BASELINE_FILE)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn guards_baseline_state(paths: &Paths) -> GuardsBaseline {
+    let Ok(section) = guards_section(paths) else { return GuardsBaseline::Changed };
+    match read_baseline(paths).and_then(|b| b.get("sha256").and_then(|h| h.as_str()).map(str::to_string)) {
+        Some(h) if h == sha256_hex(&section) => GuardsBaseline::Accepted,
+        Some(_) => GuardsBaseline::Changed,
+        None => GuardsBaseline::Missing,
+    }
+}
+
+/// `agentkit doctor --accept-guards`: the owner's acceptance of the current `[guards]`
+/// section. Prints what changed since the last acceptance and records the new hash. The
+/// guard-config guard refuses agents running it, and it records nothing unless `confirm` (the
+/// caller's interactive check: both ends a terminal, the owner typed `accept`) says yes.
+pub fn accept_guards(paths: &Paths, confirm: impl FnOnce(&str) -> bool) -> Result<String, String> {
+    let section = guards_section(paths)?;
+    let hash = sha256_hex(&section);
+    let previous = read_baseline(paths);
+    let old_section = previous.as_ref().and_then(|b| b.get("section")).and_then(|s| s.as_str()).unwrap_or("");
+    let mut out = String::new();
+    if previous.as_ref().and_then(|b| b.get("sha256")).and_then(|h| h.as_str()) == Some(hash.as_str()) {
+        out.push_str("[guards] unchanged since it was last accepted.\n");
+    } else {
+        out.push_str(if previous.is_none() { "No accepted baseline yet. [guards] is:\n" } else { "[guards] changed since it was last accepted:\n" });
+        let old: Vec<&str> = old_section.lines().collect();
+        let new: Vec<&str> = section.lines().collect();
+        for line in &old {
+            if !new.contains(line) {
+                out.push_str(&format!("- {line}\n"));
+            }
+        }
+        for line in &new {
+            if !old.contains(line) {
+                out.push_str(&format!("+ {line}\n"));
+            }
+        }
+    }
+    if !confirm(&out) {
+        return Err("not accepted; nothing recorded".into());
+    }
+    fs::create_dir_all(&paths.state).map_err(|e| e.to_string())?;
+    let record = json!({"sha256": hash, "section": section, "accepted": now()});
+    let mut text = serde_json::to_string_pretty(&record).map_err(|e| e.to_string())?;
+    text.push('\n');
+    fs::write(paths.state.join(GUARDS_BASELINE_FILE), text).map_err(|e| e.to_string())?;
+    out.push_str(&format!("Recorded {} in {}.\n", &hash[..12], paths.state.join(GUARDS_BASELINE_FILE).display()));
+    Ok(out)
 }

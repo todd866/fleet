@@ -8,6 +8,7 @@ pub mod doctor;
 pub mod generate;
 pub mod guard;
 pub mod inventory;
+pub mod ledger;
 pub mod memory;
 pub mod site;
 
@@ -57,8 +58,9 @@ agentkit sync [--apply] [--config DIR]
                                     dry-run (default); --apply writes provider files
 agentkit doctor [--provider NAME] [--config DIR] [--conformance] [--json]
                                     exit non-zero when a provider has drifted
+agentkit doctor --accept-guards     owner only: accept the site's [guards] (disabled guards warn, not fail)
 agentkit context                    time, capacity, unread mail, fleet alerts
-agentkit hook <claude|codex|cursor> <guard|all>
+agentkit hook <claude|codex|cursor|agy> <guard|all>
                                     provider adapter: tool-call JSON on stdin; `all` runs every enabled guard
 agentkit memory import --from DIR   import Claude memory files into the notebook
 agentkit memory path                print the notebook directory
@@ -103,6 +105,33 @@ fn cmd_doctor(args: &[&str]) -> i32 {
     let conformance_only = args.contains(&"--conformance");
     let json = args.contains(&"--json");
     let paths = paths_from(args);
+    if args.contains(&"--accept-guards") {
+        // The owner's step only; the guard-config guard refuses it from an agent.
+        // Interactive only: a hook or an agent's shell has no terminal on both ends, and the
+        // owner types the word himself (21 Nov 2026: the record was forgeable by any caller).
+        let confirm = |change: &str| -> bool {
+            // SAFETY: isatty only reads the descriptor's state.
+            let tty = unsafe { libc::isatty(0) == 1 && libc::isatty(1) == 1 };
+            if !tty {
+                eprintln!("agentkit doctor --accept-guards: needs a terminal (the owner runs it himself)");
+                return false;
+            }
+            print!("{change}Type accept to record this [guards] as the owner's: ");
+            let _ = io::stdout().flush();
+            let mut line = String::new();
+            io::stdin().read_line(&mut line).is_ok() && line.trim() == "accept"
+        };
+        return match doctor::accept_guards(&paths, confirm) {
+            Ok(text) => {
+                print!("{text}");
+                0
+            }
+            Err(e) => {
+                eprintln!("agentkit doctor --accept-guards: {e}");
+                2
+            }
+        };
+    }
     match doctor::run(&paths, provider, conformance_only, json) {
         Ok((code, text)) => {
             if json {
@@ -121,10 +150,10 @@ fn cmd_doctor(args: &[&str]) -> i32 {
 
 fn cmd_hook(args: &[&str]) -> i32 {
     let (Some(provider), Some(guard_name)) = (args.first().copied(), args.get(1).copied()) else {
-        eprintln!("usage: agentkit hook <claude|codex|cursor> <guard|all>");
+        eprintln!("usage: agentkit hook <claude|codex|cursor|agy> <guard|all>");
         return 2;
     };
-    if !matches!(provider, "claude" | "codex" | "cursor") {
+    if !matches!(provider, "claude" | "codex" | "cursor" | "agy") {
         eprintln!("agentkit hook: unknown provider {provider}");
         return 2;
     }
@@ -142,6 +171,7 @@ fn cmd_hook(args: &[&str]) -> i32 {
         Err(_) => site::Site {
             schema: 1,
             manage_model: false,
+            providers: vec![],
             projects: vec![],
             retired_cursor_rules: vec![],
             guards: site::GuardFile::default(),
@@ -158,32 +188,39 @@ fn cmd_hook(args: &[&str]) -> i32 {
         .copied()
         .filter(|n| site::guard_enabled(n, &site.guards.disabled))
         .collect();
-    let decision = if guard_name == "all" {
-        let value: serde_json::Value = if raw.trim().is_empty() {
-            serde_json::Value::Null
+    let decided = guard_fail_closed(|| {
+        if guard_name == "all" {
+            let value: serde_json::Value = if raw.trim().is_empty() {
+                serde_json::Value::Null
+            } else {
+                match serde_json::from_str(&raw) {
+                    Ok(v) => v,
+                    Err(_) => return None,
+                }
+            };
+            Some(guard::decide_all(&value, &cfg, &enabled))
         } else {
-            match serde_json::from_str(&raw) {
-                Ok(v) => v,
-                Err(_) => return 0,
-            }
-        };
-        guard::decide_all(&value, &cfg, &enabled)
-    } else {
-        match guard::decide_json(guard_name, &raw, &cfg) {
-            Ok(d) => d,
-            Err(_) => return 0,
+            guard::decide_json(guard_name, &raw, &cfg).ok()
         }
-    };
+    });
+    let Some(decision) = decided else { return 0 };
     let rendered = match provider {
         "claude" | "codex" => guard::format_claude(&decision),
         "cursor" => guard::format_cursor(&decision),
+        "agy" => guard::format_agy(&decision),
         other => {
             eprintln!("agentkit hook: unknown provider {other}");
             return 2;
         }
     };
-    let mut out = io::stdout().lock();
-    let _ = out.write_all(rendered.as_bytes());
+    {
+        let mut out = io::stdout().lock();
+        let _ = out.write_all(rendered.as_bytes());
+        let _ = out.flush();
+    }
+    // After the answer is out: the ledger can only add time, never change the decision.
+    let value: serde_json::Value = serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
+    ledger::record(provider, guard_name, &value, &decision, &paths.state);
     0
 }
 
@@ -277,10 +314,30 @@ fn paths_from(args: &[&str]) -> Paths {
         .map(PathBuf::from)
         .or_else(|| env::var_os("AGENTKIT_CONFIG").map(PathBuf::from))
         .unwrap_or_else(|| home.join(".config/agentkit"));
-    let state = env::var_os("AGENTKIT_STATE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".local/state/agentkit"));
+    let state = ledger::default_state_dir(&home);
     Paths { home, config, state }
+}
+
+/// Run a guard decision; a panic anywhere inside it is a deny, never a silent allow (a hook
+/// that crashes is treated by the providers as no answer, which lets the call through).
+pub fn guard_fail_closed<F: FnOnce() -> Option<guard::Decision>>(f: F) -> Option<guard::Decision> {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        #[cfg(debug_assertions)]
+        if env::var("AGENTKIT_TEST_PANIC").ok().as_deref() == Some("1") {
+            panic!("test panic");
+        }
+        f()
+    }));
+    std::panic::set_hook(previous);
+    match result {
+        Ok(d) => d,
+        Err(_) => Some(guard::Decision::deny(
+            "guard-panic",
+            "the guard crashed on this command, so it is refused (fail closed). Rephrasing will not help; report the command to the owner so the guard can be fixed.",
+        )),
+    }
 }
 
 pub fn guard_main(name: &str) -> i32 {
@@ -289,11 +346,11 @@ pub fn guard_main(name: &str) -> i32 {
         return 0;
     }
     let cfg = site::guard_config_from_env();
-    let decision = match guard::decide_json(name, &raw, &cfg) {
-        Ok(d) => d,
-        Err(_) => return 0,
-    };
+    let Some(decision) = guard_fail_closed(|| guard::decide_json(name, &raw, &cfg).ok()) else { return 0 };
     println!("{}", guard::format_neutral(&decision));
+    let _ = io::stdout().flush();
+    let value: serde_json::Value = serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
+    ledger::record("bin", name, &value, &decision, &paths_from(&[]).state);
     0
 }
 

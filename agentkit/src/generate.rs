@@ -76,12 +76,15 @@ pub fn sync(paths: &Paths, apply: bool) -> Result<String, String> {
 
 pub fn plan(paths: &Paths, site: &Site) -> Result<Vec<Planned>, String> {
     let source = paths.config.join("rules/core-always.md");
-    let mut files = vec![
-        provider_rules(paths, "claude", &source)?,
-        provider_rules(paths, "codex", &source)?,
-        provider_rules(paths, "cursor", &source)?,
-    ];
-    files.extend(retired_cursor_rules(paths, site, &source)?);
+    let active = site::active_providers(&paths.config, site);
+    let has = |p: &str| active.contains(&p);
+    let mut files = Vec::new();
+    for p in &active {
+        files.push(provider_rules(paths, p, &source)?);
+    }
+    if has("cursor") {
+        files.extend(retired_cursor_rules(paths, site, &source)?);
+    }
     for project in &site.projects {
         let proj_src = paths.config.join("rules/projects").join(format!("{}.md", project.name));
         let text = site::rules_project(&paths.config, &project.name)?;
@@ -95,18 +98,26 @@ pub fn plan(paths: &Paths, site: &Site) -> Result<Vec<Planned>, String> {
             "{}\n\n@AGENTS.md\n",
             generated_banner("AGENTS.md")
         );
-        files.push(Planned {
-            path: dir.join("AGENTS.md"),
-            contents: agents,
-            providers: vec!["codex", "cursor"],
-            kind: "rules",
-        });
-        files.push(Planned {
-            path: dir.join("CLAUDE.md"),
-            contents: claude,
-            providers: vec!["claude"],
-            kind: "rules",
-        });
+        let agents_providers: Vec<&'static str> = ["codex", "cursor", "agy"]
+            .into_iter()
+            .filter(|p| has(p))
+            .collect();
+        if !agents_providers.is_empty() {
+            files.push(Planned {
+                path: dir.join("AGENTS.md"),
+                contents: agents,
+                providers: agents_providers,
+                kind: "rules",
+            });
+        }
+        if has("claude") {
+            files.push(Planned {
+                path: dir.join("CLAUDE.md"),
+                contents: claude,
+                providers: vec!["claude"],
+                kind: "rules",
+            });
+        }
     }
     for skill_dir in site::skill_dirs(&paths.config) {
         let name = skill_dir
@@ -118,54 +129,81 @@ pub fn plan(paths: &Paths, site: &Site) -> Result<Vec<Planned>, String> {
         let src = skill_dir.join("SKILL.md");
         let stamped = stamp_skill(&raw, &src.display().to_string());
         let desc = skill_description(&raw);
-        files.push(Planned {
-            path: paths.home.join(".claude/skills").join(&name).join("SKILL.md"),
-            contents: stamped.clone(),
-            providers: vec!["claude"],
-            kind: "rules",
-        });
-        files.push(Planned {
-            path: paths.home.join(".codex/skills").join(&name).join("SKILL.md"),
-            contents: stamped.clone(),
-            providers: vec!["codex"],
-            kind: "rules",
-        });
-        files.push(Planned {
-            path: paths.home.join(".cursor/rules").join(format!("skill-{name}.mdc")),
-            contents: render_mdc(
-                &desc,
-                false,
-                &src.display().to_string(),
-                &skill_body(&raw),
-                &paths.notebook(),
-                false,
-            ),
-            providers: vec!["cursor"],
-            kind: "rules",
-        });
-        files.push(Planned {
-            path: paths.home.join(".cursor/commands").join(format!("{name}.md")),
-            contents: stamped,
-            providers: vec!["cursor"],
-            kind: "rules",
-        });
+        if has("claude") {
+            files.push(Planned {
+                path: paths.home.join(".claude/skills").join(&name).join("SKILL.md"),
+                contents: stamped.clone(),
+                providers: vec!["claude"],
+                kind: "rules",
+            });
+        }
+        if has("codex") {
+            files.push(Planned {
+                path: paths.home.join(".codex/skills").join(&name).join("SKILL.md"),
+                contents: stamped.clone(),
+                providers: vec!["codex"],
+                kind: "rules",
+            });
+        }
+        if has("agy") {
+            files.push(Planned {
+                path: paths.home.join(".gemini/config/skills").join(&name).join("SKILL.md"),
+                contents: stamped.clone(),
+                providers: vec!["agy"],
+                kind: "rules",
+            });
+        }
+        if has("cursor") {
+            files.push(Planned {
+                path: paths.home.join(".cursor/rules").join(format!("skill-{name}.mdc")),
+                contents: render_mdc(
+                    &desc,
+                    false,
+                    &src.display().to_string(),
+                    &skill_body(&raw),
+                    &paths.notebook(),
+                    false,
+                ),
+                providers: vec!["cursor"],
+                kind: "rules",
+            });
+            files.push(Planned {
+                path: paths.home.join(".cursor/commands").join(format!("{name}.md")),
+                contents: stamped,
+                providers: vec!["cursor"],
+                kind: "rules",
+            });
+        }
     }
     let bin = std::env::var("AGENTKIT_BIN").unwrap_or_else(|_| "agentkit".into());
-    files.push(hook_file(
-        paths.home.join(".claude/settings.json"),
-        merge_claude(&paths.home.join(".claude/settings.json"), &bin, site)?,
-        vec!["claude"],
-    ));
-    files.push(hook_file(
-        paths.home.join(".codex/hooks.json"),
-        merge_codex(&paths.home.join(".codex/hooks.json"), &bin, site)?,
-        vec!["codex"],
-    ));
-    files.push(hook_file(
-        paths.home.join(".cursor/hooks.json"),
-        merge_cursor(&paths.home.join(".cursor/hooks.json"), &bin, site)?,
-        vec!["cursor"],
-    ));
+    if has("claude") {
+        files.push(hook_file(
+            paths.home.join(".claude/settings.json"),
+            merge_claude(&paths.home.join(".claude/settings.json"), &bin, site, &paths.config)?,
+            vec!["claude"],
+        ));
+    }
+    if has("codex") {
+        files.push(hook_file(
+            paths.home.join(".codex/hooks.json"),
+            merge_codex(&paths.home.join(".codex/hooks.json"), &bin, site)?,
+            vec!["codex"],
+        ));
+    }
+    if has("cursor") {
+        files.push(hook_file(
+            paths.home.join(".cursor/hooks.json"),
+            merge_cursor(&paths.home.join(".cursor/hooks.json"), &bin, site)?,
+            vec!["cursor"],
+        ));
+    }
+    if has("agy") {
+        files.push(hook_file(
+            paths.home.join(".gemini/config/hooks.json"),
+            merge_agy(&paths.home.join(".gemini/config/hooks.json"), &bin, site)?,
+            vec!["agy"],
+        ));
+    }
     if site.manage_model {
         files.extend(model_files(paths, site)?);
     }
@@ -324,6 +362,7 @@ const GUARDS: &[(&str, u64, bool)] = &[
     ("approval-files", 10, true),
     ("idrive-cleanup", 10, true),
     ("secrets", 10, true),
+    ("guard-config", 10, true),
 ];
 
 fn provider_rules(paths: &Paths, provider: &str, _core_src: &Path) -> Result<Planned, String> {
@@ -371,6 +410,18 @@ fn provider_rules(paths: &Paths, provider: &str, _core_src: &Path) -> Result<Pla
                 true,
             ) + &format!("\n{trailer_note}"),
             providers: vec!["cursor"],
+            kind: "rules",
+        }),
+        "agy" => Ok(Planned {
+            path: paths.home.join(".gemini/config/GEMINI.md"),
+            contents: format!(
+                "{}\n\n{}\n\n{}\n{}\n",
+                generated_banner(&source_label),
+                body.trim_end(),
+                GUARD_RULES.trim_end(),
+                format!("{}\n{}", trailer(&paths.notebook()), trailer_note).trim_end()
+            ),
+            providers: vec!["agy"],
             kind: "rules",
         }),
         other => Err(format!("unknown provider {other}")),
@@ -433,11 +484,40 @@ fn context_hook_command(provider: &str) -> String {
     format!("env AGENTKIT_PROVIDER={provider} agent-context")
 }
 
-fn merge_claude(path: &Path, bin: &str, site: &Site) -> Result<String, String> {
+/// Claude settings keys a shared file may never set: model choice, approval posture, per-host
+/// paths and the hooks agentkit renders itself.
+const CLAUDE_NEVER_SHARED: &[&str] = &[
+    "hooks", "model", "effortLevel", "permissions", "skipDangerousModePermissionPrompt",
+    "statusLine", "autoMode", "apiKeyHelper", "awsAuthRefresh", "awsCredentialExport",
+    // One shared file must not switch the guards off on every Mac, or set their environment.
+    "disableAllHooks", "env",
+];
+
+/// Top-level keys from `rules/claude-settings.json` (written on the reference Mac, copied to the
+/// others with the rules) set into this Mac's Claude settings, so every Mac has the same plugins,
+/// skill switches and preferences. Keys in CLAUDE_NEVER_SHARED are ignored.
+fn shared_claude_settings(config: &Path) -> serde_json::Map<String, Value> {
+    let mut out = serde_json::Map::new();
+    if let Value::Object(map) = load_json(&config.join("rules/claude-settings.json")) {
+        for (k, v) in map {
+            if !CLAUDE_NEVER_SHARED.contains(&k.as_str()) {
+                out.insert(k, v);
+            }
+        }
+    }
+    out
+}
+
+fn merge_claude(path: &Path, bin: &str, site: &Site, config: &Path) -> Result<String, String> {
     let mut root = load_json(path);
     if !root.is_object() {
         root = json!({});
     }
+    for (k, v) in shared_claude_settings(config) {
+        root[k] = v;
+    }
+    // `disableAllHooks` turns every guard off; the plan never keeps it, so doctor sees drift.
+    root.as_object_mut().unwrap().remove("disableAllHooks");
     let hooks = root.as_object_mut().unwrap().entry("hooks").or_insert_with(|| json!({}));
     if !hooks.is_object() {
         *hooks = json!({});
@@ -587,6 +667,59 @@ fn merge_cursor(path: &Path, bin: &str, site: &Site) -> Result<String, String> {
 fn scrub_cursor_array(slot: &mut Value) {
     let Some(arr) = slot.as_array_mut() else { return };
     arr.retain(|entry| !is_managed(&command_of(entry)));
+}
+
+const AGY_GUARD_MATCHER: &str = "run_command|write_file|edit_file|write_to_file|replace_file_content|multi_replace_file_content|read_file|view_file|grep_search";
+
+fn merge_agy(path: &Path, bin: &str, site: &Site) -> Result<String, String> {
+    let mut root = load_json(path);
+    if !root.is_object() {
+        root = json!({});
+    }
+    let obj = root.as_object_mut().unwrap();
+    let keep_context = obj
+        .get("fleet-context")
+        .and_then(|v| v.get("SessionStart"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter().any(|h| {
+                let c = command_of(h);
+                c.contains("agy-session-start") || c.contains("agent-context")
+            })
+        })
+        .unwrap_or(false);
+    if !keep_context {
+        obj.insert(
+            "fleet-context".into(),
+            json!({
+                "SessionStart": [{
+                    "type": "command",
+                    "command": "~/.local/bin/agy-session-start",
+                    "timeout": 10
+                }]
+            }),
+        );
+    }
+    let guards = enabled_guards(site);
+    if !guards.is_empty() {
+        let max_timeout = guards.iter().map(|(_, t, _)| *t).max().unwrap_or(20);
+        obj.insert(
+            "agentkit-guards".into(),
+            json!({
+                "PreToolUse": [{
+                    "matcher": AGY_GUARD_MATCHER,
+                    "hooks": [{
+                        "type": "command",
+                        "command": format!("{bin} hook agy all"),
+                        "timeout": max_timeout
+                    }]
+                }]
+            }),
+        );
+    } else {
+        obj.remove("agentkit-guards");
+    }
+    Ok(pretty(&root))
 }
 
 fn model_files(paths: &Paths, site: &Site) -> Result<Vec<Planned>, String> {

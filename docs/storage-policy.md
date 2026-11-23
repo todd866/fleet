@@ -67,6 +67,24 @@ Scratch is the exception to the copy: it has no master, so apply moves it straig
 
 Verification that fails leaves the source in place. The incomplete staging copy is moved to Trash rather than unlinked.
 
+## What is measured and what is declared
+
+Three tools, three questions. None of them moves data.
+
+| Tool | Question | Where it writes | When |
+|---|---|---|---|
+| `placement status` | Are the copies and backups of what is declared actually there? | `~/.local/state/placement/status.json` | Hourly, with `diskmap peers`, on the Mac that holds the peer caches |
+| `placement-unclaimed` | Which big folders were measured and no data set claims? | `~/.local/state/placement/unclaimed.json` (`--write`) | The same hourly job |
+| `cloud-inventory` | What is in each configured rclone remote? | `~/.local/state/placement/cloud.json` | Daily 03:10Z on the unmetered hub |
+
+`placement-unclaimed` reads diskmap `where.json` (this Mac and `peers/*.where.json`) and `placement.toml`. A folder is claimed when a data set path equals it, contains it, or sits inside it. `--write` records `{generated, hosts:{host:{gb_total, top:[{path,gb}]}}}`.
+
+`cloud-inventory` reads `~/.config/fleet/cloud-inventory.toml` (`name`, `remote`, `depth`, default 2). A remote that `rclone listremotes` does not have is skipped. It runs `rclone size --json` on each folder down to that depth. Example: [examples/cloud-inventory.toml](examples/cloud-inventory.toml).
+
+Fleet morning reads both files, its own or a newer copy a snapshot carried. `place:unclaimed:<host>` is ok under 50 GB and a warn at 50 GB; the datum is the two largest folders. `cloud:<name>` shows the total and the largest folder. Folders no data set `offsite` or path claims are listed as `unclaimed: …`. A reading older than 26 h is stale.
+
+Every move of 1 GB or more gets a row in `OFFLOADS.md` in the same step. Every new long-lived folder gets a `[[dataset]]` in `placement.toml` when it is created.
+
 ## What status reports
 
 One row per host: mark, free, floor, band, state. Then one row per data gap: too few encrypted copies, no off-site copy, a master volume with none of the bytes that exist elsewhere, or bulk sitting on a host that should not have it. Column heads are the only labels. fleet-health copies `below-floor`, `below-band`, and each gap into its issue list. mac-registry counts them in Needs attention. Both read the JSON; they do not re-measure the disk.

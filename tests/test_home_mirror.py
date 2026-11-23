@@ -112,6 +112,18 @@ class HubAttach(unittest.TestCase):
         self.assertEqual((create[1], attach[1]), (b"secret", b"secret"))
         self.assertTrue(all("secret" not in " ".join(args) for args, _ in calls))
 
+    def test_an_unmounted_drive_never_gets_a_new_image_on_the_boot_disk(self):
+        cfg = json.loads(self.cfg.read_text())
+        cfg["image"] = "/V/Drive/home.sparsebundle"
+        self.cfg.write_text(json.dumps(cfg))
+        calls = []
+        def run(args, **kw):
+            calls.append(args)
+            return SimpleNamespace(returncode=0, stdout=b"secret\n", stderr=b"")
+        rc = M.hub_attach(self.cfg, run=run, ismount=lambda p: False, exists=lambda p: False, stdin=b"")
+        self.assertEqual(rc, 1)
+        self.assertFalse(any(a[0] == "/usr/bin/hdiutil" for a in calls))
+
     def test_a_piped_password_wins_and_password_cmd_is_not_run(self):
         calls, mounted = [], []
         def run(args, **kw):

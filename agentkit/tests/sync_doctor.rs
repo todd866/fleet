@@ -397,9 +397,89 @@ fn disabled_guard_skips_hooks_and_reports_in_doctor() {
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("disabled (site)"));
     assert!(out.stdout.is_empty());
+    // A guard switched off in site config fails the doctor (21 Nov 2026): one write of
+    // `disabled = [...]` used to turn guards off while doctor stayed green.
     let (code, doc, err) = home.run(&["doctor", "--conformance"]);
-    assert_eq!(code, 0, "{err}{doc}");
+    assert_eq!(code, 1, "{err}{doc}");
     assert!(doc.contains("push") && doc.contains("disabled (site)"), "{doc}");
+    let (_, json_out, _) = home.run(&["doctor", "--json"]);
+    assert!(json_out.contains("guards disabled by site config") && json_out.contains("push"), "{json_out}");
+    assert!(json_out.contains("--accept-guards"), "the failure names the owner's step: {json_out}");
+}
+
+#[test]
+fn an_accepted_guard_disable_warns_and_a_changed_one_fails_again() {
+    let home = Home::new();
+    home.site();
+    let base = "schema = 1\nmanage_model = false\n\n[[projects]]\nname = \"example\"\npath = \"work/example\"\n";
+    home.write("agentkit.toml", &format!("{base}\n[guards]\ndisabled = [\"hard-delete\"]\n"));
+    let (code, _, err) = home.run(&["sync", "--apply"]);
+    assert_eq!(code, 0, "{err}");
+    // no baseline: fails
+    let (code, out, err) = home.run(&["doctor", "--json"]);
+    assert_eq!(code, 1, "{err}{out}");
+    assert!(out.contains("no accepted baseline"), "{out}");
+    // without a terminal (a hook, an agent's shell) nothing is recorded
+    let record = home.root.join(".local/state/agentkit/guards-accepted.json");
+    let (code, _, err) = home.run(&["doctor", "--accept-guards"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("needs a terminal"), "{err}");
+    assert!(!record.exists());
+    // the owner at a terminal: it shows the change and records it only on `accept`
+    let in_pty = |answer: &str| {
+        use std::io::Write;
+        let mut child = Command::new("script")
+            .args(["-q", "/dev/null"])
+            .arg(bin("agentkit"))
+            .args(["doctor", "--accept-guards"])
+            .env("HOME", &home.root)
+            .env("AGENTKIT_CONFIG", home.config())
+            .env("AGENTKIT_STATE", home.root.join(".local/state/agentkit"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // `script` turns the end of its input into ^D on the terminal, so the answer is typed
+        // once the prompt is up and the input is held open until the program has read it.
+        let mut stdin = child.stdin.take().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        stdin.write_all(answer.as_bytes()).unwrap();
+        stdin.flush().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        drop(stdin);
+        let out = child.wait_with_output().unwrap();
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    let out = in_pty("no\n");
+    assert!(out.contains("+ disabled = [\"hard-delete\"]"), "{out}");
+    assert!(!record.exists(), "a refusal recorded: {out}");
+    let out = in_pty("accept\n");
+    assert!(out.contains("Recorded"), "{out}");
+    assert!(record.is_file());
+    // accepted and unchanged: a warning that names the guard, and a pass
+    let (code, out, err) = home.run(&["doctor", "--json"]);
+    assert_eq!(code, 0, "{err}{out}");
+    assert!(out.contains("accepted by the owner: hard-delete"), "{out}");
+    let (code, out, _) = home.run(&["doctor"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("? warning") && out.contains("hard-delete"), "{out}");
+    // layout alone (order, spacing) is not a change
+    home.write("agentkit.toml", &format!("{base}\n[guards]\n\ndisabled   = [ \"hard-delete\" ]\n"));
+    let (code, out, _) = home.run(&["doctor", "--json"]);
+    assert_eq!(code, 0, "{out}");
+    // another guard disabled, or any other [guards] change while one is disabled: fails again
+    home.write("agentkit.toml", &format!("{base}\n[guards]\ndisabled = [\"hard-delete\", \"guard-config\"]\n"));
+    let (code, out, _) = home.run(&["doctor", "--json"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("changed since the owner accepted"), "{out}");
+    home.write("agentkit.toml", &format!("{base}\n[guards]\ndisabled = [\"hard-delete\"]\nair_aliases = [\"x\"]\n"));
+    let (code, _, _) = home.run(&["doctor", "--json"]);
+    assert_eq!(code, 1);
+    // nothing disabled: no baseline needed
+    home.write("agentkit.toml", &format!("{base}\n[guards]\nair_aliases = [\"x\"]\n"));
+    let (code, out, err) = home.run(&["doctor", "--json"]);
+    assert_eq!(code, 0, "{err}{out}");
 }
 
 #[test]
@@ -489,4 +569,65 @@ fn conformance_never_touches_the_real_metered_link_marker() {
     let (code, doc, err) = home.run(&["doctor", "--conformance"]);
     assert_eq!(code, 0, "{err}{doc}");
     assert_eq!(fs::read_to_string(&marker).unwrap(), "set by link-meter\n");
+}
+
+#[test]
+fn shared_claude_settings_merge_but_never_touch_model_or_permissions() {
+    let home = Home::new();
+    home.site();
+    fs::create_dir_all(home.root.join(".claude")).unwrap();
+    fs::write(
+        home.root.join(".claude/settings.json"),
+        r#"{"model": "local-choice", "permissions": {"defaultMode": "default"}, "theme": "dark", "keep": 1}"#,
+    )
+    .unwrap();
+    home.write(
+        "rules/claude-settings.json",
+        r#"{"theme": "light", "enabledPlugins": {"a@b": true}, "model": "other", "permissions": {"allow": ["Bash"]}, "hooks": {}}"#,
+    );
+    let (code, _, err) = home.run(&["sync", "--apply"]);
+    assert_eq!(code, 0, "{err}");
+    let v: Value = serde_json::from_str(&fs::read_to_string(home.root.join(".claude/settings.json")).unwrap()).unwrap();
+    assert_eq!(v["theme"], "light");
+    assert_eq!(v["enabledPlugins"]["a@b"], true);
+    assert_eq!(v["keep"], 1);
+    assert_eq!(v["model"], "local-choice");
+    assert_eq!(v["permissions"]["defaultMode"], "default");
+    assert!(v["hooks"]["PreToolUse"].is_array());
+    let (code, out, _) = home.run(&["sync"]);
+    assert_eq!(code, 0);
+    assert!(out.contains("no changes"), "{out}");
+}
+
+#[test]
+fn agy_sync_doctor_and_paused_providers_skip_claude_and_codex() {
+    let home = Home::new();
+    home.site();
+    home.write("paused-providers", "# paused\nclaude\ncodex\n");
+    let (code, applied, err) = home.run(&["sync", "--apply"]);
+    assert_eq!(code, 0, "{err}{applied}");
+    assert!(!home.root.join(".claude/CLAUDE.md").exists(), "paused claude should not be generated");
+    assert!(!home.root.join(".codex/AGENTS.md").exists(), "paused codex should not be generated");
+    let gemini = fs::read_to_string(home.root.join(".gemini/config/GEMINI.md")).unwrap();
+    assert!(gemini.contains("Use the Trash"), "{gemini}");
+    assert!(gemini.contains("hard-delete:"), "{gemini}");
+    let agy_hooks: Value = serde_json::from_str(
+        &fs::read_to_string(home.root.join(".gemini/config/hooks.json")).unwrap(),
+    )
+    .unwrap();
+    let hooks_text = agy_hooks.to_string();
+    assert!(hooks_text.contains("hook agy all"), "{hooks_text}");
+    assert!(hooks_text.contains("agy-session-start"), "{hooks_text}");
+    assert!(home.root.join(".gemini/config/skills/sample/SKILL.md").is_file());
+    let (code, doc, err) = home.run(&["doctor", "--json"]);
+    assert_eq!(code, 0, "{err}{doc}");
+    let report: Value = serde_json::from_str(&doc).unwrap();
+    assert_eq!(report["ok"], true, "{doc}");
+    let ids: Vec<&str> = report["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|p| p["id"].as_str())
+        .collect();
+    assert_eq!(ids, vec!["cursor", "agy"], "{doc}");
 }

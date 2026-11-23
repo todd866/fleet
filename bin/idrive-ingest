@@ -50,6 +50,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -64,9 +65,10 @@ LOG_MAX = 50 * 1024 * 1024   # the client redraws its progress screen; a multi-d
 INSTALLER = "https://www.idrivedownloads.com/downloads/linux/download-for-linux/linux-bin/idriveforlinux.bin"
 DEFAULT_MASKS = [".Spotlight-V100", ".fseventsd", ".Trashes", ".DocumentRevisions-V100", ".TemporaryItems"]
 LOG_NAME = re.compile(r"^(\d{9,11})_([A-Za-z]+\*?)_([A-Za-z]+)$")  # "Success*": done, some files failed
-# One failed file in the log's ERROR REPORT. A path can hold "]" (Apple News cache names do), so the
-# closing bracket is the one followed by " Reason : " or by the end of the entry.
-FAILED_FILE = re.compile(r"\[FAILED\] \[(/.*?)\](?= Reason : |[ \t]*(?:\r?\n|$))(?: Reason : ([^\n]*))?", re.S)
+# One failed file in the log's ERROR REPORT. A path can hold "]" (Apple News cache names do) or
+# "\r" (macOS custom-icon "Icon\r" files), never "\n". Permission-denied entries use "]. Reason:"
+# and are not counted in "Files failed to backup", so matching per-line keeps them separate.
+FAILED_FILE = re.compile(r"\[FAILED\] \[(/[^\n]*?)\](?= Reason : |[ \t]*(?:\r?\n|$))(?: Reason : ([^\n]*))?")
 COUNTS = {
     "considered": r"Files considered for backup\s*:\s*(\d+)",
     "backed_up": r"Files backed up now\s*:\s*(\d+)",
@@ -95,9 +97,9 @@ def env_for(cfg):
 
 def run(cfg, args, timeout=120, stdin=None):
     try:
-        done = subprocess.run(args, capture_output=True, text=True, errors="replace", timeout=timeout,
-                              env=env_for(cfg), stdin=stdin)
-        return done.returncode, done.stdout, done.stderr
+        # Read raw bytes so universal newlines never turn macOS "Icon\r" into "Icon\n".
+        done = subprocess.run(args, capture_output=True, timeout=timeout, env=env_for(cfg), stdin=stdin)
+        return done.returncode, done.stdout.decode("utf-8", "replace"), done.stderr.decode("utf-8", "replace")
     except (OSError, subprocess.TimeoutExpired) as exc:
         return 127, "", str(exc)
 
@@ -179,6 +181,27 @@ def count_gap(on_disk, considered):
     if not on_disk or considered is None:
         return None
     return round((on_disk - considered) / on_disk, 4)
+
+
+_UNMOUNTABLE = re.compile(r'error mounting "tmpfs" to rootfs at "/backup/([^"]+)"')
+
+
+def unmountable_mask(err):
+    """The `source/mask` a failed create could not blank, from docker's error text, or None.
+
+    On 21 Nov 2026, after a reboot, the VM's share of the hub's home folder could no longer open ~/.Trash
+    (macOS privacy protection; the host could), so every create failed on that tmpfs mask and each
+    tick stopped the VM for nothing. A mask the VM cannot open is one the client cannot read either:
+    set it aside and carry on."""
+    m = _UNMOUNTABLE.search(err or "")
+    return m.group(1).rstrip("/") if m else None
+
+
+def drop_masks(sources, skip):
+    """Remove set-aside `source/mask` entries from the planned sources (in place)."""
+    for s in sources:
+        s["masks"] = [m for m in s["masks"] if f"{s['name']}/{m}" not in skip]
+    return sources
 
 
 def container_args(cfg, sources):
@@ -302,6 +325,9 @@ def due(now, success, every_h, spec, last_start, started_recently):
 def vm_status(cfg):
     rc, out, _ = run(cfg, ["limactl", "list", "--json", cfg["vm"]], timeout=30)
     if rc != 0:
+        # One slow limactl under disk load read as "missing" twice on 21 Nov while the VM ran.
+        rc, out, _ = run(cfg, ["limactl", "list", "--json", cfg["vm"]], timeout=90)
+    if rc != 0:
         return "missing", []
     for line in out.splitlines():
         try:
@@ -341,7 +367,17 @@ def runs(cfg):
     if rc != 0:
         return None
     def read_log(name):
-        _rc, text, _ = exec_(cfg, f"tail -c 20000 {base}/{name}")
+        q = shlex.quote(name)
+        if "*" in name:
+            # Success* logs can carry a large [INFORMATION] block between [ERROR REPORT] and
+            # [SUMMARY:], pushing [ERROR REPORT] past a 20 KB tail. Read both sections directly.
+            cmd = (f"for f in {base}/{q}; do [ -f \"$f\" ] || continue; "
+                   "awk '/^\\[ERROR REPORT\\]/{p=1} /^\\[INFORMATION\\]|^\\[SUMMARY:\\]/{p=0} p' \"$f\" | head -c 262144; "
+                   "awk '/^\\[SUMMARY:\\]/{p=1} p' \"$f\" | tail -c 20000; done")
+            _rc, text, _ = exec_(cfg, cmd)
+            if text.strip():
+                return text
+        _rc, text, _ = exec_(cfg, f"tail -c 20000 {base}/{q}")
         return text
     return parse_runs(out.split(), read_log)
 
@@ -403,6 +439,8 @@ def tick(cfg, dry=False):
     vm_ok = ensure_vm(cfg, dry, actions, problems, idle=not running_before)
     sources = plan(cfg, busy=busy(cfg))
     active = [s for s in sources if not s["missing"] and not s["waiting"]]
+    unmountable = sorted(set(previous.get("unmountable_masks") or []))
+    drop_masks(active, set(unmountable))
     args, spec = container_args(cfg, active)
     is_running, have_spec = container(cfg) if vm_ok else (None, None)
     age = backup_age(cfg) if is_running else None
@@ -424,10 +462,17 @@ def tick(cfg, dry=False):
             run(cfg, ["docker", "rm", "-f", NAME], timeout=120)
             rc, _o, err = run(cfg, args, timeout=300)
             actions.append("recreated container" if rc == 0 else f"container create failed: {err.strip()[-300:]}")
-            if rc != 0 and "Conflict" in err:
-                # The old container could not be removed: after the 18 Nov 2026 reboot the VM's share of a slow
-                # USB drive hung, the container stuck in "Created", and every tick failed this way for 6 hours.
-                # No backup is running here, so stop the VM; the next tick starts it fresh and recreates.
+            bad = unmountable_mask(err) if rc != 0 else None
+            if bad and bad not in unmountable:
+                # One mask the VM cannot open: no stuck VM, so set it aside; the next tick recreates.
+                unmountable = sorted(set(unmountable) | {bad})
+                actions.append(f"set aside unmountable mask {bad}")
+            elif rc != 0:
+                # The old container could not be removed or the create timed out: after the 18 Nov 2026
+                # reboot the VM's share of a slow USB drive hung, the container stuck in "Created", and
+                # every tick failed this way for 6 hours; on 21 Nov a plain create timeout (rc 1 after
+                # 300s on a cold VM) did the same. No backup is running in either case, so stop the VM;
+                # the next tick starts it fresh and recreates.
                 run(cfg, ["limactl", "stop", "-f", cfg["vm"]], timeout=300)
                 actions.append("stopped VM to clear a stuck container")
             is_running, have_spec = container(cfg)
@@ -435,8 +480,16 @@ def tick(cfg, dry=False):
                 mounted = [s["name"] for s in active]
     elif vm_ok and is_running is False:
         if not dry:
-            run(cfg, ["docker", "start", NAME], timeout=120)
-            actions.append("started container")
+            rc, _o, _e = run(cfg, ["docker", "start", NAME], timeout=120)
+            if rc != 0:
+                # A container stuck in "Created" (VM restarted underneath it, 21 Nov 2026) cannot be
+                # started; remove and recreate it so this tick recovers instead of failing until a
+                # spec change triggers the recreate branch above.
+                run(cfg, ["docker", "rm", "-f", NAME], timeout=120)
+                rc, _o, _e = run(cfg, args, timeout=300)
+                actions.append("recreated stuck container" if rc == 0 else "container recreate failed")
+            else:
+                actions.append("started container")
             is_running, have_spec = container(cfg)
     if vm_ok and not is_running:
         problems.append("container not running")
@@ -447,7 +500,10 @@ def tick(cfg, dry=False):
         problems.append("no backup set (client not signed in?)")
     history = [r for r in (history or []) if r["epoch"] >= int(cfg.get("count_from") or 0)]
     last = history[0] if history else None
-    success = next((ok for ok in (accepted(r, cfg.get("accept_failed")) for r in history) if ok), None)
+    # A set-aside mask's folder is unreadable in the VM, so the client may list it as failed: accept it.
+    patterns = list(cfg.get("accept_failed") or []) + [
+        re.escape("/" + m.split("/", 1)[1]) + "(/|$)" for m in unmountable if "/" in m]
+    success = next((ok for ok in (accepted(r, patterns) for r in history) if ok), None)
     started_at = previous.get("started_at")
     last_start = previous.get("last_start") or {}
     held = holds(previous.get("held"), success, last_start)
@@ -526,6 +582,7 @@ def tick(cfg, dry=False):
         "login_backup_at": previous.get("login_backup_at"),
         "actions": actions,
         "problems": problems,
+        "unmountable_masks": unmountable,
     }
     if not dry:
         tmp = status_path.with_suffix(".json.tmp")
