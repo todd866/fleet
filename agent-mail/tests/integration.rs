@@ -372,6 +372,10 @@ fn snippet_includes_provider_instruction() {
         "cursor check missing: {stdout}"
     );
     assert!(
+        stdout.contains("--provider gemini --json"),
+        "gemini check missing: {stdout}"
+    );
+    assert!(
         stdout.contains("--provider other --json"),
         "generic check missing: {stdout}"
     );
@@ -789,6 +793,105 @@ fn cursor_hook_keeps_oversized_mail_at_source_without_ack() {
             .unwrap()
             .contains(&text)
     );
+    let _ = fs::remove_dir_all(state);
+    let _ = fs::remove_dir_all(config);
+}
+
+#[test]
+fn gemini_is_first_class_and_agy_alias_normalizes_to_gemini() {
+    let (state, config) = temp_dirs();
+    fs::write(
+        state.join("inbox.jsonl"),
+        format!("{}\n", inbox_line("msgg", "", "hello agy")),
+    )
+    .unwrap();
+
+    for alias in ["gemini", "agy"] {
+        let (code, stdout, _) = run_mail(
+            &state,
+            &config,
+            None,
+            &["unread", "--provider", alias, "--json"],
+            None,
+        );
+        assert_eq!(code, 0, "{alias} unread failed");
+        let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect(&stdout);
+        assert_eq!(v["unread"][0]["id"], "msgg");
+        let reader = v["reader"].as_str().unwrap_or("");
+        assert!(reader.starts_with("gemini:"), "alias {alias} reader {reader}");
+    }
+
+    // Marking via `agy` records `gemini:` receipt so `--provider gemini` sees it read.
+    let (code, _, _) = run_mail(
+        &state,
+        &config,
+        None,
+        &["unread", "--provider", "agy", "--mark", "--json"],
+        None,
+    );
+    assert_eq!(code, 0);
+    let (code, stdout, _) = run_mail(
+        &state,
+        &config,
+        None,
+        &["unread", "--provider", "gemini", "--json"],
+        None,
+    );
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect(&stdout);
+    assert_eq!(v["unread"].as_array().unwrap().len(), 0);
+
+    // Exact send to `--to-provider agy` is delivered to `--provider gemini` and vice versa.
+    let (code, id_out, _) = run_mail(
+        &state,
+        &config,
+        None,
+        &[
+            "send",
+            "local",
+            "targeted agy",
+            "--to-provider",
+            "agy",
+            "--to-session",
+            "sess-g1",
+        ],
+        None,
+    );
+    assert_eq!(code, 0);
+    let (code, stdout, _) = run_mail(
+        &state,
+        &config,
+        None,
+        &[
+            "unread",
+            "--provider",
+            "gemini",
+            "--session",
+            "sess-g1",
+            "--mark",
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect(&stdout);
+    assert_eq!(v["unread"][0]["id"], id_out.trim());
+
+    // install/uninstall accept both `agy` and `gemini`.
+    let (code, stdout, _) = run_mail(&state, &config, None, &["install", "--provider", "agy"], None);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("agy-session-start"));
+    assert!(config.join("snippets/gemini-hooks.json").is_file());
+    let (code, _, _) = run_mail(
+        &state,
+        &config,
+        None,
+        &["uninstall", "--provider", "gemini"],
+        None,
+    );
+    assert_eq!(code, 0);
+    assert!(!config.join("snippets/gemini-hooks.json").exists());
+
     let _ = fs::remove_dir_all(state);
     let _ = fs::remove_dir_all(config);
 }

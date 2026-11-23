@@ -12,13 +12,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const USAGE: &str = "\
 #   agent-mail send HOST[:PROJECT[:ROLE]] \"text\"
 #   agent-mail send HOST[:PROJECT[:ROLE]] \"text\" --to-provider P --to-session ID
-#   agent-mail unread [--mark|--hook] [--provider claude|codex|cursor|agy|gemini|zai|other] [--json] [--role ROLE] [--session ID]
-#   agent-mail wait [--timeout SEC] [--provider P] [--role ROLE] [--session ID]
+#   agent-mail unread [--mark|--hook] [--provider claude|codex|cursor|gemini|agy|zai|other] [--json] [--role ROLE] [--session ID]
+#   agent-mail wait [--timeout SEC] [--provider claude|codex|cursor|gemini|agy|zai|other] [--role ROLE] [--session ID]
 #   agent-mail status HOST [ID]     who has read it? (legacy read.txt still counts)
 #   agent-mail log [N]              the last N messages here, read or not
 #   agent-mail snippet              project instruction block for AGENTS.md / CLAUDE.md / rules
-#   agent-mail install [--provider claude|codex|cursor|all] [NAME]
-#   agent-mail uninstall [--provider claude|codex|cursor|all]
+#   agent-mail install [--provider claude|codex|cursor|gemini|agy|all] [NAME]
+#   agent-mail uninstall [--provider claude|codex|cursor|gemini|agy|all]
 #   agent-mail relay
 # Inbox: ~/.local/state/agent-mail/inbox.jsonl. Receipts: receipts.jsonl. Legacy marks: read.txt.
 {
@@ -27,6 +27,7 @@ const USAGE: &str = "\
 const CLAUDE_HOOK: &str = "\"$HOME/.local/bin/agent-mail\" unread --hook";
 const CODEX_HOOK: &str = "\"$HOME/.local/bin/agent-mail\" unread --hook --provider codex";
 const CURSOR_HOOK: &str = "\"$HOME/.local/bin/agent-mail\" unread --hook --provider cursor";
+const GEMINI_HOOK: &str = "\"$HOME/.local/bin/agy-session-start\"";
 
 /// Codex CLI 0.154.0 stores delivery hooks in `hooks.json`. `config.toml` `notify`
 /// is a single turn-ended command, not a hook list. `[hooks.state]` records the
@@ -37,6 +38,12 @@ config.toml notify is one turn-ended command, not a delivery hook. \
 [hooks.state] holds each hook's trusted_hash. \
 A new hook does not run until the owner reviews it with /hooks. \
 This command does not edit ~/.codex.
+";
+
+const GEMINI_INSTALL_NOTE: &str = "\
+Antigravity / Gemini reads hooks from ~/.gemini/config/hooks.json (SessionStart via agy-session-start, \
+which runs `agent-mail unread --provider gemini --json`). \
+This command writes a snippet under ~/.config/agent-mail/snippets/gemini-hooks.json and does not edit ~/.gemini.
 ";
 
 const READ_SID_STALE: Duration = Duration::from_secs(14 * 24 * 3600);
@@ -85,7 +92,7 @@ For one session, send with paired `--to-provider P --to-session ID`; readers sup
 Codex: at session start and before finishing, run `agent-mail unread --provider codex`.
 Claude Code and Claude-compatible launchers use the installed hook (`agent-mail unread --hook`).
 Cursor agents run `agent-mail unread --provider cursor` the same way.
-Antigravity / Gemini agents run `agent-mail unread --provider agy --json`.
+Antigravity / Gemini agents run `agent-mail unread --provider gemini --json` (`agy` is accepted as an alias).
 Any other agent or script runs `agent-mail unread --provider other --json`.
 A background watcher runs `agent-mail wait` until new mail for this project arrives.
 "
@@ -324,8 +331,9 @@ fn parse_send_target(args: &[String]) -> Result<Option<SessionTarget>, ()> {
     while i < args.len() {
         let value = args.get(i + 1).ok_or(())?;
         match args[i].as_str() {
-            "--to-provider" if provider.is_none() && provider_name_ok(value) => {
-                provider = Some(value.clone());
+            "--to-provider" if provider.is_none() => {
+                let canon = normalize_provider(value).ok_or(())?;
+                provider = Some(canon.to_string());
             }
             "--to-session"
                 if session.is_none() && session_name_ok(value) && !value.starts_with('-') =>
@@ -356,12 +364,14 @@ fn session_target(m: &Value) -> Result<Option<SessionTarget>, ()> {
             Ok(None)
         }
         (Some(p), Some(s)) => {
-            let provider = p.as_str().filter(|p| provider_name_ok(p)).ok_or(())?;
+            let raw_provider = p.as_str().ok_or(())?;
+            let provider = normalize_provider(raw_provider).ok_or(())?;
             let session = s.as_str().filter(|s| session_name_ok(s)).ok_or(())?;
-            if m.get("role").and_then(Value::as_str)
-                != Some(legacy_session_guard(provider, session).as_str())
-                || m.get("to_role").is_some_and(|role| !role.is_string())
-            {
+            let guard_ok = m.get("role").and_then(Value::as_str).is_some_and(|r| {
+                r == legacy_session_guard(provider, session)
+                    || r == legacy_session_guard(raw_provider, session)
+            });
+            if !guard_ok || m.get("to_role").is_some_and(|role| !role.is_string()) {
                 return Err(());
             }
             Ok(Some(SessionTarget {
@@ -593,8 +603,16 @@ struct MailFlags {
     timeout: Option<u64>,
 }
 
-fn provider_name_ok(name: &str) -> bool {
-    matches!(name, "claude" | "codex" | "cursor" | "agy" | "gemini" | "zai" | "other")
+fn normalize_provider(name: &str) -> Option<&'static str> {
+    match name {
+        "claude" => Some("claude"),
+        "codex" => Some("codex"),
+        "cursor" => Some("cursor"),
+        "gemini" | "agy" => Some("gemini"),
+        "zai" => Some("zai"),
+        "other" => Some("other"),
+        _ => None,
+    }
 }
 
 fn parse_mail_flags(args: &[String]) -> Result<MailFlags, ()> {
@@ -618,10 +636,13 @@ fn parse_mail_flags(args: &[String]) -> Result<MailFlags, ()> {
                 let Some(name) = args.get(i) else {
                     return Err(());
                 };
-                if flags.provider.is_some() || !provider_name_ok(name) {
+                let Some(canon) = normalize_provider(name) else {
+                    return Err(());
+                };
+                if flags.provider.is_some() {
                     return Err(());
                 }
-                flags.provider = Some(name.clone());
+                flags.provider = Some(canon.to_string());
             }
             "--role" => {
                 i += 1;
@@ -723,7 +744,9 @@ fn seen_ids(d: &Path, provider: Option<&str>, session_file: &Path) -> HashSet<St
     }
     let filter = provider.unwrap_or("claude");
     for receipt in load_receipts(d) {
-        if provider_of(&receipt.reader) == filter {
+        let rp = provider_of(&receipt.reader);
+        let rp_canon = normalize_provider(rp).unwrap_or(rp);
+        if rp_canon == filter {
             seen.insert(receipt.id);
         }
     }
@@ -1214,7 +1237,11 @@ fn cmd_status(args: &[String]) -> i32 {
             };
             let matches = match &target {
                 Ok(None) => true,
-                Ok(Some(t)) => reader == reader_identity(&t.provider, &t.session, &legacy_host),
+                Ok(Some(t)) => {
+                    reader == reader_identity(&t.provider, &t.session, &legacy_host)
+                        || (t.provider == "gemini"
+                            && reader == reader_identity("agy", &t.session, &legacy_host))
+                }
                 Err(()) => false,
             };
             if matches {
@@ -1566,6 +1593,47 @@ fn uninstall_cursor() -> i32 {
     0
 }
 
+fn gemini_hooks_value() -> Value {
+    let mut command_hook = serde_json::Map::new();
+    command_hook.insert("type".to_string(), Value::String("command".to_string()));
+    command_hook.insert(
+        "command".to_string(),
+        Value::String(GEMINI_HOOK.trim_matches('"').to_string()),
+    );
+    command_hook.insert("timeout".to_string(), Value::from(10));
+    let mut fleet_ctx = serde_json::Map::new();
+    fleet_ctx.insert(
+        "SessionStart".to_string(),
+        Value::Array(vec![Value::Object(command_hook)]),
+    );
+    let mut root = serde_json::Map::new();
+    root.insert("fleet-context".to_string(), Value::Object(fleet_ctx));
+    Value::Object(root)
+}
+
+fn install_gemini() -> i32 {
+    let path = config_dir().join("snippets").join("gemini-hooks.json");
+    let value = gemini_hooks_value();
+    write_json_atomic(&path, &value);
+    println!("{GEMINI_INSTALL_NOTE}");
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&value).unwrap_or_default()
+    );
+    println!();
+    print!("{}", instruction_block());
+    0
+}
+
+fn uninstall_gemini() -> i32 {
+    let path = config_dir().join("snippets").join("gemini-hooks.json");
+    let _ = fs::remove_file(&path);
+    println!(
+        "agent-mail did not edit ~/.gemini. Remove any agent-mail / agy-session-start hook from ~/.gemini/config/hooks.json if no longer wanted."
+    );
+    0
+}
+
 fn parse_adapter_args(args: &[String]) -> Result<(Option<String>, Vec<String>), ()> {
     let mut name = None;
     let mut providers = Vec::new();
@@ -1578,8 +1646,11 @@ fn parse_adapter_args(args: &[String]) -> Result<(Option<String>, Vec<String>), 
                     return Err(());
                 };
                 match provider.as_str() {
-                    "all" => providers.extend(["claude", "codex", "cursor"].map(str::to_string)),
+                    "all" => {
+                        providers.extend(["claude", "codex", "cursor", "gemini"].map(str::to_string))
+                    }
                     "claude" | "codex" | "cursor" => providers.push(provider.clone()),
+                    "gemini" | "agy" => providers.push("gemini".to_string()),
                     _ => return Err(()),
                 }
             }
@@ -1616,6 +1687,7 @@ fn cmd_install(args: &[String]) -> i32 {
             "claude" => install_claude(),
             "codex" => install_codex(),
             "cursor" => install_cursor(),
+            "gemini" => install_gemini(),
             _ => 2,
         };
         if code != 0 {
@@ -1640,6 +1712,7 @@ fn cmd_uninstall(args: &[String]) -> i32 {
             "claude" => uninstall_claude(),
             "codex" => uninstall_codex(),
             "cursor" => uninstall_cursor(),
+            "gemini" => uninstall_gemini(),
             _ => 2,
         };
         if code != 0 {

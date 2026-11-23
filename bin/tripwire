@@ -57,7 +57,7 @@ DEFAULT_MUST_CONTAIN = [
     ["~/.cursor/hooks.json", "agentkit hook"],
 ]
 LAUNCHD_DIRS = ["~/Library/LaunchAgents", "/Library/LaunchAgents", "/Library/LaunchDaemons"]
-DEFAULT_SUMMON = ["glm-opinion", "--timeout", "900", "{brief}"]
+DEFAULT_SUMMON = ["tripwire-investigate", "{brief}"]
 
 HOLD_FILES = ["~/.ssh/authorized_keys"]
 NEVER_PAUSE = ["sshd", "launchd"]
