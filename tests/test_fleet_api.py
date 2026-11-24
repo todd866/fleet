@@ -135,6 +135,34 @@ class FleetAPITests(unittest.TestCase):
             with e:
                 return e.code, e.read()
 
+    def test_service_directory_joins_definitions_to_allowlisted_observations(self):
+        registry = self.mac_sync / "registry"
+        (registry / "hosts").mkdir(parents=True)
+        (registry / "jobs.tsv").write_text("a.job\thub\tMedia sync\tmedia\t2027-01-01\n"
+                                           "missing.job\thub\tNo sample\tmedia\t\n")
+        (registry / "descriptions.tsv").write_text("media\tapp\tactive\tOffline playback\n")
+        (registry / "hosts/hub.json").write_text(json.dumps({
+            "host": "hub", "at": "2026-11-24 11:07", "repos": {"private": "hidden"},
+            "jobs": {"a.job": {"loaded": True, "pid": "-", "status": "0", "when": "daily 02:00Z",
+                               "cmd": "private argument"},
+                     "extra.job": {"loaded": False}}
+        }))
+        (registry / "hosts/partial.json").write_text("{")
+        code, _ = self._req("/v1/services")
+        self.assertEqual(code, 401)
+        code, raw = self._req("/v1/services", token=self.token)
+        self.assertEqual(code, 200)
+        doc = json.loads(raw)
+        self.assertTrue(doc["catalogAvailable"])
+        self.assertEqual(doc["projects"], {"media": "Offline playback"})
+        self.assertEqual(doc["observations"], {"hub": "2026-11-24 11:07"})
+        jobs = {row["label"]: row for row in doc["services"]}
+        self.assertEqual(jobs["a.job"]["observed"]["hub"], {"state": "idle", "schedule": "daily 02:00Z"})
+        self.assertEqual(jobs["a.job"]["project"], "media")
+        self.assertEqual(jobs["missing.job"]["observed"], {})
+        self.assertEqual(jobs["extra.job"]["observed"]["hub"]["state"], "unloaded")
+        self.assertNotIn("private", str(raw))
+
     def test_auth_required_and_ota_silent_404(self) -> None:
         code, _ = self._req("/v1/overview")
         self.assertEqual(code, 401)

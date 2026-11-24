@@ -49,6 +49,28 @@ struct InboxView: View {
                     }
                 }
 
+                if model.pendingRelaysCount > 0 {
+                    Section {
+                        Button {
+                            model.selectedTab = .agents
+                        } label: {
+                            HStack {
+                                Label("\(model.pendingRelaysCount) Pending Agent Relays", systemImage: "arrow.left.arrow.right")
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(FleetTheme.warn)
+                                Spacer()
+                                Text("Review")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                                Image(systemName: "chevron.right")
+                                    .font(.caption2)
+                                    .foregroundStyle(.tertiary)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+
                 unreadSection
                 claimsSection
                 messagesSection
@@ -298,7 +320,7 @@ private struct ComposeMessageSheet: View {
                 }
 
                 Section("Message") {
-                    TextField("Instruction or note for your Macs…", text: $messageText, axis: .vertical)
+                    TextField("Instruction or note for your Macs", text: $messageText, axis: .vertical)
                         .lineLimit(3...8)
                 }
 
@@ -335,7 +357,6 @@ private struct ComposeMessageSheet: View {
                 }
             }
         }
-        .preferredColorScheme(.dark)
     }
 
     private func submit() async {

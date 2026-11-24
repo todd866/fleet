@@ -26,6 +26,8 @@ targets:
           - Info.plist
           - Fleet.entitlements
       - path: Shared
+      - path: ../docs/stack.md
+        buildPhase: resources
     dependencies:
       - target: FleetWidgets
     settings:
@@ -34,7 +36,7 @@ targets:
         INFOPLIST_FILE: App/Info.plist
         CODE_SIGN_ENTITLEMENTS: App/Fleet.entitlements
         MARKETING_VERSION: "1.0.0"
-        CURRENT_PROJECT_VERSION: "1"
+        CURRENT_PROJECT_VERSION: "4"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ENABLE_PREVIEWS: YES
         SWIFT_STRICT_CONCURRENCY: targeted
@@ -53,7 +55,7 @@ targets:
         INFOPLIST_FILE: Widget/Info.plist
         CODE_SIGN_ENTITLEMENTS: Widget/FleetWidgets.entitlements
         MARKETING_VERSION: "1.0.0"
-        CURRENT_PROJECT_VERSION: "1"
+        CURRENT_PROJECT_VERSION: "4"
         SKIP_INSTALL: YES
         LD_RUNPATH_SEARCH_PATHS:
           - $(inherited)
@@ -70,6 +72,16 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: $(FLEET_BUNDLE_ID).tests
         GENERATE_INFOPLIST_FILE: YES
+  FleetUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources: [UITests]
+    dependencies:
+      - target: Fleet
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(FLEET_BUNDLE_ID).uitests
+        GENERATE_INFOPLIST_FILE: YES
 schemes:
   Fleet:
     build:
@@ -77,10 +89,12 @@ schemes:
         Fleet: all
         FleetWidgets: all
         FleetTests: [test]
+        FleetUITests: [test]
     test:
       config: Debug
       targets:
         - FleetTests
+        - FleetUITests
     archive:
       config: Release
   FleetWidgets:

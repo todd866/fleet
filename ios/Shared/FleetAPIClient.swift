@@ -54,6 +54,10 @@ public actor FleetAPIClient {
         )
     }
 
+    func fetchServices() async throws -> ServiceDirectory {
+        try await request(path: "/v1/services")
+    }
+
     public func fetchHealth() async throws -> HealthResponse {
         try await request(path: "/v1/health")
     }

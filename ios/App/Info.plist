@@ -28,6 +28,7 @@
 			<key>CFBundleURLSchemes</key>
 			<array>
 				<string>fleet</string>
+				<string>agycontrol</string>
 			</array>
 		</dict>
 	</array>
@@ -37,10 +38,14 @@
 	<string>$(FLEET_APP_GROUP)</string>
 	<key>FleetDefaultServer</key>
 	<string>$(FLEET_DEFAULT_SERVER)</string>
+	<key>MCPrimaryServer</key>
+	<string>$(MC_PRIMARY_SERVER)</string>
+	<key>MCFallbackServer</key>
+	<string>$(MC_FALLBACK_SERVER)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>NSFaceIDUsageDescription</key>
-	<string>Confirm mutating Fleet controls such as morning refresh and provider pause toggles.</string>
+	<string>Confirm high-risk Fleet and AI Commander controls such as restarts, morning refresh, and provider pauses.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

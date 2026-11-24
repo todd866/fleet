@@ -174,7 +174,6 @@ struct RowActionSheet: View {
                 dispatchPrompt = suggestedFixPrompt(for: row)
             }
         }
-        .preferredColorScheme(.dark)
     }
 
     @ViewBuilder
@@ -260,7 +259,7 @@ struct RowActionSheet: View {
                 }
             }
 
-            TextField("Fix instructions…", text: $dispatchPrompt, axis: .vertical)
+            TextField("Fix instructions", text: $dispatchPrompt, axis: .vertical)
                 .lineLimit(3...6)
                 .font(.callout)
 
@@ -501,7 +500,7 @@ struct JobActionSheet: View {
                         .autocorrectionDisabled()
                         .font(.subheadline.monospaced())
 
-                    TextField("Fix instructions…", text: $dispatchPrompt, axis: .vertical)
+                    TextField("Fix instructions", text: $dispatchPrompt, axis: .vertical)
                         .lineLimit(3...6)
                         .font(.callout)
 
@@ -573,7 +572,6 @@ struct JobActionSheet: View {
                 }
             }
         }
-        .preferredColorScheme(.dark)
     }
 
     private func loadLogs() async {
@@ -717,7 +715,7 @@ struct PlacementActionSheet: View {
                         .autocorrectionDisabled()
                         .font(.subheadline.monospaced())
 
-                    TextField("Fix instructions…", text: $dispatchPrompt, axis: .vertical)
+                    TextField("Fix instructions", text: $dispatchPrompt, axis: .vertical)
                         .lineLimit(3...6)
                         .font(.callout)
 
@@ -766,7 +764,6 @@ struct PlacementActionSheet: View {
                 dispatchPrompt = "Resolve placement violation on \(violation.host.uppercased()) for dataset '\(violation.dataset)' (code: \(violation.code), detail: \(violation.detail ?? "—"))."
             }
         }
-        .preferredColorScheme(.dark)
     }
 
     private func runPlacementCheck(_ host: String) async {

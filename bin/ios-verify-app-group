@@ -1,0 +1,42 @@
+#!/usr/bin/env python3
+"""Verify the signed App Group used by an iOS host and its extensions."""
+import argparse
+from pathlib import Path
+import plistlib
+import subprocess
+import sys
+
+
+def verify(app, extensions, info_key):
+    host_group = None
+    for bundle in [app, *(app / "PlugIns" / name for name in extensions)]:
+        with (bundle / "Info.plist").open("rb") as stream:
+            info = plistlib.load(stream)
+        group = info.get(info_key)
+        if not isinstance(group, str) or not group.startswith("group.") or "$" in group:
+            raise ValueError(f"{bundle.name} is missing a resolved {info_key}")
+        if host_group is not None and group != host_group:
+            raise ValueError(f"{bundle.name} configures a different App Group from {app.name}")
+        host_group = group
+        subprocess.run(["codesign", "--verify", "--strict", bundle], check=True)
+        signed = subprocess.check_output(["codesign", "-d", "--entitlements", "-", "--xml", bundle])
+        groups = plistlib.loads(signed).get("com.apple.security.application-groups", []) if signed else []
+        if not isinstance(groups, list) or group not in groups:
+            raise ValueError(f"{bundle.name} signature lacks its configured App Group")
+        print(f"{bundle.name} build {info['CFBundleVersion']}: signature and configured App Group verified")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("app", type=Path)
+    parser.add_argument("--extension", action="append", required=True, metavar="NAME.appex")
+    parser.add_argument("--group-info-key", required=True, help="Info.plist key containing the runtime App Group")
+    args = parser.parse_args()
+    try:
+        verify(args.app, args.extension, args.group_info_key)
+    except (OSError, ValueError, KeyError, plistlib.InvalidFileException, subprocess.CalledProcessError) as exc:
+        sys.exit(f"App Group verification failed: {exc}")
+
+
+if __name__ == "__main__":
+    main()

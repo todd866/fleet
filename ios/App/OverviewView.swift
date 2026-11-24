@@ -35,7 +35,7 @@ struct OverviewView: View {
                         MissionCard {
                             HStack(spacing: 12) {
                                 ProgressView()
-                                Text(model.isRefreshing ? "Contacting tailnet hub…" : "Pull down to fetch Fleet telemetry.")
+                                Text(model.isRefreshing ? "Contacting tailnet hub" : "Pull down to fetch Fleet telemetry.")
                                     .foregroundStyle(.secondary)
                             }
                         }
@@ -46,7 +46,11 @@ struct OverviewView: View {
             }
             .background(FleetTheme.bg.ignoresSafeArea())
             .navigationTitle("Fleet")
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .principal) {
+                    FleetViewPicker(selection: $model.fleetSubtab)
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
                         Task { await model.refreshAll() }
@@ -57,7 +61,7 @@ struct OverviewView: View {
                             Image(systemName: "arrow.clockwise")
                         }
                     }
-                    .disabled(model.isRefreshing || !model.isConfigured)
+                    .disabled(model.isRefreshing || !model.isAnyConfigured)
                 }
             }
             .refreshable {
@@ -1056,7 +1060,6 @@ private struct MorningBriefSheet: View {
                 }
             }
         }
-        .preferredColorScheme(.dark)
     }
 
     private func dispatchBullet(_ bullet: BriefBullet) async {

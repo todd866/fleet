@@ -940,6 +940,60 @@ class FleetDataStore:
             "rows": rows,
         }
 
+    def build_services(self) -> dict[str, Any]:
+        registry = self.mac_sync / "registry"
+        jobs: dict[str, dict] = {}
+        observations: dict[str, str] = {}
+        catalog = registry / "jobs.tsv"
+
+        def service(label: str) -> dict:
+            return jobs.setdefault(label, {"label": label, "project": "", "purpose": "",
+                                           "expected": "", "review": "", "observed": {}})
+
+        try:
+            lines = catalog.read_text(encoding="utf-8").splitlines()
+            catalog_available = True
+        except (OSError, UnicodeError):
+            lines = []
+            catalog_available = False
+        for line in lines:
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            label, expected, purpose, project, review = (line.split("\t") + [""] * 4)[:5]
+            if label.strip():
+                service(label.strip()).update(project=project, purpose=purpose, expected=expected, review=review)
+
+        for path in sorted((registry / "hosts").glob("*.json")):
+            doc = _read_json(path, {})
+            if (not HOST_ID_RE.fullmatch(path.stem) or not isinstance(doc, dict)
+                    or doc.get("host") != path.stem or not isinstance(doc.get("jobs"), dict)):
+                continue
+            observations[path.stem] = str(doc.get("at") or "")
+            for label, record in doc["jobs"].items():
+                if not isinstance(record, dict):
+                    continue
+                if record.get("loaded") is False:
+                    state = "unloaded"
+                elif record.get("loaded") is not True:
+                    state = "unknown"
+                elif str(record.get("pid", "")).isdigit() and int(record["pid"]) > 0:
+                    state = "running"
+                elif record.get("status") in ("0", 0, "", "-"):
+                    state = "idle"
+                elif str(record.get("status", "")).lstrip("-").isdigit():
+                    state = f"exit {record['status']}"
+                else:
+                    state = "unknown"
+                service(label)["observed"][path.stem] = {"state": state, "schedule": str(record.get("when") or "")}
+        owners = {row["project"] for row in jobs.values() if row["project"]}
+        projects = {}
+        for line in _read_text(registry / "descriptions.tsv").splitlines():
+            fields = line.split("\t", 3)
+            if len(fields) == 4 and fields[0] in owners:
+                projects[fields[0]] = fields[3]
+        return {"catalogAvailable": catalog_available, "projects": projects, "observations": observations,
+                "services": [jobs[label] for label in sorted(jobs)]}
+
     def build_overview(self) -> dict[str, Any]:
         morning = self._morning_summary()
         hosts_doc = self.build_hosts()
@@ -1074,6 +1128,10 @@ class FleetDataStore:
         tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
         tmp.write_text("\n".join(out_lines) + ("\n" if out_lines else ""), encoding="utf-8")
         os.replace(tmp, path)
+        if not paused_val:
+            mark_path = self.home / ".local/state/ai-pick" / f"unavailable-{provider}.json"
+            if mark_path.exists():
+                mark_path.replace(mark_path.with_name(f"cleared-{provider}-{int(time.time())}.json"))
         self._audit("provider-pause", {"provider": provider, "paused": paused_val})
         return 200, {"ok": True, "provider": provider, "paused": paused_val, "list": self._paused_providers()}
 
@@ -1342,6 +1400,7 @@ class FleetAPIHandler(BaseHTTPRequestHandler):
             return
 
         routes: dict[str, Callable[[], dict[str, Any]]] = {
+            "/v1/services": self.srv.store.build_services,
             "/v1/overview": self.srv.store.build_overview,
             "/v1/hosts": self.srv.store.build_hosts,
             "/v1/morning": self.srv.store.build_morning,
@@ -1493,8 +1552,32 @@ def main(argv: list[str] | None = None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     srv = sub.add_parser("serve", help="Run the HTTP server")
     srv.add_argument("--config", type=Path, default=None)
+    services = sub.add_parser("services", help="Find projects, placement and last observed launchd state")
+    services.add_argument("query", nargs="?", default="")
+    services.add_argument("--json", action="store_true")
+    services.add_argument("--config", type=Path)
     args = ap.parse_args(argv)
     cfg = load_config(args.config)
+    if args.cmd == "services":
+        doc = FleetDataStore(cfg).build_services()
+        query = args.query.casefold()
+        doc["services"] = [row for row in doc["services"] if query in
+                           " ".join([row["label"], row["project"], row["purpose"], row["expected"],
+                                     *row["observed"]]).casefold()]
+        if args.json:
+            print(json.dumps(doc, ensure_ascii=False))
+        else:
+            if not doc["catalogAvailable"]:
+                print("Job definitions unavailable", file=sys.stderr)
+            for host, at in doc["observations"].items():
+                print(f"{host}: observed {at or 'at unknown time'} (host local)")
+            for row in doc["services"]:
+                seen = ", ".join(f"{host} {obs['state']}" for host, obs in row["observed"].items())
+                print(f"{row['label']}  [{row['project'] or 'unassigned'}]  "
+                      f"expected: {row['expected'] or 'unspecified'}  observed: {seen or 'none'}")
+                if row["purpose"]:
+                    print(f"  {row['purpose']}")
+        return 0 if doc["catalogAvailable"] or doc["observations"] else 1
     token = load_token(cfg)
     store = FleetDataStore(cfg)
     server = FleetHTTPServer((str(cfg["bind"]), int(cfg["port"])), store, token, cfg)

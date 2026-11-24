@@ -101,6 +101,12 @@ struct BoardView: View {
             .scrollContentBackground(.hidden)
             .background(FleetTheme.bg.ignoresSafeArea())
             .navigationTitle("Board")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .principal) {
+                    FleetViewPicker(selection: $model.fleetSubtab)
+                }
+            }
             .searchable(text: $searchText, prompt: "Search checks, hosts, or jobs")
             .refreshable {
                 await model.refreshAll()

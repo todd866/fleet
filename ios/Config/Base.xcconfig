@@ -4,5 +4,7 @@ FLEET_BUNDLE_ID = org.example.fleet
 FLEET_WIDGET_BUNDLE_ID = org.example.fleet.widgets
 FLEET_APP_GROUP = group.org.example.fleet
 FLEET_DEFAULT_SERVER = https:/$()/hub.example.ts.net:8444
+MC_PRIMARY_SERVER = https:/$()/hub.example.ts.net:8446
+MC_FALLBACK_SERVER =
 
 #include? "../../../../.config/fleet/ios-private.xcconfig"

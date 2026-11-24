@@ -43,6 +43,27 @@ struct CheckFleetStatusIntent: AppIntent {
     }
 }
 
+struct AskCommanderIntent: AppIntent {
+    static let title: LocalizedStringResource = "Ask Fleet Command"
+    static let description = IntentDescription("Send a question or directive to Fleet AI Commander across your connected Macs.")
+
+    @Parameter(title: "Directive")
+    var prompt: String
+
+    init() {}
+
+    init(prompt: String) {
+        self.prompt = prompt
+    }
+
+    func perform() async throws -> some IntentResult & ProvidesDialog {
+        let client = MissionControlAPIClient()
+        let res = try await client.sendCommanderMessage(text: prompt)
+        let reply = stripTrailingEllipsis(res.assistantMessage?.text ?? res.error ?? "Command dispatched.")
+        return .result(dialog: IntentDialog(stringLiteral: reply))
+    }
+}
+
 struct FleetShortcuts: AppShortcutsProvider {
     static var appShortcuts: [AppShortcut] {
         AppShortcut(
@@ -62,6 +83,15 @@ struct FleetShortcuts: AppShortcutsProvider {
             ],
             shortTitle: "Fleet Note",
             systemImageName: "mic.badge.plus"
+        )
+        AppShortcut(
+            intent: AskCommanderIntent(),
+            phrases: [
+                "Ask \(.applicationName) Command",
+                "Command \(.applicationName)"
+            ],
+            shortTitle: "Ask Command",
+            systemImageName: "sparkles"
         )
     }
 }

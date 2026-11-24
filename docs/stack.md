@@ -28,6 +28,18 @@ Each layer below says where it lives and how far it has got. "Here" means this r
 | Instruments | Menu-bar vitals, home energy, weather and aviation | [Glancebar](https://github.com/todd866/glancebar), [Energybar](https://github.com/todd866/energybar), [Isobar](https://github.com/todd866/isobar) | in daily use |
 | Joining a Mac | Open a new Mac, point Claude at this repository, wait: tools, guards, jobs, agent setup, then each data set restored from its master (home drives, IDrive, GitHub) | here: [fleet-join](../bin/fleet-join), [setup](setup.md) | join and drift check working (one recipe, run on every Mac); data restore and a proven IDrive restore not built yet |
 
+## Find a running service
+
+On a Mac, `fleet-api services SEARCH` matches a launchd label, project, host or purpose.
+Add `--json` for a structured response including the review date and schedule. On iPhone,
+open **Fleet → Fleet → Stack**, choose a project or search directly, then open a service.
+The authenticated `GET /v1/services` route and the local command read the same
+`registry/jobs.tsv` and `registry/hosts/*.json` under the configured mac-sync directory.
+Edit the former to correct ownership or intended placement. Each Mac writes its own observations.
+Snapshot dates use that host's local clock. An idle scheduled job was loaded when sampled.
+For current failures use the Fleet Board. For projects, tools and data outside launchd use
+the full generated `registry/REGISTRY.md` and the placement inventory.
+
 ## How the layers meet
 
 - **The morning check is the spine.** Every layer reports into it: free space and growth per

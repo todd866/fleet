@@ -1,7 +1,32 @@
+import LocalAuthentication
 import XCTest
 @testable import Fleet
 
 final class FleetTests: XCTestCase {
+    @MainActor
+    func testUnavailableOwnerAuthenticationStopsAction() async {
+        let model = FleetAppModel()
+        let context = LAContext()
+        context.invalidate()
+        do {
+            try await model.authenticateOwner(reason: "Confirm test action", context: context)
+            XCTFail("An invalid authentication context must stop the action")
+        } catch {
+            XCTAssertEqual((error as NSError).domain, LAError.errorDomain)
+        }
+    }
+
+    func testStackGuideUsesBundledArchitectureAndServicesSearchesByPurpose() throws {
+        let guide = try XCTUnwrap(Bundle.main.url(forResource: "stack", withExtension: "md"))
+        let layers = StackGuide.layers(try String(contentsOf: guide, encoding: .utf8))
+        XCTAssertTrue(layers.contains { $0.name == "Data placement" && $0.sources.contains("placement") })
+        let service = FleetService(label: "org.example.media-sync", project: "media", purpose: "Copy saved tracks",
+                                   expected: "hub", review: "", observed: [:])
+        XCTAssertTrue(service.matches("saved tracks"))
+        XCTAssertTrue(service.matches("HUB"))
+        XCTAssertFalse(service.matches("scheduled backup"))
+    }
+
     func testDecodeOverviewPayload() throws {
         let json = """
         {
@@ -399,6 +424,144 @@ final class FleetTests: XCTestCase {
 
         XCTAssertTrue(suggestedFixPrompt(for: snoozedRows[0]).contains("org.vendor.air.web-refresh"))
     }
+
+    func testMissionControlAndCommanderModels() throws {
+        let boardJSON = """
+        {
+          "generatedAt": 1795500000000,
+          "sortMode": "fixed",
+          "counts": {"total": 2, "attention": 1, "working": 1, "bg": 0, "unread": 0, "idle": 0, "hidden": 0, "pendingRelays": 1},
+          "hosts": [{"name": "studio", "isSelf": true, "online": true, "conversationCount": 2}],
+          "conversations": [
+            {
+              "id": "conv-1",
+              "shortId": "conv1",
+              "title": "API Refactor",
+              "host": "studio",
+              "projectId": "p1",
+              "projectName": "api-gateway",
+              "stepCount": 12,
+              "state": "attention",
+              "waitingReason": "Approve rollout",
+              "unread": false,
+              "stalled": false,
+              "ageMs": 45000,
+              "lastModifiedMs": 1795499955000,
+              "lastUserInputMs": 1795499900000,
+              "autoWake": true,
+              "focus": "Ready",
+              "lastReply": "Tests pass",
+              "briefing": {
+                "headline": "Approve key rollout",
+                "brief": "All 48 auth specs passed and rollout plan is ready.",
+                "currentWork": "",
+                "priorCompleted": "Finished verifier",
+                "needsUser": "Approve rollout",
+                "phase": "wait",
+                "health": "blocked",
+                "bullets": ["48 specs pass", "Zero errors"],
+                "nextActions": [{"label": "Approve rollout", "prompt": "Proceed with staged rollout"}]
+              },
+              "pinned": true,
+              "hidden": false,
+              "slot": 1
+            }
+          ],
+          "relays": [
+            {
+              "id": "rel-1",
+              "fromLabel": "ml-eval",
+              "targetConversationId": "conv-1",
+              "targetTitle": "API Refactor",
+              "targetHost": "studio",
+              "message": "Benchmark passed",
+              "hop": 1,
+              "status": "pending",
+              "reason": "Cross-agent check",
+              "createdAt": 1795499990000
+            }
+          ]
+        }
+        """.data(using: .utf8)!
+
+        let board = try JSONDecoder().decode(MCBoardResponse.self, from: boardJSON)
+        XCTAssertEqual(board.counts.pendingRelays, 1)
+        XCTAssertEqual(board.conversations.count, 1)
+        XCTAssertEqual(board.conversations[0].state, .attention)
+        XCTAssertEqual(board.conversations[0].briefing?.phase, "wait")
+        XCTAssertEqual(board.conversations[0].briefing?.bullets?.count, 2)
+        XCTAssertEqual(board.relays?.first?.fromLabel, "ml-eval")
+
+        let cmdJSON = """
+        {
+          "ok": true,
+          "state": {
+            "version": 1,
+            "preferences": {"routingMode": "auto", "directDispatch": false},
+            "digest": {
+              "status": "attention",
+              "headline": "1 approval waiting",
+              "items": ["API Refactor awaiting rollout sign-off"],
+              "starterPrompts": ["Triage waiting"],
+              "generatedAt": 1795500000000
+            },
+            "messages": [
+              {
+                "id": "msg-1",
+                "role": "assistant",
+                "text": "Ready to dispatch rollout.",
+                "createdAt": 1795500001000,
+                "modelTier": "Carbon",
+                "inspectedCount": 2,
+                "actions": [
+                  {
+                    "id": "a1",
+                    "kind": "send_to_agent",
+                    "label": "Send prompt",
+                    "summary": "Approve rollout",
+                    "explicitlyRequested": true,
+                    "risk": "high",
+                    "params": {"text": "Proceed now"},
+                    "status": "pending"
+                  }
+                ],
+                "followUps": ["Check relays"]
+              }
+            ]
+          }
+        }
+        """.data(using: .utf8)!
+
+        let cmd = try JSONDecoder().decode(CommanderStateResponse.self, from: cmdJSON)
+        XCTAssertEqual(cmd.state.preferences.routingMode, .auto)
+        XCTAssertEqual(cmd.state.digest?.status, "attention")
+        let act = try XCTUnwrap(cmd.state.messages.first?.actions?.first)
+        XCTAssertEqual(act.risk, .high)
+        XCTAssertTrue(act.isEditableKind)
+        XCTAssertEqual(act.defaultEditableText, "Proceed now")
+
+        XCTAssertEqual(stripTrailingEllipsis("Done checking..."), "Done checking")
+        XCTAssertEqual(stripTrailingEllipsis("Wait\u{2026}"), "Wait")
+
+        // Unified PairingLink variants
+        let fleetTok = String(repeating: "a1b2", count: 5)
+        let mcTok = String(repeating: "c3d4", count: 5)
+        let legacyLink = try PairingLink.parse("fleet://pair?url=https://hub.example.ts.net:8444&token=\(fleetTok)")
+        XCTAssertTrue(legacyLink.hasFleetCredentials)
+        XCTAssertFalse(legacyLink.hasMissionControlCredentials)
+
+        let unifiedLink = try PairingLink.parse("fleet://pair?url=https://hub.example.ts.net:8444&token=\(fleetTok)&mcUrl=https://pri.example.ts.net:8446&mcFallback=https://sec.example.ts.net:8446&mcToken=\(mcTok)")
+        XCTAssertTrue(unifiedLink.hasFleetCredentials)
+        XCTAssertTrue(unifiedLink.hasMissionControlCredentials)
+        XCTAssertEqual(unifiedLink.mcPrimaryURL, "https://pri.example.ts.net:8446")
+        XCTAssertEqual(unifiedLink.mcFallbackURL, "https://sec.example.ts.net:8446")
+        XCTAssertEqual(unifiedLink.mcToken, mcTok)
+
+        let mcOnly = try PairingLink.parse("agycontrol://pair?url=https://pri.example.ts.net:8446&fallback=https://sec.example.ts.net:8446&token=\(mcTok)")
+        XCTAssertFalse(mcOnly.hasFleetCredentials)
+        XCTAssertTrue(mcOnly.hasMissionControlCredentials)
+        XCTAssertEqual(mcOnly.mcFallbackURL, "https://sec.example.ts.net:8446")
+    }
 }
 
 private extension Optional where Wrapped == [DriveInfo] {
@@ -407,4 +570,85 @@ private extension Optional where Wrapped == [DriveInfo] {
 
 private extension Optional where Wrapped == [HostSample] {
     var orEmpty: [HostSample] { self ?? [] }
+}
+
+private final class MissionControlStub: URLProtocol, @unchecked Sendable {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var calls: [String: [String]] = [:]
+
+    static func takeCalls(for testID: String) -> [String] {
+        lock.withLock { calls.removeValue(forKey: testID) ?? [] }
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let url = request.url, let host = url.host else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badURL))
+            return
+        }
+        let parts = host.split(separator: ".")
+        let endpoint = String(parts[0])
+        let testID = String(parts[1])
+        Self.lock.withLock {
+            Self.calls[testID, default: []].append("\(request.httpMethod ?? "") \(endpoint) \(url.path)")
+        }
+
+        if endpoint == "offline" {
+            client?.urlProtocol(self, didFailWithError: URLError(.networkConnectionLost))
+            return
+        }
+        let status = endpoint == "gateway" ? 502 : 200
+        let body = endpoint == "malformed" ? "partial receipt" : #"{"ok":true,"host":"secondary"}"#
+        let response = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: nil)!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(body.utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
+extension FleetTests {
+    private func stubbedMissionControl(primary: String, testID: String) -> (MissionControlAPIClient, URLSession) {
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [MissionControlStub.self]
+        let session = URLSession(configuration: config)
+        let credentials = MissionControlCredentials(
+            primaryURL: "https://\(primary).\(testID).invalid",
+            fallbackURL: "https://secondary.\(testID).invalid",
+            token: "test"
+        )
+        let client = MissionControlAPIClient(fastSession: session, longSession: session, credentialsProvider: { credentials })
+        return (client, session)
+    }
+
+    func testMissionControlReadFallsBackAndWritesUseTheRespondingMac() async throws {
+        let testID = UUID().uuidString.lowercased()
+        let (client, session) = stubbedMissionControl(primary: "offline", testID: testID)
+        defer { session.invalidateAndCancel() }
+        let health = try await client.testConnection()
+        XCTAssertEqual(health.host, "secondary")
+        _ = try await client.sendMessage(conversationId: "chat", text: "continue")
+        XCTAssertEqual(MissionControlStub.takeCalls(for: testID), [
+            "GET offline /healthz", "GET secondary /healthz", "POST secondary /v1/threads/chat/message",
+        ])
+    }
+
+    func testMissionControlAmbiguousWritesAreNeverReplayed() async throws {
+        for primary in ["offline", "gateway", "malformed"] {
+            let testID = UUID().uuidString.lowercased()
+            let (client, session) = stubbedMissionControl(primary: primary, testID: testID)
+            defer { session.invalidateAndCancel() }
+            do {
+                _ = try await client.sendMessage(conversationId: "chat", text: "continue")
+                XCTFail("Expected an unconfirmed delivery for \(primary)")
+            } catch MissionControlAPIError.unknownOutcome {
+                // The server may have already delivered the action before this failure.
+            }
+            XCTAssertEqual(MissionControlStub.takeCalls(for: testID), ["POST \(primary) /v1/threads/chat/message"])
+        }
+    }
 }
