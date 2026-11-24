@@ -3129,6 +3129,20 @@ fn same_inode_as_ledger(path: &str, cfg: &GuardConfig) -> bool {
 /// in any argument is treated as a write. (`rg` is not here: `--pre` runs a program.)
 const LEDGER_READERS: &[&str] = &["cat", "head", "tail", "wc", "ls", "stat", "grep", "jq"];
 
+fn is_readonly_ledger_unit(u: &Unit) -> bool {
+    let prog = u.prog();
+    if LEDGER_READERS.contains(&prog) {
+        return true;
+    }
+    prog == "find"
+        && !u.argv.iter().any(|a| {
+            matches!(
+                a.as_str(),
+                "-delete" | "-exec" | "-execdir" | "-ok" | "-okdir" | "-fls" | "-fprint" | "-fprint0" | "-fprintf"
+            )
+        })
+}
+
 /// The paths a word may name: the word itself and the value of `--opt=VALUE` or `name=VALUE`
 /// (`of=` for dd). Short options with a glued value (`-oVALUE`) are judged by substring in
 /// `ledger_write_hit`, never by slicing.
@@ -3220,9 +3234,12 @@ fn ledger_write_hit(cmd: &str, cfg: &GuardConfig) -> bool {
             }
         }
     }
-    let is_writer = |prog: &str| !prog.is_empty() && !LEDGER_READERS.contains(&prog) && !matches!(prog, "cd" | "pushd" | "popd");
+    let is_writer = |u: &Unit| {
+        let prog = u.prog();
+        !prog.is_empty() && !is_readonly_ledger_unit(u) && !matches!(prog, "cd" | "pushd" | "popd")
+    };
     let any_redirect = units.iter().any(|u| !redirect_targets(&u.text).is_empty());
-    if known_risky && (any_redirect || units.iter().any(|u| is_writer(u.prog()))) {
+    if known_risky && (any_redirect || units.iter().any(is_writer)) {
         return true;
     }
     if runtime_cd {
@@ -3236,7 +3253,7 @@ fn ledger_write_hit(cmd: &str, cfg: &GuardConfig) -> bool {
             let prog = u.prog();
             let targets = redirect_targets(&u.text);
             targets.iter().any(|t| vague(t) || bare(t))
-                || (is_writer(prog) && u.argv.iter().skip(1).any(|w| vague(w)))
+                || (is_writer(u) && u.argv.iter().skip(1).any(|w| vague(w)))
                 || (CHANGERS.contains(&prog) && u.argv.iter().skip(1).any(|w| bare(w)))
         });
         if names_protected || hands_vague {
@@ -3308,7 +3325,7 @@ fn ledger_write_hit(cmd: &str, cfg: &GuardConfig) -> bool {
         if redirect_targets(&u.text).iter().any(|t| hit(t, &local, cwd_known)) {
             return true;
         }
-        if LEDGER_READERS.contains(&prog) {
+        if is_readonly_ledger_unit(&u) {
             continue;
         }
         if u.argv.iter().skip(1).any(|w| hit(w, &local, cwd_known)) {

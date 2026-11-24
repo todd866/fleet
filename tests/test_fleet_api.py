@@ -8,6 +8,7 @@ import os
 import plistlib
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -94,9 +95,20 @@ class FleetAPITests(unittest.TestCase):
             "evidence_dir": str(self.evidence),
             "ota_dir": str(self.ota),
             "audit_log": str(self.home / ".local/state/fleet-api/actions.jsonl"),
+            "mail_ack_file": str(self.home / ".local/state/fleet-api/mail-ack.json"),
+            "snooze_file": str(self.home / ".local/state/fleet-api/snoozed.json"),
+            "site_config": str(self.home / ".config/fleet/site.json"),
+            "remote_action_hosts": ["primary"],
+            "agent_mail_bin": "",
             "bundle_id": "org.example.fleet",
             "app_title": "Fleet",
         })
+        (self.home / ".config/fleet").mkdir(parents=True, exist_ok=True)
+        (self.home / ".config/fleet/site.json").write_text(json.dumps({
+            "hub": "hub",
+            "primary": "primary",
+            "job_label_prefixes": ["example"],
+        }))
         store = srv.FleetDataStore(self.cfg)
         self.server = srv.FleetHTTPServer(("127.0.0.1", 0), store, self.token, self.cfg)
         self.port = self.server.server_address[1]
@@ -166,6 +178,141 @@ class FleetAPITests(unittest.TestCase):
 
         code, _ = self._req("/v1/actions/provider-pause", method="POST", body={"provider": "gemini", "paused": True}, token=self.token)
         self.assertEqual(code, 400)
+
+    def test_mail_ack_single_and_all(self) -> None:
+        code, raw = self._req("/v1/mail", token=self.token)
+        self.assertEqual(code, 200)
+        mail_doc = json.loads(raw)
+        self.assertEqual(mail_doc["unread_total"], 1)
+        self.assertFalse(mail_doc["messages"][0]["read"])
+
+        # Add an inbox message matching the snapshot item ID + a future unread item
+        msg_1 = {"id": "1", "at": 1795472500, "from": "hub", "project": "fleet", "text": "older item"}
+        msg_2 = {"id": "2", "at": 1795472600, "from": "hub", "project": "fleet", "text": "newer item"}
+        inbox_path = self.home / ".local/state/agent-mail/inbox.jsonl"
+        inbox_path.write_text(json.dumps(msg_1) + "\n" + json.dumps(msg_2) + "\n")
+
+        # Single-ID ack marks id "1" read and clears host snapshot unread count
+        code, raw = self._req("/v1/actions/mail-ack", method="POST", body={"ids": ["1"]}, token=self.token)
+        self.assertEqual(code, 200)
+        ack1 = json.loads(raw)
+        self.assertTrue(ack1["ok"])
+        self.assertEqual(ack1["unread_total"], 0)
+
+        _, raw = self._req("/v1/mail", token=self.token)
+        mail_after_1 = json.loads(raw)
+        by_id = {m["id"]: m for m in mail_after_1["messages"]}
+        self.assertTrue(by_id["1"]["read"])
+        self.assertFalse(by_id["2"]["read"])
+
+        # Add a second unread entry in host snapshot and test ack-all
+        snap_path = self.mac_sync / "fleet-snapshots/primary.json"
+        snap = json.loads(snap_path.read_text())
+        snap["reading"]["mail"].append({"id": "2", "at": 1795472600, "read": False})
+        snap_path.write_text(json.dumps(snap))
+
+        code, raw = self._req("/v1/actions/mail-ack", method="POST", body={"all": True}, token=self.token)
+        self.assertEqual(code, 200)
+        ack_all = json.loads(raw)
+        self.assertTrue(ack_all["ok"])
+        self.assertEqual(ack_all["unread_total"], 0)
+
+        _, raw = self._req("/v1/overview", token=self.token)
+        self.assertEqual(json.loads(raw)["unread_mail"], 0)
+
+        # A brand-new message arriving later surfaces cleanly as unread
+        future_epoch = int(time.time()) + 3600
+        snap["reading"]["mail"].append({"id": "msg-future", "at": future_epoch, "read": False})
+        snap_path.write_text(json.dumps(snap))
+        _, raw = self._req("/v1/mail", token=self.token)
+        self.assertEqual(json.loads(raw)["unread_total"], 1)
+
+    def test_snooze_validation_and_action_guards(self) -> None:
+        # Snooze one failing morning row -> excluded from active fail count and marked snoozed_until
+        code, raw = self._req("/v1/actions/snooze", method="POST", body={"key": "job:hub:demo", "hours": 24, "note": "known"}, token=self.token)
+        self.assertEqual(code, 200)
+        snz = json.loads(raw)
+        self.assertTrue(snz["ok"])
+        self.assertTrue(snz["until"])
+
+        _, ov_raw = self._req("/v1/overview", token=self.token)
+        ov = json.loads(ov_raw)
+        self.assertEqual(ov["snoozed_count"], 1)
+        self.assertEqual(ov["action_hosts"], ["hub", "primary"])
+        self.assertEqual(ov["counts"]["fail"], 24)
+        self.assertEqual(ov["counts"]["pass"], 291)
+
+        _, mo_raw = self._req("/v1/morning", token=self.token)
+        mo = json.loads(mo_raw)
+        self.assertEqual(mo["snoozed_count"], 1)
+        by_key = {r["key"]: r for r in mo["rows"]}
+        self.assertIsNotNone(by_key["job:hub:demo"]["snoozed_until"])
+
+        # Unsnooze restores active fail count
+        code, _ = self._req("/v1/actions/snooze", method="POST", body={"key": "job:hub:demo", "clear": True}, token=self.token)
+        self.assertEqual(code, 200)
+        _, mo2_raw = self._req("/v1/morning", token=self.token)
+        self.assertEqual(json.loads(mo2_raw)["counts"]["fail"], 25)
+
+        # Disallowed hosts / unsafe labels / invalid actions are rejected
+        code, _ = self._req("/v1/job-log?host=laptop&label=com.example.ok", token=self.token)
+        self.assertEqual(code, 403)
+        code, _ = self._req("/v1/job-log?host=hub&label=com.apple.Finder", token=self.token)
+        self.assertEqual(code, 403)
+        code, _ = self._req("/v1/actions/job-kickstart", method="POST", body={"host": "laptop", "label": "com.example.ok"}, token=self.token)
+        self.assertEqual(code, 403)
+        code, _ = self._req("/v1/actions/job-kickstart", method="POST", body={"host": "hub", "label": "../bad"}, token=self.token)
+        self.assertEqual(code, 400)
+        code, _ = self._req("/v1/actions/host-action", method="POST", body={"host": "hub", "kind": "wipe-disk"}, token=self.token)
+        self.assertEqual(code, 400)
+        code, _ = self._req("/v1/actions/host-action", method="POST", body={"host": "laptop", "kind": "snapshot"}, token=self.token)
+        self.assertEqual(code, 403)
+        code, _ = self._req("/v1/actions/dispatch-fix", method="POST", body={"to": "bad target!", "prompt": "fix"}, token=self.token)
+        self.assertEqual(code, 400)
+
+        # Verify local plist missing returns clean 404 on allowed host/label
+        code, _ = self._req("/v1/job-log?host=hub&label=com.example.missing", token=self.token)
+        self.assertEqual(code, 404)
+
+        # Verify local job-log reads plist stderr path when present in self.home
+        agents = self.home / "Library/LaunchAgents"
+        agents.mkdir(parents=True, exist_ok=True)
+        log_file = self.home / ".local/state/sample.err.log"
+        log_file.write_text("line1\nValueError: sample failure\n")
+        (agents / "com.example.sample.plist").write_bytes(plistlib.dumps({
+            "Label": "com.example.sample",
+            "StandardErrorPath": str(log_file),
+        }))
+        code, raw = self._req("/v1/job-log?host=hub&label=com.example.sample&lines=20", token=self.token)
+        self.assertEqual(code, 200)
+        doc = json.loads(raw)
+        self.assertTrue(doc["ok"])
+        self.assertIn("ValueError: sample failure", doc["stderr"])
+
+    def test_log_message_includes_forwarded_ip_user_ua_and_redacts_token(self) -> None:
+        import io
+        from contextlib import redirect_stderr
+
+        buf = io.StringIO()
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/v1/health?t=supersecrettoken123",
+            headers={
+                "X-Forwarded-For": "203.0.113.42, 100.64.0.1",
+                "Tailscale-User-Login": "owner@example.com",
+                "User-Agent": 'ProbeBot/1.0 "evil"',
+            },
+        )
+        with redirect_stderr(buf):
+            try:
+                urllib.request.urlopen(req, timeout=5).close()
+            except urllib.error.HTTPError as exc:
+                exc.close()
+        logged = buf.getvalue()
+        self.assertIn("ip=203.0.113.42", logged)
+        self.assertIn("user=owner@example.com", logged)
+        self.assertIn('ua="ProbeBot/1.0 evil"', logged)
+        self.assertIn("?t=REDACTED", logged)
+        self.assertNotIn("supersecrettoken123", logged)
 
 
 if __name__ == "__main__":

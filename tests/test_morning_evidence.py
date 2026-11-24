@@ -12,7 +12,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from fleet.morning import probe
 from fleet.morning.cli import _deliver, main
-from fleet.morning.collect import _host_snapshot
+from fleet.morning.collect import _host_snapshot, _surface_probes, _surface_probes_local
+from fleet.morning.config import _merge, DEFAULTS
 from fleet.morning.evaluate import evaluate
 
 
@@ -113,6 +114,140 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(receipt['status'], 'wrong-host')
         self.assertIn('backup:hub:idrive', receipt['actionable_keys'])
         run.assert_not_called()
+
+    def test_surface_probes_ignores_observe_lines_and_flags_ip_bursts(self):
+        from datetime import datetime, timezone
+        iso_now = datetime.fromtimestamp(self.now - 120, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        iso_old = datetime.fromtimestamp(self.now - 36 * 3600, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        app_log = self.home / "logs/web.log"
+        api_log = self.home / "logs/api.log"
+        mcp_log = self.home / "logs/mcp.log"
+        app_log.parent.mkdir(parents=True, exist_ok=True)
+        # Observe lines (non-enforced) and old lines should not trigger bursts
+        app_log.write_text(
+            f"{iso_now} auth observe: would reject GET /api/draw from 192.0.2.99 ua=\"Browser\"\n"
+            f"{iso_old} auth enforce: rejected GET /secret from 198.51.100.2 ua=\"Scanner\" token=absent\n"
+            f"{iso_now} auth enforce: rejected GET /api/shows from 198.51.100.3 ua=\"Scanner\" token=wrong\n"
+        )
+        # Single-IP burst of 25 404s -> warn (>= ip_warn 20)
+        api_lines = [f'[{iso_now}] ip=198.51.100.55 "GET /bad/{i}?t=REDACTED HTTP/1.1" 404 - ua="dirsearch"\n' for i in range(25)]
+        api_lines.append(f'[{iso_now}] ip=127.0.0.1 "GET /v1/health HTTP/1.1" 401 - ua="curl/8.0"\n')
+        api_log.write_text("".join(api_lines))
+        # MCP log with >= 100 rejections from one IP -> fail (>= ip_fail 100)
+        mcp_log.write_text("".join(f"{iso_now} reject 404 GET /probe/{i} from=203.0.113.88 ua=\"zgrab\"\n" for i in range(105)))
+
+        cfg = _merge(DEFAULTS, {
+            "surface_probes": {
+                "logs": [
+                    {"name": "app", "path": "~/logs/web.log"},
+                    {"name": "api", "path": "~/logs/api.log"},
+                    {"name": "mcp", "path": "~/logs/mcp.log"},
+                ],
+                "window_h": 24, "ip_warn": 20, "ip_fail": 100, "total_warn": 50, "total_fail": 300,
+            },
+        })
+        local = _surface_probes_local(self.home, cfg, self.now)
+        merged = _surface_probes({"hub": {"surface_probes": local}}, self.home, cfg, self.now)
+        rows = {r.key: r for r in evaluate({"hosts": {}, "surface_probes": merged}, cfg, self.now)}
+
+        self.assertEqual(rows["sec:probes:app"].status, "pass")
+        self.assertEqual(rows["sec:probes:app"].value, "1 err (1 IP)")
+        self.assertEqual(rows["sec:probes:api"].status, "warn")
+        self.assertEqual(rows["sec:probes:api"].datum, "top 198.51.100.55 x25")
+        self.assertEqual(rows["sec:probes:mcp"].status, "fail")
+        self.assertEqual(rows["sec:probes:mcp"].datum, "top 203.0.113.88 x105")
+
+    def test_vpn_gateway_evaluation_pass_warn_fail_and_absent(self):
+        hosts = {
+            "green": {
+                "ok": True,
+                "vpn_gateway": {
+                    "pac_ok": True,
+                    "domains": 5,
+                    "vpn_ok": True,
+                    "vpn_ip": "86.104.22.87",
+                    "vpn_country": "Netherlands",
+                    "transmission_ok": True,
+                },
+            },
+            "txdown": {
+                "ok": True,
+                "vpn_gateway": {
+                    "pac_ok": True,
+                    "domains": 5,
+                    "vpn_ok": True,
+                    "vpn_ip": "86.104.22.87",
+                    "vpn_country": "Netherlands",
+                    "transmission_ok": False,
+                },
+            },
+            "vpndown": {
+                "ok": True,
+                "vpn_gateway": {
+                    "pac_ok": False,
+                    "domains": 0,
+                    "vpn_ok": False,
+                    "vpn_ip": "",
+                    "vpn_country": "",
+                    "transmission_ok": False,
+                },
+            },
+            "hub": {"ok": True},
+        }
+        rows = {r.key: r for r in evaluate({"hosts": hosts}, DEFAULTS, self.now)}
+        self.assertEqual(rows["sec:vpn:green"].status, "pass")
+        self.assertEqual(rows["sec:vpn:green"].value, "up (86.104.22.87)")
+        self.assertEqual(rows["sec:vpn:green"].datum, "5 domains")
+        self.assertEqual(rows["sec:vpn:txdown"].status, "warn")
+        self.assertEqual(rows["sec:vpn:txdown"].datum, "transmission down")
+        self.assertEqual(rows["sec:vpn:vpndown"].status, "fail")
+        self.assertEqual(rows["sec:vpn:vpndown"].datum, "pac,gluetun")
+        self.assertNotIn("sec:vpn:hub", rows)
+
+    def test_vpn_gateway_probe_reads_pac_domains_count_and_gluetun_and_transmission(self):
+        self.assertIsNone(probe._vpn_gateway())
+        domains_file = self.home / ".config/fleet/vpn-domains.txt"
+        domains_file.parent.mkdir(parents=True, exist_ok=True)
+        domains_file.write_text("thepiratebay.org\n")
+
+        class FakeResp:
+            def __init__(self, status, payload=b""):
+                self.status = status
+                self._payload = payload
+
+            def read(self):
+                return self._payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class FakeOpener:
+            def open(self, url, timeout=2):
+                if ":8899/health" in url:
+                    return FakeResp(200, json.dumps({
+                        "ok": True,
+                        "domains_count": 5,
+                        "domains": ["a", "b", "c", "d", "e"],
+                    }).encode())
+                if ":8890/v1/publicip/ip" in url:
+                    return FakeResp(200, json.dumps({"public_ip": "86.104.22.87", "country": "Netherlands"}).encode())
+                if ":9091/transmission/web/" in url:
+                    raise probe.urllib.error.HTTPError(url, 409, "Conflict", {}, None)
+                raise AssertionError(url)
+
+        with patch.object(probe.urllib.request, "build_opener", return_value=FakeOpener()):
+            got = probe._vpn_gateway()
+        self.assertEqual(got, {
+            "pac_ok": True,
+            "domains": 5,
+            "vpn_ok": True,
+            "vpn_ip": "86.104.22.87",
+            "vpn_country": "Netherlands",
+            "transmission_ok": True,
+        })
 
 if __name__ == '__main__':
     unittest.main()

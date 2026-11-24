@@ -42,6 +42,7 @@ def collect(config, *, here, now, state=None, run=None, home=None, gather=None, 
     merged["board"] = _board(home, run)
     merged["agentkit"] = _agentkit(run)
     merged["security_evidence"] = _security_evidence(merged.get("hosts") or {}, home, config)
+    merged["surface_probes"] = _surface_probes(merged.get("hosts") or {}, home, config, now)
     merged["upstream"] = _upstream(home)
     from fleet.ai_usage import read_summary
     merged["ai_usage"] = read_summary(home)
@@ -97,6 +98,9 @@ def collect_local(config, *, here, now, home, run=None, gather=None):
     sec = _security_evidence_local(home, config)
     if sec is not None:
         reading["security_evidence"] = sec
+    probes = _surface_probes_local(home, config, now)
+    if probes is not None:
+        reading["surface_probes"] = probes
     return {
         "version": 1,
         "host": here,
@@ -137,6 +141,137 @@ def _security_evidence(hosts, home, config):
             best = doc
             best_gen = gen
     return best
+
+
+_PROBE_TS = re.compile(r"^\[?(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)\]?")
+_HTTP_REJECT = re.compile(r'"(?:GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH)\s+[^"]*\s+HTTP/1\.[01]"\s+(401|403|404|405|429)\b')
+_FRED_REJECT = re.compile(r"\breject\s+(400|404|405|413)\b")
+_PROBE_IP = re.compile(r"(?:\bip=|\bfrom=|\bfrom\s+)([0-9a-fA-F.:]{3,45})")
+_PROBE_MAX_BYTES = 256 * 1024
+
+
+def _resolve_log_path(home, raw_path):
+    text = str(raw_path or "").strip()
+    if not text:
+        return None
+    if text.startswith("~/"):
+        return Path(home) / text[2:]
+    return Path(text).expanduser()
+
+
+def _tail_lines(path: Path) -> list[str]:
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as fh:
+            truncated = size > _PROBE_MAX_BYTES
+            if truncated:
+                fh.seek(-_PROBE_MAX_BYTES, os.SEEK_END)
+            raw = fh.read().decode("utf-8", errors="replace")
+    except OSError:
+        return []
+    lines = raw.splitlines()
+    return lines[1:] if truncated and lines else lines
+
+
+def _extract_probe_rejection(line: str) -> str | None:
+    m = _HTTP_REJECT.search(line)
+    if m:
+        return m.group(1)
+    m = _FRED_REJECT.search(line)
+    if m:
+        return m.group(1)
+    if "auth enforce: rejected" in line:
+        return "403" if ("=wrong" in line) else "401"
+    return None
+
+
+def _scan_surface_log(path: Path, since: int, until: int) -> dict:
+    by_status: dict[str, int] = {}
+    ip_counts: dict[str, int] = {}
+    total = 0
+    for line in _tail_lines(path):
+        ts_m = _PROBE_TS.match(line)
+        if not ts_m:
+            continue
+        ts = _epoch(ts_m.group(1))
+        if ts is None or ts < since or ts > until:
+            continue
+        code = _extract_probe_rejection(line)
+        if not code:
+            continue
+        total += 1
+        by_status[code] = by_status.get(code, 0) + 1
+        ip_m = _PROBE_IP.search(line)
+        if ip_m:
+            ip = ip_m.group(1).strip()
+            if ip and ip not in ("-", "127.0.0.1", "::1"):
+                ip_counts[ip] = ip_counts.get(ip, 0) + 1
+    top_ip, top_ip_count = (max(ip_counts.items(), key=lambda kv: (kv[1], kv[0])) if ip_counts else (None, 0))
+    return {
+        "present": True,
+        "total": total,
+        "by_status": by_status,
+        "unique_ips": len(ip_counts),
+        "top_ip": top_ip,
+        "top_ip_count": top_ip_count,
+    }
+
+
+def _surface_probes_local(home, config, now):
+    cfg = (config or {}).get("surface_probes") or {}
+    entries = cfg.get("logs") or []
+    if not entries:
+        return None
+    window_h = max(1, int(cfg.get("window_h", 24) or 24))
+    since = int(now) - window_h * 3600
+    until = int(now) + 300
+    surfaces = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name") or "").strip()
+        path = _resolve_log_path(home, entry.get("path"))
+        if not name or path is None:
+            continue
+        if not path.is_file():
+            surfaces.append({"name": name, "present": False, "total": 0, "by_status": {}, "unique_ips": 0, "top_ip": None, "top_ip_count": 0})
+            continue
+        row = _scan_surface_log(path, since, until)
+        row["name"] = name
+        surfaces.append(row)
+    return {"generated": int(now), "window_h": window_h, "surfaces": surfaces} if surfaces else None
+
+
+def _surface_probes(hosts, home, config, now):
+    candidates = []
+    local = _surface_probes_local(home, config, now)
+    if isinstance(local, dict):
+        candidates.append(local)
+    for host in (hosts or {}).values():
+        if isinstance(host, dict) and isinstance(host.get("surface_probes"), dict):
+            candidates.append(host["surface_probes"])
+    if not candidates:
+        return None
+    by_name: dict[str, tuple[tuple[int, int], dict]] = {}
+    max_gen = 0
+    window_h = 24
+    for doc in candidates:
+        try:
+            gen = int(doc.get("generated") or 0)
+        except (TypeError, ValueError):
+            gen = 0
+        max_gen = max(max_gen, gen)
+        window_h = int(doc.get("window_h") or window_h)
+        for s in doc.get("surfaces") or []:
+            if not isinstance(s, dict) or not s.get("name"):
+                continue
+            rank = (1 if s.get("present") else 0, gen)
+            prev = by_name.get(s["name"])
+            if prev is None or rank >= prev[0]:
+                by_name[s["name"]] = (rank, s)
+    if not by_name:
+        return None
+    return {"generated": max_gen, "window_h": window_h, "surfaces": [by_name[k][1] for k in sorted(by_name)]}
 
 
 def _default_gather():
@@ -272,7 +407,7 @@ def _host_snapshot(name, raw, registry_host, config, health, now, registered=Non
             idrive = int(latest["observed_mtime"])
     if "idrive" in raw or name in (backups.get("idrive_hosts") or []) or idrive is not None or _has_kind(health_host, "idrive"):
         row["idrive"] = raw.get("idrive") if "idrive" in raw else (None if idrive is None else {"last_epoch": idrive})
-    for key in ("idrive_ingest", "home_mirror", "offload_queue", "free_space_guard", "mac_setup", "placement", "unclaimed", "cloud", "diskmap_access", "gdrive_backup"):
+    for key in ("idrive_ingest", "home_mirror", "offload_queue", "free_space_guard", "mac_setup", "placement", "unclaimed", "cloud", "diskmap_access", "gdrive_backup", "vpn_gateway"):
         if isinstance(raw.get(key), dict) and raw[key]:
             row[key] = raw[key]
     if isinstance(raw.get("placement_datasets"), list) and raw["placement_datasets"]:

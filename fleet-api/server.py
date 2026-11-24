@@ -28,6 +28,14 @@ API_VERSION = 1
 MAX_BODY_BYTES = 16 * 1024
 MAX_TEXT_LEN = 2000
 MAIL_TARGET_RE = re.compile(r"^[a-z0-9_-]+(:[a-z0-9_.-]+){0,2}$")
+HOST_ID_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
+JOB_LABEL_RE = re.compile(r"^[A-Za-z0-9._-]{3,128}$")
+HOST_ACTION_SUFFIXES = {
+    "free-space-guard": "free-space-guard",
+    "snapshot": "fleet-snapshot",
+    "idrive-tick": "idrive-ingest",
+    "placement-check": "placement-status,storage-health,fleet-snapshot",
+}
 ALLOWED_PAUSE_PROVIDERS = frozenset({"claude", "codex", "zai", "cursor"})
 _BAD_EXIT_VALUES = {None, "", "-", "0", 0}
 _TERM_EXIT_VALUES = {"-15", "143"}
@@ -46,6 +54,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "evidence_dir": "~/.local/state/fleet/evidence",
     "agent_mail_bin": "~/.local/bin/agent-mail",
     "fleet_bin": "",
+    "mail_ack_file": "~/.local/state/fleet-api/mail-ack.json",
+    "snooze_file": "~/.local/state/fleet-api/snoozed.json",
+    "site_config": "~/.config/fleet/site.json",
+    "remote_action_hosts": [],
     "read_rate_limit_per_min": 60,
     "write_rate_limit_per_min": 20,
 }
@@ -146,6 +158,147 @@ def verify_token(supplied: str, expected: str) -> bool:
     return hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8"))
 
 
+def _parse_mail_epoch(raw: Any) -> float | None:
+    if isinstance(raw, bool) or raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        val = float(raw)
+        return val if val > 1_000_000_000 else None
+    text = str(raw).strip()
+    if not text:
+        return None
+    try:
+        val = float(text)
+        return val if val > 1_000_000_000 else None
+    except ValueError:
+        pass
+    try:
+        iso = text[:-1] + "+00:00" if text.endswith("Z") else text
+        parsed = dt.datetime.fromisoformat(iso)
+        return parsed.timestamp()
+    except ValueError:
+        pass
+    try:
+        return dt.datetime.strptime(text, "%Y-%m-%d %H:%M:%S").timestamp()
+    except ValueError:
+        return None
+
+
+_REMOTE_JOB_SCRIPT = r"""
+import json, os, plistlib, re, subprocess, sys, time
+from pathlib import Path
+
+mode = sys.argv[1]
+arg = sys.argv[2]
+extra = sys.argv[3] if len(sys.argv) > 3 else ""
+home = Path.home()
+agents = home / "Library/LaunchAgents"
+uid = os.getuid()
+
+def parse_launchctl(label):
+    res = subprocess.run(["launchctl", "print", f"gui/{uid}/{label}"], capture_output=True, text=True, timeout=6)
+    text = (res.stdout or "") + "\n" + (res.stderr or "")
+    state = None
+    last_exit = None
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("state = "):
+            state = s.split("=", 1)[1].strip()
+        elif s.startswith("last exit code = "):
+            raw = s.split("=", 1)[1].strip()
+            try:
+                last_exit = int(raw)
+            except ValueError:
+                last_exit = raw
+    return res.returncode, state, last_exit, text.strip()
+
+def read_tail(raw_path, lines):
+    if not raw_path:
+        return None, ""
+    p = Path(os.path.expanduser(str(raw_path))).resolve()
+    allowed_roots = (home.resolve(), Path("/tmp").resolve(), Path("/private/tmp").resolve(), Path("/var/log").resolve(), Path("/Library/Logs").resolve())
+    if not any(p == r or str(p).startswith(str(r) + "/") for r in allowed_roots):
+        return str(p), "[log path outside allowed roots]"
+    if not p.is_file():
+        return str(p), ""
+    try:
+        size = p.stat().st_size
+        with p.open("rb") as fh:
+            if size > 65536:
+                fh.seek(-65536, os.SEEK_END)
+            data = fh.read().decode("utf-8", errors="replace")
+        tail = "\n".join(data.splitlines()[-lines:])
+        if len(tail) > 12288:
+            tail = tail[-12288:]
+        return str(p), tail
+    except OSError as e:
+        return str(p), f"[unreadable: {e}]"
+
+if mode == "job-log":
+    lines = max(10, min(100, int(extra or "60")))
+    plist_path = agents / f"{arg}.plist"
+    if not plist_path.is_file():
+        print(json.dumps({"ok": False, "code": 404, "error": f"plist missing: {plist_path.name}"}))
+        sys.exit(0)
+    pl = plistlib.loads(plist_path.read_bytes())
+    err_path, err_txt = read_tail(pl.get("StandardErrorPath"), lines)
+    out_raw = pl.get("StandardOutPath")
+    if out_raw and os.path.expanduser(str(out_raw)) == os.path.expanduser(str(pl.get("StandardErrorPath") or "")):
+        out_path, out_txt = err_path, ""
+    else:
+        out_path, out_txt = read_tail(out_raw, lines)
+    rc, state, last_exit, _ = parse_launchctl(arg)
+    print(json.dumps({
+        "ok": True,
+        "label": arg,
+        "stderr_path": err_path,
+        "stdout_path": out_path,
+        "stderr": err_txt,
+        "stdout": out_txt,
+        "state": state or ("unloaded" if rc != 0 else "unknown"),
+        "last_exit": last_exit,
+    }))
+elif mode in ("job-kickstart", "host-action"):
+    if mode == "host-action":
+        suffixes = [s for s in arg.split(",") if s]
+        matches = []
+        for sfx in suffixes:
+            found = sorted(agents.glob(f"*.{sfx}.plist"))
+            if found:
+                matches = found
+                break
+        if not matches:
+            print(json.dumps({"ok": False, "code": 404, "error": f"no plist matching .{arg}.plist on host"}))
+            sys.exit(0)
+        plist_path = matches[0]
+        label = plist_path.stem
+    else:
+        label = arg
+        plist_path = agents / f"{label}.plist"
+        if not plist_path.is_file():
+            print(json.dumps({"ok": False, "code": 404, "error": f"plist missing: {plist_path.name}"}))
+            sys.exit(0)
+    k = subprocess.run(["launchctl", "kickstart", "-k", f"gui/{uid}/{label}"], capture_output=True, text=True, timeout=10)
+    time.sleep(0.8)
+    _, state, last_exit, _ = parse_launchctl(label)
+    if mode == "job-kickstart":
+        for snap_p in sorted(agents.glob("*.fleet-snapshot.plist"))[:1]:
+            if snap_p.stem != label:
+                subprocess.Popen(["launchctl", "kickstart", f"gui/{uid}/{snap_p.stem}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if k.returncode != 0:
+        err = (k.stderr or k.stdout or f"kickstart exit {k.returncode}").strip()[:200]
+        print(json.dumps({"ok": False, "code": 409, "label": label, "error": err, "state": state, "last_exit": last_exit}))
+    else:
+        print(json.dumps({
+            "ok": True,
+            "label": label,
+            "state": state or "running",
+            "last_exit": last_exit,
+            "detail": f"Kickstarted {label} ({state or 'running'})",
+        }))
+"""
+
+
 class FleetDataStore:
     """Reads synced Fleet state files directly from disk without spawning subprocesses."""
 
@@ -156,9 +309,226 @@ class FleetDataStore:
         self.evidence_dir = _expand(cfg["evidence_dir"])
         self.ota_dir = _expand(cfg["ota_dir"])
         self.audit_log = _expand(cfg["audit_log"])
+        self.mail_ack_file = _expand(cfg.get("mail_ack_file") or "~/.local/state/fleet-api/mail-ack.json")
+        self.snooze_file = _expand(cfg.get("snooze_file") or "~/.local/state/fleet-api/snoozed.json")
+        self.site_config_path = _expand(cfg.get("site_config") or "~/.config/fleet/site.json")
         self.started_at = time.monotonic()
         self._refresh_lock = threading.Lock()
         self._refresh_running = False
+        self._mail_ack_lock = threading.Lock()
+        self._snooze_lock = threading.Lock()
+
+    def _site_meta(self) -> dict[str, Any]:
+        doc = _read_json(self.site_config_path, {})
+        return doc if isinstance(doc, dict) else {}
+
+    def _hub_id(self) -> str:
+        raw = str(self._site_meta().get("hub") or socket.gethostname().split(".")[0]).strip().lower()
+        return raw if HOST_ID_RE.match(raw) else "hub"
+
+    def _action_hosts(self) -> list[str]:
+        out: list[str] = []
+        hub = self._hub_id()
+        if HOST_ID_RE.match(hub):
+            out.append(hub)
+        raw_remote = self.cfg.get("remote_action_hosts") or []
+        if isinstance(raw_remote, list):
+            for item in raw_remote:
+                hid = str(item or "").strip().lower()
+                if HOST_ID_RE.match(hid) and hid not in out:
+                    out.append(hid)
+        return out
+
+    def _is_allowed_job_label(self, label: str) -> bool:
+        if not JOB_LABEL_RE.match(label) or ".." in label or "/" in label:
+            return False
+        prefixes = {
+            str(p).strip().lower()
+            for p in (self._site_meta().get("job_label_prefixes") or [])
+            if isinstance(p, str) and p.strip()
+        }
+        parts = label.lower().split(".")
+        if len(parts) < 2:
+            return False
+        if not prefixes:
+            return len(parts) >= 3
+        return parts[0] in prefixes or parts[1] in prefixes
+
+    def _load_snoozes(self) -> dict[str, dict[str, Any]]:
+        doc = _read_json(self.snooze_file, {})
+        if not isinstance(doc, dict):
+            return {}
+        raw_items = doc.get("items")
+        if not isinstance(raw_items, dict):
+            return {}
+        now = time.time()
+        clean: dict[str, dict[str, Any]] = {}
+        for k, v in raw_items.items():
+            if not isinstance(k, str) or not isinstance(v, dict):
+                continue
+            try:
+                until_epoch = float(v.get("until_epoch") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if until_epoch > now:
+                clean[k] = {
+                    "until_epoch": until_epoch,
+                    "until": str(v.get("until") or _utc_iso(until_epoch)),
+                    "note": str(v.get("note") or ""),
+                }
+        return clean
+
+    def _save_snoozes(self, items: dict[str, dict[str, Any]]) -> None:
+        self.snooze_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.snooze_file.with_name(f".{self.snooze_file.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps({"items": items}, separators=(",", ":")), encoding="utf-8")
+        os.replace(tmp, self.snooze_file)
+
+    def _annotate_rows(
+        self,
+        raw_rows: list[Any],
+        base_counts: dict[str, Any] | None,
+    ) -> tuple[list[dict[str, Any]], dict[str, int], dict[str, str]]:
+        snoozes = self._load_snoozes()
+        rows_out: list[dict[str, Any]] = []
+        raw_counts = {"pass": 0, "warn": 0, "fail": 0}
+        snoozed_delta = {"warn": 0, "fail": 0}
+        active_snoozed: dict[str, str] = {}
+        for item in raw_rows:
+            if not isinstance(item, dict):
+                continue
+            row = dict(item)
+            key = str(row.get("key") or "")
+            st = str(row.get("status") or "").lower()
+            if st in ("pass", "ok", "healthy"):
+                raw_counts["pass"] += 1
+            elif st in ("warn", "warning", "stale"):
+                raw_counts["warn"] += 1
+            elif st in ("fail", "error", "crit", "critical"):
+                raw_counts["fail"] += 1
+            snz = snoozes.get(key)
+            if snz:
+                row["snoozed_until"] = snz["until"]
+                active_snoozed[key] = snz["until"]
+                if st in ("warn", "warning", "stale"):
+                    snoozed_delta["warn"] += 1
+                elif st in ("fail", "error", "crit", "critical"):
+                    snoozed_delta["fail"] += 1
+            else:
+                row["snoozed_until"] = None
+            rows_out.append(row)
+
+        if isinstance(base_counts, dict):
+            counts = {
+                "pass": int(base_counts.get("pass") or 0),
+                "warn": max(0, int(base_counts.get("warn") or 0) - snoozed_delta["warn"]),
+                "fail": max(0, int(base_counts.get("fail") or 0) - snoozed_delta["fail"]),
+            }
+        else:
+            counts = {
+                "pass": raw_counts["pass"],
+                "warn": max(0, raw_counts["warn"] - snoozed_delta["warn"]),
+                "fail": max(0, raw_counts["fail"] - snoozed_delta["fail"]),
+            }
+        return rows_out, counts, active_snoozed
+
+    def _run_host_job_script(self, host: str, mode: str, arg: str, extra: str = "") -> tuple[int, dict[str, Any]]:
+        if host not in self._action_hosts():
+            return 403, {"ok": False, "error": f"actions not permitted on host {host!r}"}
+        hub = self._hub_id()
+        try:
+            if host == hub:
+                env = dict(os.environ)
+                env["HOME"] = str(self.home)
+                res = subprocess.run(
+                    [sys.executable, "-c", _REMOTE_JOB_SCRIPT, mode, arg, extra],
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    timeout=20,
+                )
+            else:
+                res = subprocess.run(
+                    ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6", host, "python3", "-", mode, arg, extra],
+                    input=_REMOTE_JOB_SCRIPT,
+                    capture_output=True,
+                    text=True,
+                    timeout=22,
+                )
+        except subprocess.TimeoutExpired:
+            return 504, {"ok": False, "error": f"timed out contacting host {host}"}
+        if res.returncode != 0 and not res.stdout.strip():
+            err = (res.stderr or f"exit {res.returncode}").strip()[:200]
+            return 502, {"ok": False, "error": err}
+        try:
+            doc = json.loads(res.stdout.strip())
+        except ValueError:
+            return 502, {"ok": False, "error": f"invalid response from {host}: {res.stdout[:120]}"}
+        if not isinstance(doc, dict):
+            return 502, {"ok": False, "error": "unexpected host response"}
+        code = int(doc.pop("code", 200 if doc.get("ok") else 400))
+        doc["host"] = host
+        return code, doc
+
+    def _send_agent_mail(self, to: str, text: str) -> tuple[bool, str, int]:
+        raw_tool = str(self.cfg.get("agent_mail_bin") or "").strip()
+        if not raw_tool:
+            return False, "agent-mail not configured", 500
+        tool = _expand(raw_tool)
+        if not tool.is_file() and raw_tool == DEFAULT_CONFIG["agent_mail_bin"]:
+            found = shutil.which("agent-mail")
+            if found:
+                tool = Path(found)
+        if not tool.is_file():
+            return False, "agent-mail not installed", 500
+        res = subprocess.run([str(tool), "send", to, text], capture_output=True, text=True, timeout=15)
+        if res.returncode != 0:
+            return False, (res.stderr.strip()[:200] or f"agent-mail exit {res.returncode}"), 502
+        return True, res.stdout.strip(), 200
+
+    def _load_mail_ack(self) -> dict[str, Any]:
+        doc = _read_json(self.mail_ack_file, {})
+        if not isinstance(doc, dict):
+            doc = {}
+        raw_ids = doc.get("acked_ids")
+        acked_ids = [str(x) for x in raw_ids if isinstance(x, str) and x] if isinstance(raw_ids, list) else []
+        try:
+            acked_epoch = float(doc.get("acked_epoch") or 0.0)
+        except (TypeError, ValueError):
+            acked_epoch = 0.0
+        return {
+            "acked_epoch": acked_epoch,
+            "acked_at": doc.get("acked_at") if isinstance(doc.get("acked_at"), str) else None,
+            "acked_ids": acked_ids[-2000:],
+        }
+
+    def _save_mail_ack(self, ack: dict[str, Any]) -> None:
+        self.mail_ack_file.parent.mkdir(parents=True, exist_ok=True)
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for mid in ack.get("acked_ids") or []:
+            if mid and mid not in seen:
+                seen.add(mid)
+                deduped.append(mid)
+        out = {
+            "acked_epoch": float(ack.get("acked_epoch") or 0.0),
+            "acked_at": ack.get("acked_at"),
+            "acked_ids": deduped[-2000:],
+        }
+        tmp = self.mail_ack_file.with_name(f".{self.mail_ack_file.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(out, separators=(",", ":")), encoding="utf-8")
+        os.replace(tmp, self.mail_ack_file)
+
+    @staticmethod
+    def _is_msg_acked(msg_id: Any, raw_at: Any, ack: dict[str, Any], ack_ids_set: set[str]) -> bool:
+        if isinstance(msg_id, str) and msg_id in ack_ids_set:
+            return True
+        acked_epoch = float(ack.get("acked_epoch") or 0.0)
+        if acked_epoch > 0.0:
+            ep = _parse_mail_epoch(raw_at)
+            if ep is not None and ep <= acked_epoch:
+                return True
+        return False
 
     def _morning_summary(self) -> dict[str, Any]:
         for cand in (
@@ -500,13 +870,34 @@ class FleetDataStore:
         }
 
     def build_mail(self) -> dict[str, Any]:
-        inbox = _read_jsonl(self.home / ".local/state/agent-mail/inbox.jsonl", limit=60)
-        inbox.reverse()
+        raw_inbox = _read_jsonl(self.home / ".local/state/agent-mail/inbox.jsonl", limit=60)
+        raw_inbox.reverse()
+        ack = self._load_mail_ack()
+        ack_ids_set = set(ack["acked_ids"])
+
+        inbox: list[dict[str, Any]] = []
+        for entry in raw_inbox:
+            msg = dict(entry)
+            msg["read"] = bool(msg.get("read")) or self._is_msg_acked(msg.get("id"), msg.get("at"), ack, ack_ids_set)
+            inbox.append(msg)
+
         snaps = self._host_snapshots()
         unread_by_host: dict[str, int] = {}
         for hid, doc in snaps.items():
             mail_list = (doc.get("reading") or {}).get("mail") or []
-            unread_by_host[hid] = sum(1 for m in mail_list if isinstance(m, dict) and not m.get("read"))
+            unread_by_host[hid] = sum(
+                1
+                for m in mail_list
+                if isinstance(m, dict)
+                and not m.get("read")
+                and not self._is_msg_acked(m.get("id"), m.get("at"), ack, ack_ids_set)
+            )
+
+        unread_total = (
+            sum(unread_by_host.values())
+            if unread_by_host
+            else sum(1 for m in inbox if not m.get("read"))
+        )
 
         board = _read_json(self.home / ".local/state/cowork/board.json") or {}
         claims_out = []
@@ -525,20 +916,28 @@ class FleetDataStore:
         return {
             "messages": inbox[:40],
             "unread_by_host": unread_by_host,
+            "unread_total": unread_total,
+            "acked_at": ack.get("acked_at"),
             "claims": claims_out,
         }
 
     def build_morning(self) -> dict[str, Any]:
         summary = self._morning_summary()
+        rows, counts, snoozed_keys = self._annotate_rows(
+            summary.get("rows") or [],
+            summary.get("counts"),
+        )
         return {
             "version": summary.get("version", 1),
             "generated": summary.get("generated"),
             "date": summary.get("date"),
-            "ok": bool(summary.get("ok", False)),
-            "counts": summary.get("counts") or {"pass": 0, "warn": 0, "fail": 0},
+            "ok": counts["fail"] == 0,
+            "counts": counts,
             "cadence": summary.get("cadence") or {},
             "agy_morning": self._agy_morning_text(),
-            "rows": summary.get("rows") or [],
+            "snoozed_count": len(snoozed_keys),
+            "snoozed_keys": snoozed_keys,
+            "rows": rows,
         }
 
     def build_overview(self) -> dict[str, Any]:
@@ -548,13 +947,21 @@ class FleetDataStore:
         backups = self.build_backups()
         sec = self.build_security()
         mail = self.build_mail()
-        total_unread = sum(mail["unread_by_host"].values()) if mail["unread_by_host"] else len(mail["messages"])
+        total_unread = int(mail.get("unread_total") or 0)
+        _, counts, snoozed_keys = self._annotate_rows(
+            morning.get("rows") or [],
+            morning.get("counts"),
+        )
+        sec_rows, _, _ = self._annotate_rows(sec.get("rows") or [], None)
         return {
             "generated_at": morning.get("generated") or int(time.time()),
             "date": morning.get("date") or _utc_iso()[:10],
-            "counts": morning.get("counts") or {"pass": 0, "warn": 0, "fail": 0},
+            "counts": counts,
             "cadence": morning.get("cadence") or {},
             "agy_morning": self._agy_morning_text(),
+            "action_hosts": self._action_hosts(),
+            "snoozed_count": len(snoozed_keys),
+            "snoozed_keys": snoozed_keys,
             "hosts": hosts_doc["hosts"],
             "capacity": capacity,
             "backups": {
@@ -572,7 +979,7 @@ class FleetDataStore:
                 "value": sec["value"],
                 "detail": sec["detail"],
                 "generated": sec["generated"],
-                "rows": sec["rows"],
+                "rows": sec_rows,
             },
             "unread_mail": total_unread,
             "active_claims": len(mail["claims"]),
@@ -670,6 +1077,166 @@ class FleetDataStore:
         self._audit("provider-pause", {"provider": provider, "paused": paused_val})
         return 200, {"ok": True, "provider": provider, "paused": paused_val, "list": self._paused_providers()}
 
+    def action_mail_ack(self, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        raw_ids = payload.get("ids")
+        if raw_ids is not None:
+            if not isinstance(raw_ids, list) or not raw_ids or len(raw_ids) > 500:
+                return 400, {"ok": False, "error": "ids must be a non-empty list (max 500)"}
+            clean_ids: list[str] = []
+            for item in raw_ids:
+                if not isinstance(item, str) or not item.strip() or len(item.strip()) > 128:
+                    return 400, {"ok": False, "error": "each id must be a non-empty string (<=128 chars)"}
+                clean_ids.append(item.strip())
+            with self._mail_ack_lock:
+                ack = self._load_mail_ack()
+                ack["acked_ids"].extend(clean_ids)
+                self._save_mail_ack(ack)
+            mail = self.build_mail()
+            self._audit("mail-ack", {"mode": "ids", "count": len(clean_ids)})
+            return 200, {
+                "ok": True,
+                "acked_ids_count": len(clean_ids),
+                "acked_at": ack.get("acked_at"),
+                "unread_total": mail["unread_total"],
+            }
+
+        raw_inbox = _read_jsonl(self.home / ".local/state/agent-mail/inbox.jsonl", limit=200)
+        snaps = self._host_snapshots()
+        seen_ids: list[str] = []
+        max_epoch = time.time()
+        for msg in raw_inbox:
+            mid = msg.get("id")
+            if isinstance(mid, str) and mid.strip():
+                seen_ids.append(mid.strip())
+            ep = _parse_mail_epoch(msg.get("at"))
+            if ep is not None and ep > max_epoch:
+                max_epoch = ep
+        for doc in snaps.values():
+            for item in (doc.get("reading") or {}).get("mail") or []:
+                if not isinstance(item, dict):
+                    continue
+                mid = item.get("id")
+                if isinstance(mid, str) and mid.strip():
+                    seen_ids.append(mid.strip())
+                ep = _parse_mail_epoch(item.get("at"))
+                if ep is not None and ep > max_epoch:
+                    max_epoch = ep
+
+        acked_at = _utc_iso()
+        with self._mail_ack_lock:
+            ack = self._load_mail_ack()
+            ack["acked_epoch"] = max(float(ack.get("acked_epoch") or 0.0), max_epoch)
+            ack["acked_at"] = acked_at
+            ack["acked_ids"].extend(seen_ids)
+            self._save_mail_ack(ack)
+
+        raw_tool = str(self.cfg.get("agent_mail_bin") or "").strip()
+        if raw_tool:
+            tool = _expand(raw_tool)
+            if not tool.is_file() and raw_tool == DEFAULT_CONFIG["agent_mail_bin"]:
+                found = shutil.which("agent-mail")
+                tool = Path(found) if found else tool
+            if tool.is_file():
+                try:
+                    subprocess.run([str(tool), "unread", "--mark", "--provider", "agy"], capture_output=True, text=True, timeout=10)
+                except Exception:
+                    pass
+
+        mail = self.build_mail()
+        self._audit("mail-ack", {"mode": "all", "ids_seen": len(seen_ids)})
+        return 200, {
+            "ok": True,
+            "acked_at": acked_at,
+            "unread_total": mail["unread_total"],
+        }
+
+    def action_snooze(self, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        key = str(payload.get("key") or "").strip()
+        if not key or len(key) > 200 or "\n" in key or "\r" in key:
+            return 400, {"ok": False, "error": "invalid row key"}
+        if payload.get("clear") is True:
+            with self._snooze_lock:
+                items = self._load_snoozes()
+                items.pop(key, None)
+                self._save_snoozes(items)
+            self._audit("unsnooze", {"key": key})
+            return 200, {"ok": True, "key": key, "until": None, "detail": "Cleared snooze"}
+
+        raw_hours = payload.get("hours", 24)
+        if isinstance(raw_hours, bool) or not isinstance(raw_hours, (int, float)):
+            return 400, {"ok": False, "error": "hours must be 1..720"}
+        hours = int(raw_hours)
+        if hours < 1 or hours > 720:
+            return 400, {"ok": False, "error": "hours must be 1..720"}
+        note = str(payload.get("note") or "").strip()[:200]
+        until_epoch = time.time() + hours * 3600
+        until_iso = _utc_iso(until_epoch)
+        with self._snooze_lock:
+            items = self._load_snoozes()
+            items[key] = {"until_epoch": until_epoch, "until": until_iso, "note": note}
+            self._save_snoozes(items)
+        self._audit("snooze", {"key": key, "hours": hours})
+        return 200, {"ok": True, "key": key, "until": until_iso, "detail": f"Snoozed for {hours}h"}
+
+    def read_job_log(self, host: str, label: str, lines: int = 60) -> tuple[int, dict[str, Any]]:
+        clean_host = host.strip().lower()
+        clean_label = label.strip()
+        if not HOST_ID_RE.match(clean_host):
+            return 400, {"ok": False, "error": "invalid host"}
+        if clean_host not in self._action_hosts():
+            return 403, {"ok": False, "error": f"actions not permitted on host {clean_host!r}"}
+        if not JOB_LABEL_RE.match(clean_label) or ".." in clean_label or "/" in clean_label:
+            return 400, {"ok": False, "error": "invalid job label"}
+        if not self._is_allowed_job_label(clean_label):
+            return 403, {"ok": False, "error": f"label {clean_label!r} not in allowed prefixes"}
+        return self._run_host_job_script(clean_host, "job-log", clean_label, str(max(10, min(100, lines))))
+
+    def action_job_kickstart(self, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        clean_host = str(payload.get("host") or "").strip().lower()
+        clean_label = str(payload.get("label") or "").strip()
+        if not HOST_ID_RE.match(clean_host):
+            return 400, {"ok": False, "error": "invalid host"}
+        if clean_host not in self._action_hosts():
+            return 403, {"ok": False, "error": f"actions not permitted on host {clean_host!r}"}
+        if not JOB_LABEL_RE.match(clean_label) or ".." in clean_label or "/" in clean_label:
+            return 400, {"ok": False, "error": "invalid job label"}
+        if not self._is_allowed_job_label(clean_label):
+            return 403, {"ok": False, "error": f"label {clean_label!r} not in allowed prefixes"}
+        code, body = self._run_host_job_script(clean_host, "job-kickstart", clean_label)
+        self._audit("job-kickstart", {"host": clean_host, "label": clean_label, "ok": body.get("ok"), "state": body.get("state")})
+        return code, body
+
+    def action_host_action(self, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        clean_host = str(payload.get("host") or "").strip().lower()
+        kind = str(payload.get("kind") or "").strip().lower()
+        if not HOST_ID_RE.match(clean_host):
+            return 400, {"ok": False, "error": "invalid host"}
+        if clean_host not in self._action_hosts():
+            return 403, {"ok": False, "error": f"actions not permitted on host {clean_host!r}"}
+        suffix = HOST_ACTION_SUFFIXES.get(kind)
+        if not suffix:
+            return 400, {"ok": False, "error": "unknown host action kind"}
+        code, body = self._run_host_job_script(clean_host, "host-action", suffix)
+        self._audit("host-action", {"host": clean_host, "kind": kind, "ok": body.get("ok"), "label": body.get("label")})
+        return code, body
+
+    def action_dispatch_fix(self, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        to = str(payload.get("to") or "").strip()
+        prompt = str(payload.get("prompt") or "").strip()
+        key = str(payload.get("key") or "").strip()[:120]
+        title = str(payload.get("title") or "").strip()[:120]
+        if not MAIL_TARGET_RE.match(to):
+            return 400, {"ok": False, "error": "invalid target format"}
+        if not prompt or len(prompt) > 1800:
+            return 400, {"ok": False, "error": "prompt must be 1..1800 chars"}
+        prefix = f"[Fleet iPhone · {title or key}] " if (title or key) else "[Fleet iPhone] "
+        full_text = (prefix + prompt)[:MAX_TEXT_LEN]
+        ok, out, code = self._send_agent_mail(to, full_text)
+        if not ok:
+            return code, {"ok": False, "error": out}
+        self._audit("dispatch-fix", {"to": to, "key": key or None, "len": len(full_text)})
+        return 200, {"ok": True, "to": to, "id": out, "detail": f"Dispatched to {to}"}
+
 
 class FleetHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
@@ -696,7 +1263,15 @@ class FleetAPIHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:
         msg = fmt % args
         msg = re.sub(r"([?&]t=)[^&\s]+", r"\1REDACTED", msg)
-        sys.stderr.write(f"[{_utc_iso()}] {msg}\n")
+        xff = self.headers.get("X-Forwarded-For", "").split(",")[0].strip() if self.headers else ""
+        ip_raw = xff or (self.client_address[0] if self.client_address else "-")
+        ip = re.sub(r"[^0-9a-fA-F.:]", "", ip_raw)[:45] or "-"
+        ts_raw = self.headers.get("Tailscale-User-Login", "").strip() if self.headers else ""
+        ts_user = re.sub(r"[^A-Za-z0-9._@+-]", "", ts_raw)[:80]
+        ua_raw = self.headers.get("User-Agent", "-") if self.headers else "-"
+        ua = re.sub(r'[\x00-\x1f"\s]+', " ", ua_raw).strip()[:80] or "-"
+        user_part = f" user={ts_user}" if ts_user else ""
+        sys.stderr.write(f'[{_utc_iso()}] ip={ip}{user_part} {msg} ua="{ua}"\n')
 
     def _send_bytes(self, status: int, content_type: str, data: bytes, head_only: bool = False) -> None:
         self.send_response(status)
@@ -777,6 +1352,18 @@ class FleetAPIHandler(BaseHTTPRequestHandler):
         }
         if path in routes:
             self._send_json(HTTPStatus.OK, routes[path](), head_only=head_only)
+            return
+
+        if path == "/v1/job-log":
+            host_arg = (qs.get("host") or [""])[0]
+            label_arg = (qs.get("label") or [""])[0]
+            raw_lines = (qs.get("lines") or ["60"])[0]
+            try:
+                lines_n = int(raw_lines)
+            except ValueError:
+                lines_n = 60
+            code, body = self.srv.store.read_job_log(host_arg, label_arg, lines=lines_n)
+            self._send_json(code, body, head_only=head_only)
             return
 
         if is_ota:
@@ -886,6 +1473,16 @@ a.btn{{display:block;text-align:center;text-decoration:none;padding:15px 18px;bo
             code, body = self.srv.store.action_morning_refresh()
         elif path == "/v1/actions/provider-pause":
             code, body = self.srv.store.action_provider_pause(payload)
+        elif path == "/v1/actions/mail-ack":
+            code, body = self.srv.store.action_mail_ack(payload)
+        elif path == "/v1/actions/snooze":
+            code, body = self.srv.store.action_snooze(payload)
+        elif path == "/v1/actions/job-kickstart":
+            code, body = self.srv.store.action_job_kickstart(payload)
+        elif path == "/v1/actions/host-action":
+            code, body = self.srv.store.action_host_action(payload)
+        elif path == "/v1/actions/dispatch-fix":
+            code, body = self.srv.store.action_dispatch_fix(payload)
         else:
             code, body = HTTPStatus.NOT_FOUND, {"ok": False, "error": "unknown action"}
         self._send_json(code, body)

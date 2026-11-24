@@ -592,12 +592,18 @@ public struct MorningRow: Codable, Sendable, Hashable, Identifiable {
     public var value: String?
     public var datum: String?
     public var detail: String?
+    public var snoozedUntil: String?
 
     public var id: String { "\(key)|\(area ?? "")|\(name)|\(status)|\(datum ?? "")" }
     public var severity: RowSeverity { RowSeverity(status: status) }
+    public var isSnoozed: Bool {
+        guard let snoozedUntil, !snoozedUntil.isEmpty else { return false }
+        return true
+    }
 
     enum CodingKeys: String, CodingKey {
         case key, status, symbol, area, name, value, datum, detail
+        case snoozedUntil = "snoozed_until"
     }
 
     public init(
@@ -608,7 +614,8 @@ public struct MorningRow: Codable, Sendable, Hashable, Identifiable {
         name: String,
         value: String? = nil,
         datum: String? = nil,
-        detail: String? = nil
+        detail: String? = nil,
+        snoozedUntil: String? = nil
     ) {
         self.key = key
         self.status = status
@@ -618,6 +625,7 @@ public struct MorningRow: Codable, Sendable, Hashable, Identifiable {
         self.value = value
         self.datum = datum
         self.detail = detail
+        self.snoozedUntil = snoozedUntil
     }
 
     public init(from decoder: Decoder) throws {
@@ -630,6 +638,7 @@ public struct MorningRow: Codable, Sendable, Hashable, Identifiable {
         value = c.decodeFlexibleString(forKey: .value)
         datum = c.decodeFlexibleString(forKey: .datum)
         detail = c.decodeFlexibleString(forKey: .detail)
+        snoozedUntil = c.decodeFlexibleString(forKey: .snoozedUntil)
     }
 }
 
@@ -668,6 +677,8 @@ public struct FleetOverviewResponse: Codable, Sendable, Hashable {
     public var counts: CountsSummary
     public var cadence: CadenceInfo?
     public var agyMorning: String?
+    public var actionHosts: [String]?
+    public var snoozedCount: Int?
     public var hosts: [HostSummary]
     public var capacity: CapacityResponse
     public var backups: OverviewBackups
@@ -679,8 +690,40 @@ public struct FleetOverviewResponse: Codable, Sendable, Hashable {
         case date, counts, cadence, hosts, capacity, backups, security
         case generatedAt = "generated_at"
         case agyMorning = "agy_morning"
+        case actionHosts = "action_hosts"
+        case snoozedCount = "snoozed_count"
         case unreadMail = "unread_mail"
         case activeClaims = "active_claims"
+    }
+
+    public init(
+        generatedAt: Int,
+        date: String? = nil,
+        counts: CountsSummary,
+        cadence: CadenceInfo? = nil,
+        agyMorning: String? = nil,
+        actionHosts: [String]? = nil,
+        snoozedCount: Int? = nil,
+        hosts: [HostSummary],
+        capacity: CapacityResponse,
+        backups: OverviewBackups,
+        security: SecuritySummaryBlock,
+        unreadMail: Int,
+        activeClaims: Int
+    ) {
+        self.generatedAt = generatedAt
+        self.date = date
+        self.counts = counts
+        self.cadence = cadence
+        self.agyMorning = agyMorning
+        self.actionHosts = actionHosts
+        self.snoozedCount = snoozedCount
+        self.hosts = hosts
+        self.capacity = capacity
+        self.backups = backups
+        self.security = security
+        self.unreadMail = unreadMail
+        self.activeClaims = activeClaims
     }
 }
 
@@ -692,11 +735,13 @@ public struct MorningResponse: Codable, Sendable, Hashable {
     public var counts: CountsSummary
     public var cadence: CadenceInfo?
     public var agyMorning: String?
+    public var snoozedCount: Int?
     public var rows: [MorningRow]
 
     enum CodingKeys: String, CodingKey {
         case version, generated, date, ok, counts, cadence, rows
         case agyMorning = "agy_morning"
+        case snoozedCount = "snoozed_count"
     }
 }
 
@@ -841,6 +886,7 @@ public struct MailMessage: Codable, Sendable, Hashable, Identifiable {
     public var to: String?
     public var text: String?
     public var body: String?
+    public var read: Bool?
 
     public var stableID: String {
         id ?? "\(at ?? "")|\(from ?? "")|\(to ?? "")|\(displayText.prefix(24))"
@@ -850,6 +896,42 @@ public struct MailMessage: Codable, Sendable, Hashable, Identifiable {
         if let text, !text.isEmpty { return text }
         if let body, !body.isEmpty { return body }
         return "(empty)"
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, at, from, project, to, text, body, read
+    }
+
+    public init(
+        id: String? = nil,
+        at: String? = nil,
+        from: String? = nil,
+        project: String? = nil,
+        to: String? = nil,
+        text: String? = nil,
+        body: String? = nil,
+        read: Bool? = nil
+    ) {
+        self.id = id
+        self.at = at
+        self.from = from
+        self.project = project
+        self.to = to
+        self.text = text
+        self.body = body
+        self.read = read
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = c.decodeFlexibleString(forKey: .id)
+        at = c.decodeFlexibleString(forKey: .at)
+        from = c.decodeFlexibleString(forKey: .from)
+        project = c.decodeFlexibleString(forKey: .project)
+        to = c.decodeFlexibleString(forKey: .to)
+        text = c.decodeFlexibleString(forKey: .text)
+        body = c.decodeFlexibleString(forKey: .body)
+        read = try? c.decodeIfPresent(Bool.self, forKey: .read)
     }
 }
 
@@ -897,11 +979,15 @@ public struct CoworkClaim: Codable, Sendable, Hashable, Identifiable {
 public struct MailResponse: Codable, Sendable, Hashable {
     public var messages: [MailMessage]
     public var unreadByHost: [String: Int]?
+    public var unreadTotal: Int?
+    public var ackedAt: String?
     public var claims: [CoworkClaim]
 
     enum CodingKeys: String, CodingKey {
         case messages, claims
         case unreadByHost = "unread_by_host"
+        case unreadTotal = "unread_total"
+        case ackedAt = "acked_at"
     }
 }
 
@@ -920,35 +1006,106 @@ public struct HealthResponse: Codable, Sendable, Hashable {
     }
 }
 
+public struct JobLogResponse: Codable, Sendable, Hashable {
+    public var ok: Bool
+    public var host: String?
+    public var label: String?
+    public var stderrPath: String?
+    public var stdoutPath: String?
+    public var stderr: String?
+    public var stdout: String?
+    public var state: String?
+    public var lastExit: String?
+    public var error: String?
+
+    enum CodingKeys: String, CodingKey {
+        case ok, host, label, stderr, stdout, state, error
+        case stderrPath = "stderr_path"
+        case stdoutPath = "stdout_path"
+        case lastExit = "last_exit"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        ok = (try? c.decode(Bool.self, forKey: .ok)) ?? false
+        host = c.decodeFlexibleString(forKey: .host)
+        label = c.decodeFlexibleString(forKey: .label)
+        stderrPath = c.decodeFlexibleString(forKey: .stderrPath)
+        stdoutPath = c.decodeFlexibleString(forKey: .stdoutPath)
+        stderr = c.decodeFlexibleString(forKey: .stderr)
+        stdout = c.decodeFlexibleString(forKey: .stdout)
+        state = c.decodeFlexibleString(forKey: .state)
+        lastExit = c.decodeFlexibleString(forKey: .lastExit)
+        error = c.decodeFlexibleString(forKey: .error)
+    }
+}
+
 public struct ActionResultResponse: Codable, Sendable, Hashable {
     public var ok: Bool
     public var error: String?
+    public var detail: String?
     public var to: String?
     public var id: String?
+    public var host: String?
+    public var label: String?
+    public var state: String?
+    public var lastExit: String?
+    public var until: String?
     public var recorded: Bool?
     public var mailId: String?
     public var started: Bool?
     public var provider: String?
     public var paused: Bool?
     public var list: [String]?
+    public var unreadTotal: Int?
+    public var ackedAt: String?
 
     enum CodingKeys: String, CodingKey {
-        case ok, error, to, id, recorded, started, provider, paused, list
+        case ok, error, detail, to, id, host, label, state, until, recorded, started, provider, paused, list
+        case lastExit = "last_exit"
         case mailId = "mail_id"
+        case unreadTotal = "unread_total"
+        case ackedAt = "acked_at"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        ok = (try? c.decode(Bool.self, forKey: .ok)) ?? false
+        error = c.decodeFlexibleString(forKey: .error)
+        detail = c.decodeFlexibleString(forKey: .detail)
+        to = c.decodeFlexibleString(forKey: .to)
+        id = c.decodeFlexibleString(forKey: .id)
+        host = c.decodeFlexibleString(forKey: .host)
+        label = c.decodeFlexibleString(forKey: .label)
+        state = c.decodeFlexibleString(forKey: .state)
+        lastExit = c.decodeFlexibleString(forKey: .lastExit)
+        until = c.decodeFlexibleString(forKey: .until)
+        recorded = try? c.decodeIfPresent(Bool.self, forKey: .recorded)
+        mailId = c.decodeFlexibleString(forKey: .mailId)
+        started = try? c.decodeIfPresent(Bool.self, forKey: .started)
+        provider = c.decodeFlexibleString(forKey: .provider)
+        paused = try? c.decodeIfPresent(Bool.self, forKey: .paused)
+        list = try? c.decodeIfPresent([String].self, forKey: .list)
+        unreadTotal = c.decodeFlexibleInt(forKey: .unreadTotal)
+        ackedAt = c.decodeFlexibleString(forKey: .ackedAt)
     }
 }
 
 // MARK: - Board filtering and formatting utilities
 
 public enum FleetRowFilter: String, CaseIterable, Identifiable, Sendable {
-    case all = "All"
+    case issues = "Issues"
     case failing = "Fail"
     case warning = "Warn"
-    case passing = "Pass"
+    case disks = "Disks"
+    case jobs = "Jobs"
     case security = "Security"
     case placement = "Placement"
-    case jobs = "Jobs"
-    case disks = "Disks"
+    case backups = "Backups"
+    case projects = "Projects"
+    case passing = "Pass"
+    case snoozed = "Snoozed"
+    case all = "All"
 
     public var id: String { rawValue }
 }
@@ -965,20 +1122,29 @@ public func filterAndSortRows(
         switch filter {
         case .all:
             break
+        case .issues:
+            guard !row.isSnoozed, row.severity == .fail || row.severity == .warn else { return false }
         case .failing:
-            guard row.severity == .fail else { return false }
+            guard !row.isSnoozed, row.severity == .fail else { return false }
         case .warning:
-            guard row.severity == .warn else { return false }
+            guard !row.isSnoozed, row.severity == .warn else { return false }
+        case .snoozed:
+            guard row.isSnoozed else { return false }
         case .passing:
             guard row.severity == .pass else { return false }
         case .security:
             guard areaLower.contains("sec") || keyLower.contains("sec") else { return false }
         case .placement:
-            guard areaLower.contains("plac") || areaLower.contains("back") || keyLower.contains("plac") else { return false }
+            guard areaLower.contains("plac") || keyLower.contains("plac") else { return false }
+        case .backups:
+            guard areaLower.contains("back") || areaLower.contains("cloud") || keyLower.contains("back") || keyLower.contains("idrive") || keyLower.contains("mirror") else { return false }
         case .jobs:
             guard areaLower.contains("job") || keyLower.contains("job") || keyLower.contains("launchd") else { return false }
         case .disks:
-            guard areaLower.contains("disk") || areaLower.contains("drive") || keyLower.contains("disk") else { return false }
+            guard areaLower.contains("disk") || areaLower.contains("drive") || keyLower.contains("disk") || keyLower.contains("storage:") else { return false }
+        case .projects:
+            let projectAreas: Set<String> = ["project", "check", "kit", "sync", "thermal", "update", "upstream", "agent", "capacity", "other"]
+            guard projectAreas.contains(areaLower) else { return false }
         }
         guard !needle.isEmpty else { return true }
         let haystack = [row.name, row.key, row.area, row.value, row.datum, row.detail]
@@ -1073,6 +1239,20 @@ public enum FleetFormatter {
         formatter.allowedUnits = [.useGB, .useTB, .useMB]
         formatter.countStyle = .decimal
         return formatter.string(fromByteCount: bytes)
+    }
+
+    public static func formatCompactTokens(_ tokens: Double?) -> String? {
+        guard let tokens, tokens > 0 else { return nil }
+        if tokens >= 1_000_000_000 {
+            return String(format: "%.1fB tok", tokens / 1_000_000_000.0)
+        }
+        if tokens >= 1_000_000 {
+            return String(format: "%.1fM tok", tokens / 1_000_000.0)
+        }
+        if tokens >= 1_000 {
+            return String(format: "%.0fK tok", tokens / 1_000.0)
+        }
+        return "\(Int(tokens)) tok"
     }
 
     private static func formatDelta(seconds: Int) -> String {

@@ -442,6 +442,28 @@ def hub_attach(path=None, run=subprocess.run, ismount=os.path.ismount, exists=os
     return 0
 
 
+def hub_trigger(host, run=subprocess.run, out=sys.stdout):
+    """Trigger `home-mirror run` on a peer host over ssh; treat an unreachable sleeping peer (ssh 255) as a clean skip."""
+    if not host or not re.fullmatch(r"[A-Za-z0-9._-]+", host) or host.startswith("-"):
+        raise ValueError(f"invalid host: {host!r}")
+    probe = run(["/usr/bin/ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
+                 "-o", "ServerAliveInterval=30", host, "true"],
+                capture_output=True, text=True, errors="replace", timeout=30)
+    if probe.returncode == 255:
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        print(f"{stamp} home-mirror: {host} unreachable (asleep?); skipping", file=out)
+        return 0
+    if probe.returncode != 0:
+        msg = (probe.stderr or probe.stdout or "").strip()
+        if msg:
+            print(msg, file=out)
+        return probe.returncode
+    done = run(["/usr/bin/ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20",
+                "-o", "ServerAliveInterval=30", host, '"$HOME/.local/bin/home-mirror" run'],
+               text=True, errors="replace")
+    return done.returncode
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="home-mirror", description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -450,9 +472,13 @@ def main(argv=None):
     r.add_argument("--dry-run", action="store_true")
     sub.add_parser("status")
     sub.add_parser("hub-attach")
+    ht = sub.add_parser("hub-trigger")
+    ht.add_argument("host")
     args = parser.parse_args(argv)
     if args.cmd == "hub-attach":
         return hub_attach()
+    if args.cmd == "hub-trigger":
+        return hub_trigger(args.host)
     if args.cmd == "status":
         path = STATE / "status.json"
         print(path.read_text() if path.exists() else "no status yet")

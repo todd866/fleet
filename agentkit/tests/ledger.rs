@@ -600,9 +600,46 @@ fn any_cd_into_the_ledger_folder_with_a_writer_refuses_the_command() {
         ("cd \"$X\" && rm notes.txt", true),
         ("cd ~/.local/state/agentkit && ls && tail -2 decisions.jsonl", false),
         ("cd /tmp && make", false),
+        ("ls -la ~/.local/state/agent-tick/ 2>/dev/null | head -20; find ~/.local/state -maxdepth 2 -name 'decrypt-watch*' 2>/dev/null", false),
+        ("find ~/.local/state -maxdepth 2 -type f 2>/dev/null | grep -v tripwire", false),
+        ("find ~/.local/state -delete", true),
+        ("find ~/.local/state -exec rm {} +", true),
+        ("cd ~/.local/state && find . -maxdepth 1 -delete", true),
     ];
     for (cmd, refused) in table {
         assert_eq!(d(cmd).is_deny(), *refused, "{cmd}");
     }
     let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn agy_tool_call_fields_populate_ledger_lines() {
+    let shell_call = json!({
+        "conversationId": "conv-42",
+        "toolCall": {
+            "name": "run_command",
+            "args": {"CommandLine": "rm -rf ~/Documents", "Cwd": "/var/tmp/ex/proj"}
+        }
+    });
+    let line = ledger::build_line("agy", "all", &shell_call, &Decision::deny("icloud", "no"), None, "2026-11-24T00:00:00.000Z".into(), 1, 0);
+    let v: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(v["tool"], "run_command");
+    assert_eq!(v["session"], "conv-42");
+    assert_eq!(v["cwd"], "/var/tmp/ex/proj");
+    assert_eq!(v["cmd"], "rm -rf ~/Documents");
+
+    let file_call = json!({
+        "trajectory_id": "traj-9",
+        "workspacePaths": ["/var/tmp/ex/ws"],
+        "toolCall": {
+            "name": "write_to_file",
+            "args": {"TargetFile": "/var/tmp/ex/ws/.config/agentkit/agentkit.toml"}
+        }
+    });
+    let fline = ledger::build_line("agy", "all", &file_call, &Decision::deny("guard-config", "no"), None, "2026-11-24T00:00:00.000Z".into(), 2, 0);
+    let fv: Value = serde_json::from_str(&fline).unwrap();
+    assert_eq!(fv["tool"], "write_to_file");
+    assert_eq!(fv["session"], "traj-9");
+    assert_eq!(fv["cwd"], "/var/tmp/ex/ws");
+    assert_eq!(fv["path"], "/var/tmp/ex/ws/.config/agentkit/agentkit.toml");
 }

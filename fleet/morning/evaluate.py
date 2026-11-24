@@ -55,6 +55,7 @@ def evaluate(snapshot, config, now):
         rows.extend(_queue(name, host, now, tz))
         rows.extend(_thermal(name, host, config, now))
         rows.extend(_mail(name, host, config, now))
+        rows.extend(_vpn_gateway(name, host.get("vpn_gateway")))
     rows.extend(_capacity(snapshot.get("capacity"), config, now, tz))
     rows.extend(_ai_usage(snapshot.get("ai_usage"), now))
     rows.extend(_agents(snapshot.get("board"), now))
@@ -64,6 +65,7 @@ def evaluate(snapshot, config, now):
     rows.extend(_coverage(snapshot.get("coverage"), now))
     rows.extend(_agentkit(snapshot.get("agentkit")))
     rows.extend(_security_evidence(snapshot.get("security_evidence"), now))
+    rows.extend(_surface_probes(snapshot.get("surface_probes"), config))
     rows.extend(_job_reviews(snapshot.get("job_reviews"), now))
     rows.extend(_upstream(snapshot.get("upstream"), config, now))
     rows.extend(_unregistered_jobs(snapshot.get("hosts") or {}, registry))
@@ -1272,6 +1274,89 @@ def _security_evidence(doc, now):
         detail = str(item.get("detail") or "")
         rows.append(_row(key, status, "security", name, value, datum, detail))
     return rows
+
+
+def _surface_probes(doc, config):
+    """Evaluate public Funnel and tailnet rejection log summaries against burst thresholds."""
+    if not isinstance(doc, dict):
+        return []
+    surfaces = doc.get("surfaces") or []
+    if not surfaces:
+        return []
+    cfg = (config or {}).get("surface_probes") or {}
+    ip_warn = int(cfg.get("ip_warn", 20))
+    ip_fail = int(cfg.get("ip_fail", 100))
+    total_warn = int(cfg.get("total_warn", 50))
+    total_fail = int(cfg.get("total_fail", 300))
+    window_h = int(doc.get("window_h") or cfg.get("window_h", 24))
+    rows = []
+    for s in surfaces:
+        if not isinstance(s, dict):
+            continue
+        name = str(s.get("name") or "surface")
+        slug = re.sub(r"[^a-z0-9_-]+", "-", name.lower()).strip("-") or "surface"
+        key = f"sec:probes:{slug}"
+        if not s.get("present"):
+            rows.append(_row(key, "warn", "security", f"{name} probes", "missing", "no log", f"{name} rejection log missing"))
+            continue
+        total = int(s.get("total") or 0)
+        top_ip = s.get("top_ip")
+        top_count = int(s.get("top_ip_count") or 0)
+        unique_ips = int(s.get("unique_ips") or 0)
+        if top_count >= ip_fail or total >= total_fail:
+            status = "fail"
+        elif top_count >= ip_warn or total >= total_warn:
+            status = "warn"
+        else:
+            status = "pass"
+        by_status = s.get("by_status") or {}
+        codes = " ".join(f"{k}:{v}" for k, v in sorted(by_status.items()))
+        if total == 0:
+            value, datum = "0 probes", f"last {window_h}h"
+            detail = f"{name}: 0 rejected requests in last {window_h}h"
+        else:
+            ip_noun = "IP" if unique_ips == 1 else "IPs"
+            value = f"{total} err ({unique_ips} {ip_noun})" if unique_ips else f"{total} err"
+            datum = f"top {top_ip} x{top_count}" if top_ip else f"last {window_h}h"
+            detail = f"{name}: {total} rejected in {window_h}h ({codes}); top IP {top_ip} ({top_count}x)" if top_ip else f"{name}: {total} rejected in {window_h}h ({codes})"
+        rows.append(_row(key, status, "security", f"{name} probes", value, datum, detail))
+    return rows
+
+
+def _vpn_gateway(host, doc):
+    """Evaluate a host's local split-tunnel VPN gateway (PAC, Gluetun exit IP, Transmission UI)."""
+    if not isinstance(doc, dict) or not doc:
+        return []
+    pac_ok = bool(doc.get("pac_ok"))
+    vpn_ok = bool(doc.get("vpn_ok"))
+    tx_ok = bool(doc.get("transmission_ok"))
+    ip = str(doc.get("vpn_ip") or "")
+    country = str(doc.get("vpn_country") or "")
+    try:
+        domains = int(doc.get("domains") or 0)
+    except (TypeError, ValueError):
+        domains = 0
+    key, name = f"sec:vpn:{host}", f"{host} vpn gateway"
+    if not pac_ok or not vpn_ok:
+        bad = []
+        if not pac_ok:
+            bad.append("pac")
+        if not vpn_ok:
+            bad.append("gluetun")
+        return [_row(
+            key, "fail", "security", name, "down", ",".join(bad),
+            f"split-tunnel VPN gateway unhealthy ({', '.join(bad)}); check vpn-gw status / vpn-gw up",
+        )]
+    loc = f"{ip} {country}".strip()
+    if not tx_ok:
+        return [_row(
+            key, "warn", "security", name, f"up ({ip})", "transmission down",
+            f"PAC (:8899, {domains} domains) and Gluetun ({loc}) up, but Transmission (:9091) unreachable",
+        )]
+    return [_row(
+        key, "pass", "security", name, f"up ({ip})", f"{domains} domains",
+        f"PAC (:8899, {domains} domains), Gluetun ({loc}), Transmission (:9091) all up",
+    )]
 
 
 def _agentkit(kit):

@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import xml.parsers.expat
@@ -83,6 +84,7 @@ def _gather():
         "diskmap_access": _diskmap_access(),
         "cool_c": _cool_target(),
         "queue": _queue(),
+        "vpn_gateway": _vpn_gateway(),
     }
     if not (HOME / "Library/Application Support/IDriveforMac").exists() and not pathlib.Path("/Applications/IDrive.app").exists():
         reading.pop("idrive")
@@ -929,6 +931,66 @@ def _placement_datasets(home=None):
             "keep": keep,
         })
     return rows or None
+
+
+def _vpn_gateway():
+    """Probe the local split-tunnel VPN gateway (PAC, Gluetun exit IP, Transmission UI) without touching secrets."""
+    has_pac = any((HOME / "Library/LaunchAgents").glob("*.vpn-pac.plist"))
+    has_domains = (HOME / ".config/fleet/vpn-domains.txt").is_file()
+    if not (has_pac or has_domains):
+        return None
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    def get_json(url):
+        try:
+            with opener.open(url, timeout=2) as resp:
+                if getattr(resp, "status", 200) != 200:
+                    return None
+                return json.loads(resp.read().decode("utf-8", "replace"))
+        except (OSError, ValueError, urllib.error.URLError):
+            return None
+
+    pac = get_json("http://127.0.0.1:8899/health")
+    pac_ok = isinstance(pac, dict) and bool(pac.get("ok"))
+    domains = 0
+    if isinstance(pac, dict):
+        raw_count = pac.get("domains_count")
+        if raw_count is not None:
+            try:
+                domains = int(raw_count)
+            except (TypeError, ValueError):
+                domains = 0
+        elif isinstance(pac.get("domains"), list):
+            domains = len(pac["domains"])
+        else:
+            try:
+                domains = int(pac.get("domains") or 0)
+            except (TypeError, ValueError):
+                domains = 0
+
+    gluetun = get_json("http://127.0.0.1:8890/v1/publicip/ip")
+    vpn_ip = str(gluetun.get("public_ip") or "").strip() if isinstance(gluetun, dict) else ""
+    vpn_country = str(gluetun.get("country") or "").strip() if isinstance(gluetun, dict) else ""
+    vpn_ok = bool(vpn_ip)
+
+    transmission_ok = False
+    try:
+        with opener.open("http://127.0.0.1:9091/transmission/web/", timeout=2) as resp:
+            transmission_ok = getattr(resp, "status", 200) in (200, 301, 302, 401, 409)
+    except urllib.error.HTTPError as exc:
+        transmission_ok = exc.code in (301, 302, 401, 409)
+        exc.close()
+    except (OSError, urllib.error.URLError):
+        transmission_ok = False
+
+    return {
+        "pac_ok": pac_ok,
+        "domains": domains,
+        "vpn_ok": vpn_ok,
+        "vpn_ip": vpn_ip,
+        "vpn_country": vpn_country,
+        "transmission_ok": transmission_ok,
+    }
 
 
 def _json(path):

@@ -47,6 +47,7 @@ DEFAULTS = {
     "capacity": {"near_empty_pct": 10, "near_empty_jobs": 5, "stale_h": 3},
     "agents": {"stale_claim_h": 6, "unread_mail_h": 12},
     "projects": {"heavy_runtime_s": 60, "active_host": "primary", "check_max_age_h": 30},
+    "surface_probes": {"logs": [], "window_h": 24, "ip_warn": 20, "ip_fail": 100, "total_warn": 50, "total_fail": 300},
 }
 
 

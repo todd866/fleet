@@ -110,6 +110,69 @@ public actor FleetAPIClient {
         return try await postEncodable(path: "/v1/actions/provider-pause", body: PauseBody(provider: provider, paused: paused))
     }
 
+    public func ackAllMail() async throws -> ActionResultResponse {
+        struct AckAllBody: Encodable {
+            let all: Bool
+        }
+        return try await postEncodable(path: "/v1/actions/mail-ack", body: AckAllBody(all: true))
+    }
+
+    public func ackMail(ids: [String]) async throws -> ActionResultResponse {
+        struct AckIdsBody: Encodable {
+            let ids: [String]
+        }
+        return try await postEncodable(path: "/v1/actions/mail-ack", body: AckIdsBody(ids: ids))
+    }
+
+    public func fetchJobLog(host: String, label: String, lines: Int = 60) async throws -> JobLogResponse {
+        var comps = URLComponents()
+        comps.queryItems = [
+            URLQueryItem(name: "host", value: host),
+            URLQueryItem(name: "label", value: label),
+            URLQueryItem(name: "lines", value: String(lines)),
+        ]
+        let query = comps.percentEncodedQuery ?? ""
+        return try await request(path: "/v1/job-log?\(query)")
+    }
+
+    public func kickstartJob(host: String, label: String) async throws -> ActionResultResponse {
+        try await postAction(path: "/v1/actions/job-kickstart", payload: ["host": host, "label": label])
+    }
+
+    public func runHostAction(host: String, kind: String) async throws -> ActionResultResponse {
+        try await postAction(path: "/v1/actions/host-action", payload: ["host": host, "kind": kind])
+    }
+
+    public func snooze(key: String, hours: Int, note: String? = nil) async throws -> ActionResultResponse {
+        struct SnoozeBody: Encodable {
+            let key: String
+            let hours: Int
+            let note: String?
+        }
+        return try await postEncodable(path: "/v1/actions/snooze", body: SnoozeBody(key: key, hours: hours, note: note))
+    }
+
+    public func unsnooze(key: String) async throws -> ActionResultResponse {
+        struct UnsnoozeBody: Encodable {
+            let key: String
+            let clear: Bool
+        }
+        return try await postEncodable(path: "/v1/actions/snooze", body: UnsnoozeBody(key: key, clear: true))
+    }
+
+    public func dispatchFix(to: String, key: String? = nil, title: String? = nil, prompt: String) async throws -> ActionResultResponse {
+        struct FixBody: Encodable {
+            let to: String
+            let key: String?
+            let title: String?
+            let prompt: String
+        }
+        return try await postEncodable(
+            path: "/v1/actions/dispatch-fix",
+            body: FixBody(to: to, key: key, title: title, prompt: prompt)
+        )
+    }
+
     private func postAction<P: Encodable>(path: String, payload: P) async throws -> ActionResultResponse {
         try await postEncodable(path: path, body: payload)
     }

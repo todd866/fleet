@@ -20,13 +20,17 @@ enum FleetTheme {
     static let fail = Color(red: 0.937, green: 0.267, blue: 0.267)
     static let info = Color(red: 0.220, green: 0.741, blue: 0.973)
 
-    static func color(forStatus raw: String) -> Color {
-        switch RowSeverity(status: raw) {
+    static func color(forSeverity severity: RowSeverity) -> Color {
+        switch severity {
         case .fail: return fail
         case .warn: return warn
         case .pass: return pass
         case .other: return info
         }
+    }
+
+    static func color(forStatus raw: String) -> Color {
+        color(forSeverity: RowSeverity(status: raw))
     }
 }
 
@@ -69,6 +73,7 @@ struct MissionCard<Content: View>: View {
 @MainActor
 final class FleetAppModel {
     var selectedTab: FleetTab = .overview
+    var boardFilter: FleetRowFilter = .issues
     var overview: FleetOverviewResponse?
     var morning: MorningResponse?
     var backups: BackupsResponse?
@@ -84,6 +89,15 @@ final class FleetAppModel {
     var actionStatus: String?
 
     private let client = FleetAPIClient()
+
+    func openBoard(filter: FleetRowFilter) {
+        boardFilter = filter
+        selectedTab = .board
+    }
+
+    func openControls() {
+        selectedTab = .controls
+    }
 
     init() {
         let creds = KeychainStore.shared.loadCredentials()
@@ -211,6 +225,18 @@ final class FleetAppModel {
         return res
     }
 
+    func markAllMailRead() async throws -> ActionResultResponse {
+        let res = try await client.ackAllMail()
+        await refreshAll()
+        return res
+    }
+
+    func markMailRead(id: String) async throws -> ActionResultResponse {
+        let res = try await client.ackMail(ids: [id])
+        await refreshAll()
+        return res
+    }
+
     func triggerMorningRefresh() async throws -> ActionResultResponse {
         try await authenticateOwner(reason: "Confirm running the fleet morning audit refresh")
         return try await client.triggerMorningRefresh()
@@ -219,6 +245,42 @@ final class FleetAppModel {
     func setProviderPaused(provider: String, paused: Bool) async throws -> ActionResultResponse {
         try await authenticateOwner(reason: "Confirm \(paused ? "pausing" : "resuming") \(provider)")
         let res = try await client.setProviderPaused(provider: provider, paused: paused)
+        await refreshAll()
+        return res
+    }
+
+    func fetchJobLog(host: String, label: String) async throws -> JobLogResponse {
+        try await client.fetchJobLog(host: host, label: label)
+    }
+
+    func kickstartJob(host: String, label: String) async throws -> ActionResultResponse {
+        try await authenticateOwner(reason: "Confirm running \(shortJobName(label)) on \(host.uppercased())")
+        let res = try await client.kickstartJob(host: host, label: label)
+        await refreshAll()
+        return res
+    }
+
+    func runHostAction(host: String, kind: String) async throws -> ActionResultResponse {
+        try await authenticateOwner(reason: "Confirm running \(kind) on \(host.uppercased())")
+        let res = try await client.runHostAction(host: host, kind: kind)
+        await refreshAll()
+        return res
+    }
+
+    func snoozeItem(key: String, hours: Int, note: String? = nil) async throws -> ActionResultResponse {
+        let res = try await client.snooze(key: key, hours: hours, note: note)
+        await refreshAll()
+        return res
+    }
+
+    func unsnoozeItem(key: String) async throws -> ActionResultResponse {
+        let res = try await client.unsnooze(key: key)
+        await refreshAll()
+        return res
+    }
+
+    func dispatchFix(to: String, key: String? = nil, title: String? = nil, prompt: String) async throws -> ActionResultResponse {
+        let res = try await client.dispatchFix(to: to, key: key, title: title, prompt: prompt)
         await refreshAll()
         return res
     }
@@ -264,14 +326,12 @@ struct FleetApp: App {
                     .tabItem {
                         Label("Board", systemImage: "checklist")
                     }
-                    .badge(model.overview?.counts.fail ?? 0)
                     .tag(FleetTab.board)
 
                 InboxView(model: model)
                     .tabItem {
                         Label("Inbox", systemImage: "tray.full")
                     }
-                    .badge(model.overview?.unreadMail ?? 0)
                     .tag(FleetTab.inbox)
 
                 ControlsView(model: model)

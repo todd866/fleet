@@ -24,6 +24,27 @@ struct ControlsView: View {
                     }
                 }
 
+                Section("Hub Status") {
+                    HStack {
+                        Label(
+                            model.isConfigured ? "Connected" : "Unpaired",
+                            systemImage: model.isConfigured ? "checkmark.shield.fill" : "exclamationmark.triangle"
+                        )
+                        .foregroundStyle(model.isConfigured ? FleetTheme.pass : FleetTheme.warn)
+                        Spacer()
+                        if let last = model.lastRefreshDate {
+                            Text("Synced \(FleetFormatter.relativeTime(fromEpoch: Int(last.timeIntervalSince1970)))")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    if let host = URL(string: model.serverURL)?.host {
+                        Text(host)
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
                 operationsSection
                 providersSection
                 pairingSection

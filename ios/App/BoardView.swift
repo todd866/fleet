@@ -2,59 +2,97 @@ import SwiftUI
 
 struct BoardView: View {
     @Bindable var model: FleetAppModel
-    @State private var selectedFilter: FleetRowFilter = .all
     @State private var searchText = ""
     @State private var selectedRow: MorningRow?
+    @State private var selectedViolation: PlacementViolation?
 
     private var allRows: [MorningRow] {
         model.morning?.rows ?? model.overview?.security.rows ?? []
     }
 
     private var filteredRows: [MorningRow] {
-        filterAndSortRows(allRows, filter: selectedFilter, searchText: searchText)
+        filterAndSortRows(allRows, filter: model.boardFilter, searchText: searchText)
+    }
+
+    private var groupedRows: [BoardAreaGroup] {
+        groupRowsByArea(filteredRows)
     }
 
     var body: some View {
         NavigationStack {
             List {
-                if let sec = model.security {
+                filterChipsSection
+
+                if let sec = model.security, (model.boardFilter == .security || model.boardFilter == .issues) {
                     securitySection(sec)
                 }
 
-                filterChipsSection
-
-                Section("Checks (\(filteredRows.count))") {
-                    if filteredRows.isEmpty {
-                        Text("No checks match the active filter.")
-                            .foregroundStyle(.secondary)
-                    } else {
-                        ForEach(filteredRows) { row in
-                            Button {
-                                selectedRow = row
-                            } label: {
-                                MorningRowCell(row: row)
+                if groupedRows.isEmpty {
+                    Section {
+                        VStack(spacing: 6) {
+                            Image(systemName: "checkmark.seal.fill")
+                                .font(.title2)
+                                .foregroundStyle(FleetTheme.pass)
+                            Text("No matching items")
+                                .font(.subheadline.weight(.semibold))
+                            Text(model.boardFilter == .issues ? "No failing or warning checks right now." : "Try another filter chip or search term.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 12)
+                    }
+                } else {
+                    ForEach(groupedRows) { group in
+                        Section {
+                            ForEach(group.rows) { row in
+                                Button {
+                                    selectedRow = row
+                                } label: {
+                                    MorningRowCell(row: row)
+                                }
+                                .buttonStyle(.plain)
                             }
-                            .buttonStyle(.plain)
+                        } header: {
+                            HStack {
+                                Text(group.title)
+                                Spacer()
+                                Text("\(group.rows.count)")
+                                    .monospacedDigit()
+                            }
                         }
                     }
                 }
 
-                if let violations = model.backups?.placement?.violations, !violations.isEmpty {
-                    Section("Placement Violations (\(violations.count))") {
+                if let violations = model.backups?.placement?.violations,
+                   !violations.isEmpty,
+                   (model.boardFilter == .placement || model.boardFilter == .issues || model.boardFilter == .all) {
+                    Section("Placement Gaps (\(violations.count))") {
                         ForEach(violations) { item in
-                            VStack(alignment: .leading, spacing: 4) {
+                            Button {
+                                selectedViolation = item
+                            } label: {
                                 HStack {
-                                    Text("\(item.host.uppercased()) · \(item.dataset)")
-                                        .font(.subheadline.weight(.semibold))
-                                    Spacer()
-                                    StatusPill(label: item.code, color: FleetTheme.warn)
-                                }
-                                if let detail = item.detail, !detail.isEmpty {
-                                    Text(detail)
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        HStack {
+                                            Text("\(item.host.uppercased()) · \(item.dataset)")
+                                                .font(.subheadline.weight(.semibold))
+                                                .foregroundStyle(.primary)
+                                            Spacer()
+                                            StatusPill(label: item.code, color: FleetTheme.warn)
+                                        }
+                                        if let detail = item.detail, !detail.isEmpty {
+                                            Text(detail)
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                        }
+                                    }
+                                    Image(systemName: "chevron.right")
+                                        .font(.caption2.weight(.semibold))
+                                        .foregroundStyle(.tertiary)
                                 }
                             }
+                            .buttonStyle(.plain)
                             .padding(.vertical, 2)
                         }
                     }
@@ -63,12 +101,15 @@ struct BoardView: View {
             .scrollContentBackground(.hidden)
             .background(FleetTheme.bg.ignoresSafeArea())
             .navigationTitle("Board")
-            .searchable(text: $searchText, prompt: "Search checks, areas, or details")
+            .searchable(text: $searchText, prompt: "Search checks, hosts, or jobs")
             .refreshable {
                 await model.refreshAll()
             }
             .sheet(item: $selectedRow) { row in
-                MorningRowDetailSheet(row: row)
+                RowActionSheet(model: model, row: row)
+            }
+            .sheet(item: $selectedViolation) { violation in
+                PlacementActionSheet(model: model, violation: violation)
             }
         }
     }
@@ -78,24 +119,27 @@ struct BoardView: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 8) {
                     ForEach(FleetRowFilter.allCases) { filter in
+                        let cnt = filterAndSortRows(allRows, filter: filter).count
+                        let isSelected = model.boardFilter == filter
                         Button {
-                            selectedFilter = filter
+                            model.boardFilter = filter
                         } label: {
-                            Text(filter.rawValue)
+                            Text("\(filter.rawValue) (\(cnt))")
                                 .font(.caption.weight(.semibold))
+                                .monospacedDigit()
                                 .padding(.horizontal, 12)
                                 .padding(.vertical, 6)
                                 .background(
-                                    selectedFilter == filter ? FleetTheme.pass.opacity(0.25) : FleetTheme.elevated,
+                                    isSelected ? FleetTheme.pass.opacity(0.25) : FleetTheme.elevated,
                                     in: Capsule()
                                 )
                                 .overlay(
                                     Capsule().stroke(
-                                        selectedFilter == filter ? FleetTheme.pass : FleetTheme.border,
+                                        isSelected ? FleetTheme.pass : FleetTheme.border,
                                         lineWidth: 1
                                     )
                                 )
-                                .foregroundStyle(selectedFilter == filter ? FleetTheme.pass : .primary)
+                                .foregroundStyle(isSelected ? FleetTheme.pass : .primary)
                         }
                         .buttonStyle(.plain)
                     }
@@ -108,43 +152,63 @@ struct BoardView: View {
     }
 
     private func securitySection(_ sec: SecurityResponse) -> some View {
-        Section("Security Evidence") {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack {
-                    StatusPill(label: sec.status, color: FleetTheme.color(forStatus: sec.status))
-                    if let open = sec.localTripwireOpen {
-                        StatusPill(
-                            label: "\(open) tripwire open",
-                            color: open == 0 ? FleetTheme.pass : FleetTheme.warn
-                        )
+        let namespaces = sec.namespaces ?? [:]
+        let audits = sec.namespaceAudits ?? [:]
+        return Section("Security Evidence") {
+            if !namespaces.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("LIVE CHAINS")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(.secondary)
+                    ForEach(namespaces.keys.sorted(), id: \.self) { ns in
+                        if let info = namespaces[ns] {
+                            HStack {
+                                Text(ns.uppercased())
+                                    .font(.caption.weight(.bold).monospaced())
+                                Text("\(info.integrity ?? "ok")\(info.links.map { " (\($0) links)" } ?? "")")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                                if let silent = info.silentMin {
+                                    Text("\(String(format: "%.0f", silent))m")
+                                        .font(.caption2.monospacedDigit())
+                                        .foregroundStyle(.secondary)
+                                }
+                                StatusPill(
+                                    label: info.status ?? "pass",
+                                    color: FleetTheme.color(forStatus: info.status ?? "pass")
+                                )
+                            }
+                        }
                     }
-                    Spacer()
-                    Text(FleetFormatter.relativeTime(fromEpoch: sec.generated))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
                 }
+                .padding(.vertical, 2)
+            }
 
-                if let val = sec.value, !val.isEmpty {
-                    Text(val)
-                        .font(.subheadline.weight(.medium))
-                }
-                if let detail = sec.detail, !detail.isEmpty {
-                    Text(detail)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-                if let audits = sec.namespaceAudits, !audits.isEmpty {
+            if !audits.isEmpty || (sec.localTripwireOpen ?? 0) > 0 {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("DAILY AUDIT")
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        if let open = sec.localTripwireOpen {
+                            StatusPill(
+                                label: "\(open) tripwire open",
+                                color: open == 0 ? FleetTheme.pass : FleetTheme.warn
+                            )
+                        }
+                    }
                     ForEach(audits.keys.sorted(), id: \.self) { ns in
                         if let audit = audits[ns] {
                             VStack(alignment: .leading, spacing: 3) {
                                 HStack {
-                                    Text("Audit \(ns.uppercased())")
-                                        .font(.caption.weight(.bold))
+                                    Text("\(ns.uppercased()) · \(audit.file ?? "latest")")
+                                        .font(.caption.weight(.semibold))
                                     Spacer()
                                     Text("\(audit.failCount ?? 0) fail · \(audit.warnCount ?? 0) warn")
                                         .font(.caption.monospacedDigit())
-                                        .foregroundStyle(.secondary)
+                                        .foregroundStyle((audit.failCount ?? 0) > 0 ? FleetTheme.fail : .secondary)
                                 }
                                 ForEach(audit.topFindings?.prefix(3) ?? []) { finding in
                                     Text("• [\(finding.level)] \(finding.rule): \(finding.text)")
@@ -152,12 +216,12 @@ struct BoardView: View {
                                         .foregroundStyle(.secondary)
                                 }
                             }
-                            .padding(.top, 4)
+                            .padding(.top, 2)
                         }
                     }
                 }
+                .padding(.vertical, 2)
             }
-            .padding(.vertical, 4)
         }
     }
 }
@@ -165,73 +229,50 @@ struct BoardView: View {
 private struct MorningRowCell: View {
     let row: MorningRow
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            HStack(alignment: .firstTextBaseline) {
-                StatusPill(label: row.status, color: FleetTheme.color(forStatus: row.status))
-                Text(row.name)
-                    .font(.subheadline.weight(.semibold))
-                    .lineLimit(2)
-                Spacer()
-                if let area = row.area, !area.isEmpty {
-                    Text(area)
-                        .font(.caption2.monospaced())
-                        .foregroundStyle(.secondary)
-                }
-            }
-
-            if let value = row.value, !value.isEmpty {
-                Text(value)
-                    .font(.caption)
-                    .foregroundStyle(.primary)
-            }
-            if let detail = row.detail, !detail.isEmpty {
-                Text(detail)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(3)
+    private var displayTitle: String {
+        let area = (row.area ?? "").lowercased()
+        if area == "job" || row.key.hasPrefix("job:") {
+            if !row.name.contains(" "), row.name.split(separator: ".").count >= 3 {
+                return shortJobName(row.name)
             }
         }
-        .padding(.vertical, 4)
+        return row.name
     }
-}
-
-private struct MorningRowDetailSheet: View {
-    let row: MorningRow
-    @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        NavigationStack {
-            List {
-                Section("Summary") {
-                    LabeledContent("Key", value: row.key)
-                    LabeledContent("Status", value: row.status.uppercased())
-                    if let area = row.area {
-                        LabeledContent("Area", value: area)
-                    }
-                    if let value = row.value {
-                        LabeledContent("Value", value: value)
-                    }
-                    if let datum = row.datum {
-                        LabeledContent("Datum", value: datum)
+        HStack(spacing: 10) {
+            RoundedRectangle(cornerRadius: 2)
+                .fill(row.isSnoozed ? FleetTheme.info : FleetTheme.color(forSeverity: row.severity))
+                .frame(width: 4)
+                .padding(.vertical, 2)
+
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text(displayTitle)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(row.isSnoozed ? .secondary : .primary)
+                        .lineLimit(2)
+                    Spacer()
+                    if row.isSnoozed {
+                        StatusPill(label: "Snoozed", color: FleetTheme.info)
+                    } else if let val = row.value, !val.isEmpty {
+                        Text(val)
+                            .font(.caption.weight(.medium).monospacedDigit())
+                            .foregroundStyle(FleetTheme.color(forSeverity: row.severity))
+                            .lineLimit(1)
+                    } else {
+                        StatusPill(label: row.status, color: FleetTheme.color(forSeverity: row.severity))
                     }
                 }
+
                 if let detail = row.detail, !detail.isEmpty {
-                    Section("Detail") {
-                        Text(detail)
-                            .font(.callout.monospaced())
-                            .textSelection(.enabled)
-                    }
-                }
-            }
-            .navigationTitle(row.name)
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { dismiss() }
+                    Text(detail)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
                 }
             }
         }
-        .preferredColorScheme(.dark)
+        .padding(.vertical, 3)
     }
 }

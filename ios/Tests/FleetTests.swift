@@ -175,9 +175,11 @@ final class FleetTests: XCTestCase {
         let mailJSON = """
         {
           "messages": [
-            {"id": "msg-1", "at": "2026-11-24 07:01:05", "from": "hub", "project": "storage", "text": "Check drive floor"}
+            {"id": "msg-1", "at": "2026-11-24 07:01:05", "from": "hub", "project": "storage", "text": "Check drive floor", "read": true}
           ],
           "unread_by_host": {"hub": 0, "primary": 1},
+          "unread_total": 1,
+          "acked_at": "2026-11-24T00:00:00Z",
           "claims": [
             {"work": "fleet-ios", "host": "primary", "provider": "agy", "heartbeat": 1795474914, "expires": 1795503714, "note": "Building SwiftUI app"}
           ]
@@ -187,7 +189,10 @@ final class FleetTests: XCTestCase {
         let mail = try JSONDecoder().decode(MailResponse.self, from: mailJSON)
         XCTAssertEqual(mail.messages.first?.displayText, "Check drive floor")
         XCTAssertEqual(mail.messages.first?.project, "storage")
+        XCTAssertEqual(mail.messages.first?.read, true)
         XCTAssertEqual(mail.unreadByHost?["primary"], 1)
+        XCTAssertEqual(mail.unreadTotal, 1)
+        XCTAssertEqual(mail.ackedAt, "2026-11-24T00:00:00Z")
         XCTAssertEqual(mail.claims.first?.work, "fleet-ios")
         XCTAssertEqual(mail.claims.first?.heartbeat, "1795474914")
     }
@@ -281,6 +286,118 @@ final class FleetTests: XCTestCase {
         store.saveMorning(morning)
         let loaded = store.loadMorning()
         XCTAssertEqual(loaded, morning)
+    }
+
+    func testPresentationHelpersAndFilters() throws {
+        // shortJobName & formatCompactTokens
+        XCTAssertEqual(shortJobName("com.example.agent-mail-relay"), "agent-mail-relay")
+        XCTAssertEqual(shortJobName("org.vendor.air.web-refresh"), "air.web-refresh")
+        XCTAssertEqual(shortJobName("single"), "single")
+        XCTAssertEqual(FleetFormatter.formatCompactTokens(6_312_755_650), "6.3B tok")
+        XCTAssertEqual(FleetFormatter.formatCompactTokens(265_194_540), "265.2M tok")
+        XCTAssertEqual(FleetFormatter.formatCompactTokens(45_000), "45K tok")
+
+        // Disk threshold + host headline verdict
+        let criticalJSON = """
+        {"id":"laptop","ok":true,"disk_free_gb":13.4,"disk_total_gb":245.1,"disk_target_gb":40.0,"disk_floor_gb":20.0,"failing_jobs_count":0}
+        """.data(using: .utf8)!
+        let criticalHost = try JSONDecoder().decode(HostSummary.self, from: criticalJSON)
+        let critDisk = diskThresholdInfo(for: criticalHost)
+        XCTAssertEqual(critDisk.state, .critical)
+        XCTAssertTrue(critDisk.thresholdSummary.contains("below 20 GB floor"))
+        XCTAssertEqual(hostHeadlineVerdict(for: criticalHost).label, "Low Disk")
+
+        let healthyJSON = """
+        {"id":"hub","ok":true,"disk_free_gb":134.0,"disk_total_gb":494.4,"disk_target_gb":60.0,"disk_floor_gb":40.0,"failing_jobs_count":0}
+        """.data(using: .utf8)!
+        let healthyHost = try JSONDecoder().decode(HostSummary.self, from: healthyJSON)
+        XCTAssertEqual(diskThresholdInfo(for: healthyHost).state, .healthy)
+        XCTAssertEqual(hostHeadlineVerdict(for: healthyHost).label, "Healthy")
+
+        // Attention clusters & Board grouping
+        let rows = [
+            MorningRow(key: "disk:laptop", status: "fail", area: "disk", name: "laptop internal", value: "13.4 GB"),
+            MorningRow(key: "job:hub:yt", status: "fail", area: "job", name: "hub yt-watch"),
+            MorningRow(key: "place:arch", status: "fail", area: "place", name: "Archive set"),
+            MorningRow(key: "backup:home", status: "warn", area: "backup", name: "Home mirror"),
+            MorningRow(key: "proj:app", status: "pass", area: "project", name: "App check"),
+        ]
+        let clusters = buildAttentionClusters(rows: rows)
+        XCTAssertEqual(clusters.map(\.id), ["disk", "job", "placement"])
+
+        let issues = filterAndSortRows(rows, filter: .issues)
+        XCTAssertEqual(issues.count, 4)
+        XCTAssertEqual(filterAndSortRows(rows, filter: .backups).map(\.key), ["backup:home"])
+        XCTAssertEqual(filterAndSortRows(rows, filter: .projects).map(\.key), ["proj:app"])
+
+        let groups = groupRowsByArea(issues)
+        XCTAssertEqual(groups.map(\.id), ["disk", "job", "place", "backup"])
+
+        // Capacity partitioning
+        let pools = [
+            CapacityPool(engine: "claude", pool: "5h", paused: true, unavailable: true),
+            CapacityPool(engine: "gemini", pool: "week", remainingPct: 94),
+            CapacityPool(engine: "gemini", pool: "5h", remainingPct: 77),
+        ]
+        let part = partitionCapacityPools(pools)
+        XCTAssertEqual(part.activeGroups.count, 1)
+        XCTAssertEqual(part.activeGroups.first?.pools.map { displayPoolName($0) }, ["5-hour", "Weekly"])
+        XCTAssertEqual(part.pausedPools.count, 1)
+
+        // Morning brief parsing
+        let brief = """
+        1. Top priorities today
+        - **Disk low**: clear caches on laptop.
+        - **Mirror blocked**: destination below floor.
+
+        2. Notes
+        Everything else nominal.
+        """
+        let sections = parseMorningBrief(brief)
+        XCTAssertEqual(sections.count, 2)
+        XCTAssertEqual(sections[0].title, "Top priorities today")
+        XCTAssertEqual(sections[0].bullets.first?.lead, "Disk low")
+        XCTAssertEqual(sections[0].bullets.first?.body, "clear caches on laptop.")
+
+        // GDrive breakdown & mirror state
+        let detail = GDriveDetail(total: 3, activeRuns: 1, okCount: 1, items: [
+            GDriveItem(name: "a", running: false, lastAttempt: nil, lastOK: 1, lastResult: "ok"),
+            GDriveItem(name: "b", running: true, lastAttempt: nil, lastOK: nil, lastResult: nil),
+            GDriveItem(name: "c", running: false, lastAttempt: nil, lastOK: nil, lastResult: "not mounted"),
+        ])
+        XCTAssertEqual(gdriveBreakdown(detail: detail, summary: nil), "1 OK · 1 running · 1 unmounted")
+        let mirror = cleanMirrorState("skipped: on battery")
+        XCTAssertTrue(mirror.isSkipped)
+        XCTAssertEqual(mirror.reason, "on battery")
+
+        // Interactive action helpers & snooze filtering
+        let snoozedRows = [
+            MorningRow(key: "job:hub:air", status: "fail", area: "job", name: "hub air.web-refresh", detail: "org.vendor.air.web-refresh; when every 3h; exit 1"),
+            MorningRow(key: "disk:laptop:internal", status: "fail", area: "disk", name: "laptop internal", value: "13.4 GB"),
+            MorningRow(key: "storage:hub:free", status: "fail", area: "disk", name: "hub free space", snoozedUntil: "2026-11-25T00:00:00Z"),
+            MorningRow(key: "place:arch", status: "fail", area: "place", name: "Archive", detail: "0 encrypted copy"),
+        ]
+        XCTAssertEqual(filterAndSortRows(snoozedRows, filter: .issues).count, 3)
+        XCTAssertEqual(filterAndSortRows(snoozedRows, filter: .failing).count, 3)
+        XCTAssertEqual(filterAndSortRows(snoozedRows, filter: .snoozed).map(\.key), ["storage:hub:free"])
+        XCTAssertFalse(buildAttentionClusters(rows: snoozedRows).map(\.summary).joined(separator: " ").contains("hub free"))
+
+        let jt = extractJobTarget(from: snoozedRows[0])
+        XCTAssertEqual(jt?.host, "hub")
+        XCTAssertEqual(jt?.label, "org.vendor.air.web-refresh")
+
+        let recDisk = recommendedHostAction(for: snoozedRows[1], actionHosts: ["hub", "primary"], knownHostIDs: ["hub", "primary", "laptop"])
+        XCTAssertNil(recDisk)
+
+        let recAllowedDisk = recommendedHostAction(for: snoozedRows[2], actionHosts: ["hub", "primary"], knownHostIDs: ["hub", "primary", "laptop"])
+        XCTAssertEqual(recAllowedDisk?.host, "hub")
+        XCTAssertEqual(recAllowedDisk?.kind, "free-space-guard")
+
+        let recPlace = recommendedHostAction(for: snoozedRows[3], actionHosts: ["hub", "primary"])
+        XCTAssertEqual(recPlace?.host, "hub")
+        XCTAssertEqual(recPlace?.kind, "placement-check")
+
+        XCTAssertTrue(suggestedFixPrompt(for: snoozedRows[0]).contains("org.vendor.air.web-refresh"))
     }
 }
 

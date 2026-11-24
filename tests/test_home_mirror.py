@@ -204,3 +204,27 @@ class BackupScheduling(unittest.TestCase):
         self.assertFalse(M.priority_busy(CFG,run=lambda *a,**kw: self.fail('unexpected call')))
         self.assertTrue(M.priority_busy(cfg,run=lambda *a,**kw: SimpleNamespace(returncode=75)))
         self.assertFalse(M.priority_busy(cfg,run=lambda *a,**kw: SimpleNamespace(returncode=0)))
+
+
+class HubTrigger(unittest.TestCase):
+    def test_unreachable_peer_exits_zero_and_skips_run(self):
+        import io
+        buf, calls = io.StringIO(), []
+        def run(args, **kw):
+            calls.append(args)
+            return SimpleNamespace(returncode=255, stdout="", stderr="ssh: connect timed out")
+        rc = M.hub_trigger("peer-host", run=run, out=buf)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("unreachable", buf.getvalue())
+
+    def test_reachable_peer_runs_remote_home_mirror_and_propagates_exit_code(self):
+        for remote_rc in (0, 1):
+            calls = []
+            def run(args, **kw):
+                calls.append(args)
+                return SimpleNamespace(returncode=0 if args[-1] == "true" else remote_rc, stdout="", stderr="")
+            rc = M.hub_trigger("peer-host", run=run)
+            self.assertEqual(rc, remote_rc)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(calls[1][-1], '"$HOME/.local/bin/home-mirror" run')

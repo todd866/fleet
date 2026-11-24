@@ -61,15 +61,50 @@ pub fn build_line(
     ppid: i64,
 ) -> String {
     let command = command_of(value);
-    let tool = value.get("tool_name").and_then(|t| t.as_str()).unwrap_or(if value.get("command").is_some() { "shell" } else { "" });
-    let session = ["session_id", "conversation_id", "thread_id"]
-        .iter()
-        .find_map(|k| value.get(*k).and_then(|s| s.as_str()))
-        .unwrap_or("");
-    let cwd = value.get("cwd").and_then(|c| c.as_str()).unwrap_or("");
-    let target = value
+    let input = value
         .get("tool_input")
-        .and_then(|i| i.get("file_path").or_else(|| i.get("notebook_path")).or_else(|| i.get("path")))
+        .or_else(|| value.get("toolCall").and_then(|tc| tc.get("args")));
+    let tool = value
+        .get("tool_name")
+        .and_then(|t| t.as_str())
+        .or_else(|| value.get("toolCall").and_then(|tc| tc.get("name")).and_then(|t| t.as_str()))
+        .unwrap_or(if value.get("command").is_some() { "shell" } else { "" });
+    let session = [
+        "session_id",
+        "conversation_id",
+        "thread_id",
+        "conversationId",
+        "trajectory_id",
+        "trajectoryId",
+        "execution_id",
+    ]
+    .iter()
+    .find_map(|k| value.get(*k).and_then(|s| s.as_str()))
+    .unwrap_or("");
+    let cwd = value
+        .get("cwd")
+        .and_then(|c| c.as_str())
+        .filter(|s| !s.is_empty())
+        .or_else(|| input.and_then(|i| i.get("Cwd")).and_then(|c| c.as_str()).filter(|s| !s.is_empty()))
+        .or_else(|| {
+            value
+                .get("workspacePaths")
+                .and_then(|w| w.as_array())
+                .and_then(|a| a.first())
+                .and_then(|c| c.as_str())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or("");
+    let target = input
+        .and_then(|i| {
+            i.get("file_path")
+                .or_else(|| i.get("notebook_path"))
+                .or_else(|| i.get("TargetFile"))
+                .or_else(|| i.get("Path"))
+                .or_else(|| i.get("path"))
+                .or_else(|| i.get("AbsolutePath"))
+                .or_else(|| i.get("SearchPath"))
+        })
         .and_then(|p| p.as_str())
         .unwrap_or("");
     let mut row = json!({
@@ -110,7 +145,8 @@ fn command_of(value: &Value) -> String {
     }
     value
         .get("tool_input")
-        .and_then(|t| t.get("command"))
+        .or_else(|| value.get("toolCall").and_then(|tc| tc.get("args")))
+        .and_then(|t| t.get("command").or_else(|| t.get("CommandLine")))
         .and_then(|c| c.as_str())
         .unwrap_or("")
         .to_string()
