@@ -7,6 +7,8 @@ import tempfile
 import subprocess
 import sys
 import unittest
+from unittest import mock
+from concurrent.futures import ThreadPoolExecutor
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -86,7 +88,7 @@ class TripwireTest(unittest.TestCase):
         for target, content in originals.items():
             self.assertEqual(target.read_text(), content)
         incident = self.incidents()[0].parent
-        (incident / "report.md").write_text("VERDICT: BENIGN\n")
+        (incident / "report.md").write_text("VERDICT: BENIGN\nFixture approval confirmed.\n")
         self.assertEqual(self.tw.release(incident.name, self.config), 0)
         for target in originals:
             self.assertEqual(target.read_text(), f"new settings for {target.parent.name}")
@@ -124,6 +126,88 @@ printf '%s\\n' "$TEST_REPORT"
         self.assertNotIn("stranger", self.keys.read_text())
         self.check(now=1600)
         self.assertIn("stranger", self.keys.read_text())
+
+    def test_no_hold_failed_attempts_get_one_fallback_and_a_local_report(self):
+        self.config["summon_fallback"] = ["/bin/echo", "fallback"]
+        self.check()
+        self.keys.write_text("change")
+        self.check(now=1010)
+        incident = self.incidents()[0].parent
+        (incident / "primary-result.json").write_text('{"gemini":"provider exited 1"}')
+        with ThreadPoolExecutor(2) as pool:
+            list(pool.map(lambda _: self.check(now=1011), range(2)))
+        self.assertEqual(len(self.spawn.calls), 2)
+        (incident / "fallback-result.json").write_text('{"zai":"provider HTTP 429"}')
+        self.check(now=1012)
+        report = (incident / "report.md").read_text()
+        self.assertEqual(self.tw.reports.verdict(report), self.tw.reports.NEEDS_REVIEW)
+        self.assertIn("observed_at_review", report)
+        self.assertIn("provider HTTP 429", report)
+        n = len(self.runner.calls)
+        self.check(now=1100)
+        self.assertEqual(len(self.runner.calls), n)
+        self.assertEqual(len(self.spawn.calls), 2)
+
+    def test_partial_verdict_at_deadline_cannot_release_the_file_or_extend_the_hold(self):
+        self.config.update(hold_timeout_min=1, summon_fallback=["/bin/echo", "fallback"])
+        incident = self.hold_keys()
+        (incident / "report.md").write_text("VERDICT: BENIGN\n")
+        (incident / "primary-result.json").write_text("{}")
+        self.assertEqual(self.tw.release(incident.name, self.config), 1)
+        self.check(now=1360)
+        self.assertEqual(len(self.spawn.calls), 1)
+        self.assertEqual(self.tw.reports.saved_verdict(incident), self.tw.reports.NEEDS_REVIEW)
+        preserved, = incident.glob("report.incomplete-*.md")
+        self.assertEqual(preserved.read_text(), "VERDICT: BENIGN\n")
+        self.assertNotIn("stranger", self.keys.read_text())
+
+    def test_hostile_report_stays_held_past_deadline_and_late_escalation_is_reported(self):
+        self.config.update(hold_timeout_min=1)
+        incident = self.hold_keys()
+        self.check(now=1360)
+        self.tw.reports.publish(incident, "VERDICT: HOSTILE\nConfirmed by the reviewer.")
+        self.check(now=1500)
+        self.assertEqual((incident / "verdict.seen").read_text().strip(), "VERDICT: HOSTILE")
+        self.assertNotIn("stranger", self.keys.read_text())
+        self.assertTrue(list(incident.glob("report.local-*.md")))
+        self.assertEqual(self.tw.reports.publish(incident, "VERDICT: BENIGN\nLate reply."), "VERDICT: HOSTILE")
+        self.assertEqual(self.tw.release(incident.name, self.config), 1)
+
+    def test_concurrent_incidents_get_distinct_evidence_directories(self):
+        changes = [{"wire": "test", "what": "test", "before": None, "after": "run"}]
+        with ThreadPoolExecutor(2) as pool:
+            results = list(pool.map(lambda _: self.tw.raise_incident({}, changes, 1000, "fixture",
+                                do_summon=False, runner=self.runner), range(2)))
+        self.assertNotEqual(results[0], results[1])
+        self.assertEqual(len(self.incidents()), 2)
+
+    def test_text_provider_route_is_bounded_and_never_auto_clears_metadata_only_incidents(self):
+        loader = importlib.machinery.SourceFileLoader("investigator", str(ROOT / "bin/tripwire-investigate"))
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader("investigator", loader))
+        loader.exec_module(module)
+        record = {"changes": [{"wire": "files", "what": "private-fixture", "before": "private-before",
+                              "after": "private-after", "other": "private-extra"}] * 100}
+        reply = {"stop_reason": "end_turn", "content": [{"type": "text", "text": "VERDICT: BENIGN\nOrdinary change."}]}
+        response = subprocess.CompletedProcess([], 0, stdout=json.dumps(reply) + "\n200")
+        with mock.patch.object(module.subprocess, "run", return_value=response) as send:
+            report, status = module.text_review("deepseek", record, 3)
+            self.assertEqual(status, "complete")
+            self.assertEqual(module.reports.verdict(report), module.reports.NEEDS_REVIEW)
+            command, = send.call_args.args
+            payload = json.loads(send.call_args.kwargs["input"])
+            self.assertEqual(command[-1], "http://127.0.0.1:8797/v1/messages")
+            self.assertIn("--max-filesize", command)
+            self.assertNotIn("--location", command)
+            self.assertNotIn("tools", payload)
+            self.assertNotIn("private-", send.call_args.kwargs["input"])
+            self.assertEqual(len(json.loads(payload["messages"][0]["content"])["observations"]), 48)
+            self.assertEqual(payload["model"], "deepseek-flash")
+            record = {"changes": [module.DRILL_CHANGE]}
+            self.assertEqual(module.reports.verdict(module.text_review("zai", record, 3)[0]), module.reports.NEEDS_REVIEW)
+            record["source"] = "tripwire test CLI"
+            self.assertEqual(module.reports.verdict(module.text_review("zai", record, 3)[0]), module.reports.BENIGN)
+            send.return_value = subprocess.CompletedProcess([], 0, stdout="unavailable\n429")
+            self.assertEqual(module.text_review("zai", record, 3), (None, "provider HTTP 429"))
 
     def test_first_run_records_and_raises_nothing(self):
         self.check()
@@ -283,7 +367,7 @@ printf '%s\\n' "$TEST_REPORT"
     def test_release_leaves_a_file_that_changed_again_while_held(self):
         incident = self.hold_keys()
         self.keys.write_text("someone edited it meanwhile\n")
-        (incident / "report.md").write_text("VERDICT: BENIGN\n")
+        (incident / "report.md").write_text("VERDICT: BENIGN\nFixture approval confirmed.\n")
         self.tw.release(incident.name, self.config)
         self.assertEqual(self.keys.read_text(), "someone edited it meanwhile\n")
 
@@ -392,7 +476,7 @@ printf '%s\\n' "$TEST_REPORT"
         self.check(now=1300.0, kill=lambda pid, sig: sent.append((pid, sig)))
         incident = self.incidents()[0].parent
         self.assertEqual(sent, [(child.pid, signal.SIGSTOP)])
-        (incident / "report.md").write_text("VERDICT: BENIGN\n")
+        (incident / "report.md").write_text("VERDICT: BENIGN\nFixture approval confirmed.\n")
         self.tw.release(incident.name, self.config, kill=lambda pid, sig: sent.append((pid, sig)))
         self.assertEqual(sent[-1], (child.pid, signal.SIGCONT))
 
@@ -402,7 +486,18 @@ printf '%s\\n' "$TEST_REPORT"
         self.config["launchd_dirs"] = [str(agents)]
         self.wires = {"launchd": self.tw.wire_launchd}
         calls = []
-        self.tw.launchctl = lambda args: calls.append(args) or 0
+        loaded = True
+        def launchctl(args):
+            nonlocal loaded
+            calls.append(args)
+            if args[0] == "print":
+                return 0 if loaded else 1
+            if args[0] == "bootout":
+                loaded = False
+            if args[0] == "bootstrap":
+                loaded = True
+            return 0
+        self.tw.launchctl = launchctl
         self.check()
         (agents / "com.example.stranger.plist").write_text(
             '<?xml version="1.0"?><plist version="1.0"><dict><key>Label</key><string>com.example.stranger</string></dict></plist>')
@@ -411,9 +506,63 @@ printf '%s\\n' "$TEST_REPORT"
         incident = self.incidents()[0].parent
         self.assertEqual([c[0] for c in calls], ["print", "disable", "bootout"])
         self.assertTrue(all(c[1].endswith("/com.example.stranger") for c in calls))
-        (incident / "report.md").write_text("VERDICT: BENIGN\n")
+        (incident / "report.md").write_text("VERDICT: BENIGN\nFixture approval confirmed.\n")
         self.tw.release(incident.name, self.config)
-        self.assertEqual([c[0] for c in calls[3:]], ["enable", "bootstrap"])
+        self.assertEqual([c[0] for c in calls[3:]], ["enable", "print", "bootstrap", "print"])
+
+    def test_failed_job_restoration_retains_only_unrestored_holds_and_bounds_retries(self):
+        incident = self.state / "incidents" / "fixture"
+        incident.mkdir(parents=True)
+        jobs = [{"kind": "job", "label": label, "was_loaded": True, "plist": str(self.keys)}
+                for label in ("recovering", "offline")]
+        record = {"host": "fixture", "raised_epoch": 100, "changes": [], "holds": jobs, "stdout_report": True}
+        self.tw.write_json(incident / "incident.json", record)
+        report = incident / "report.md"
+        report.write_text("VERDICT: BENIGN\nConfirmed cause in the fixture.")
+        loaded = {"recovering"}
+        bootstraps = []
+        def launch(args):
+            if args[0] == "print":
+                return 0 if args[1].rsplit("/", 1)[-1] in loaded else 1
+            if args[0] == "bootstrap":
+                bootstraps.append(args)
+                return 1
+            return 0
+        self.tw.launchctl = launch
+        for i in range(5):
+            self.check(now=1000+i)
+        record = json.loads((incident / "incident.json").read_text())
+        self.assertEqual([h["label"] for h in record["holds"]], ["offline"])
+        self.assertEqual(record["restore_attempts"], 3)
+        self.assertEqual(len(bootstraps), 3)
+        self.assertNotIn("released", record)
+        self.assertTrue(record["restore_notified"])
+        loaded.add("offline")
+        self.assertEqual(self.tw.release(incident.name, self.config, owner=True), 0)
+        self.assertIn("released", json.loads((incident / "incident.json").read_text()))
+        self.assertEqual(len(bootstraps), 3)
+
+    def test_timeout_keeps_failed_operational_restoration_separate_from_file_holds(self):
+        incident = self.hold_keys()
+        path = incident / "incident.json"
+        record = json.loads(path.read_text())
+        record["holds"].append({"kind": "job", "label": "job", "was_loaded": False, "plist": str(self.keys)})
+        self.tw.write_json(path, record)
+        self.tw.launchctl = lambda _: 1
+        self.check(now=4900)
+        self.assertNotIn("released", json.loads(path.read_text()))
+        self.assertEqual({h["kind"] for h in json.loads(path.read_text())["holds"]}, {"job", "file"})
+        self.tw.launchctl = lambda _: 0
+        self.check(now=5000)
+        self.assertEqual([h["kind"] for h in json.loads(path.read_text())["holds"]], ["file"])
+        self.assertNotIn("stranger", self.keys.read_text())
+
+    def test_primary_reserves_time_for_a_configured_fallback(self):
+        self.config.update(hold_timeout_min=2, summon_fallback=["/bin/echo"])
+        with mock.patch.object(self.tw, "start_review") as start:
+            self.hold_keys()
+        self.assertEqual(start.call_args.args[1], "primary")
+        self.assertEqual(start.call_args.args[6], 60)
 
     def test_non_benign_verdict_reaches_the_owner_once(self):
         incident = self.state / "incidents" / "20261114T000000Z-files"

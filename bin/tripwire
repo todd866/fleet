@@ -43,6 +43,9 @@ import subprocess
 import sys
 import time
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import tripwire_report as reports
+
 HOME = pathlib.Path(os.environ.get("HOME", "~")).expanduser()
 STATE = pathlib.Path(os.environ.get("TRIPWIRE_STATE", HOME / ".local/state/fleet/tripwire"))
 CONFIG = pathlib.Path(os.environ.get("TRIPWIRE_CONFIG", HOME / ".config/fleet/tripwire.json"))
@@ -60,6 +63,7 @@ DEFAULT_MUST_CONTAIN = [
 ]
 LAUNCHD_DIRS = ["~/Library/LaunchAgents", "/Library/LaunchAgents", "/Library/LaunchDaemons"]
 DEFAULT_SUMMON = ["tripwire-investigate"]
+MAX_RESTORE_ATTEMPTS = 3
 
 HOLD_FILES = ["~/.ssh/authorized_keys"]
 NEVER_PAUSE = ["sshd", "launchd"]
@@ -373,34 +377,59 @@ def apply_holds(config, found, incident, kill=os.kill):
     return holds
 
 
-def undo_holds(holds, kill=os.kill):
-    notes = []
-    for hold in holds:
+def restore_holds(record, selected, kill):
+    """Record just the outstanding holds; retrying must not repeat successful operations."""
+    if not selected:
+        return []
+    notes = record.setdefault("release_notes", [])
+    record.setdefault("original_holds", list(record.get("holds", [])))
+    pending = []
+    for hold in selected:
         try:
             if hold["kind"] == "process":
-                if process_start(hold["pid"]) == hold["started"]:
+                started = process_start(hold["pid"])
+                if started == hold["started"] and started:
                     kill(hold["pid"], signal.SIGCONT)
-                    notes.append(f"continued {hold['program']} (pid {hold['pid']})")
+                    note = f"continued {hold['program']} (pid {hold['pid']})"
+                elif started or agent_is_gone(hold["pid"], hold["started"]):
+                    note = f"{hold['program']} (pid {hold['pid']}) is gone"
                 else:
-                    notes.append(f"{hold['program']} (pid {hold['pid']}) is gone")
+                    raise OSError("cannot confirm the stopped process identity")
             elif hold["kind"] == "job":
                 target = f"gui/{os.getuid()}/{hold['label']}"
-                launchctl(["enable", target])
-                if hold["was_loaded"] and pathlib.Path(hold["plist"]).exists():
-                    launchctl(["bootstrap", f"gui/{os.getuid()}", hold["plist"]])
-                notes.append(f"enabled {hold['label']}" + (" and loaded it" if hold["was_loaded"] else ""))
+                if launchctl(["enable", target]) != 0:
+                    raise OSError(f"launchctl could not enable {hold['label']}")
+                note = f"enabled {hold['label']}"
+                if hold["was_loaded"]:
+                    if not pathlib.Path(hold["plist"]).exists():
+                        raise OSError(f"missing plist for {hold['label']}")
+                    # Bootstrapping an already running job is rejected. Read it
+                    # first so retries after partial or external recovery are safe.
+                    if launchctl(["print", target]) != 0:
+                        launchctl(["bootstrap", f"gui/{os.getuid()}", hold["plist"]])
+                        if launchctl(["print", target]) != 0:
+                            raise OSError(f"launchctl could not restore {hold['label']}")
+                    note += " and confirmed loaded"
             elif hold["kind"] == "file":
                 target = expand(hold["path"])
                 if not hold["held"]:
-                    notes.append(f"{hold['path']} had been removed; the earlier version stays")
+                    note = f"{hold['path']} had been removed; the earlier version stays"
                 elif fingerprint(target) != hold["put_back"]:
-                    notes.append(f"{hold['path']} changed again while held; left as it is")
+                    note = f"{hold['path']} changed again while held; left as it is"
                 else:
                     put(target, pathlib.Path(hold["held"]).read_bytes(), target.stat().st_mode & 0o777)
-                    notes.append(f"put the changed {hold['path']} back")
+                    note = f"put the changed {hold['path']} back"
+            else:
+                continue
         except OSError as exc:
-            notes.append(f"could not undo {hold.get('kind')}: {exc}")
-    return notes
+            pending.append(hold)
+            note = f"could not undo {hold.get('kind')}: {exc}"
+        if note not in notes:
+            notes.append(note)
+    record["holds"] = [h for h in record.get("holds", []) if h not in selected] + pending
+    record["restore_attempts"] = record.get("restore_attempts", 0) + 1
+    record["restore_failed"] = bool(pending)
+    return pending
 
 
 def refresh_file_wires(config):
@@ -424,19 +453,20 @@ def release(name, config=None, owner=False, kill=os.kill):
     if record.get("released") or not record.get("holds"):
         print("tripwire: nothing held")
         return 0
-    try:
-        first = (incident / "report.md").read_text(errors="replace").splitlines()[0].strip()
-    except (OSError, IndexError):
-        first = ""
-    if not owner and first != "VERDICT: BENIGN":
+    if not owner and reports.saved_verdict(incident) != reports.BENIGN:
         print("tripwire: not released. It needs a report whose first line is `VERDICT: BENIGN`, "
               "or the owner's `--owner`.")
         return 1
-    record["release_notes"] = undo_holds(record["holds"], kill=kill)
-    record["released"] = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + (" (owner or timeout)" if owner else "")
+    selected = list(record["holds"])
+    pending = restore_holds(record, selected, kill)
+    if not pending:
+        record["released"] = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + (" (owner)" if owner else "")
     write_json(incident / "incident.json", record)
-    if any(hold["kind"] == "file" for hold in record["holds"]):
+    if any(hold["kind"] == "file" and hold not in pending for hold in selected):
         refresh_file_wires(config)
+    if pending:
+        print(f"tripwire: {len(pending)} hold(s) still require restoration: " + "; ".join(record["release_notes"]))
+        return 1
     print("tripwire: released: " + "; ".join(record["release_notes"]))
     return 0
 
@@ -457,51 +487,83 @@ def agent_is_gone(pid, started):
     return now_started is not None and now_started != started
 
 
-def release_stale(config, now, kill=os.kill, spawn=subprocess.Popen, **hooks):
-    """A hold whose agent never reported: after hold_timeout_min a stopped process or job goes on
-    again (that hold costs work), a file that grants access or wires in a guard stays put back
-    (that hold costs nothing), and the owner is told either way."""
+def start_review(argv, attempt, incident, brief, record, now, remaining, spawn):
+    command = [part.replace("{brief}", brief).replace("{incident}", str(incident)) for part in argv]
+    env = dict(os.environ, TRIPWIRE_ATTEMPT=attempt)
+    if remaining > 0:
+        env["TRIPWIRE_REVIEW_SECONDS"] = str(remaining)
+    with open(incident / "agent.log", "ab") as log:
+        agent = spawn(command, cwd=str(incident), env=env, stdin=subprocess.DEVNULL,
+                      stdout=log, stderr=log, start_new_session=True)
+    pid = getattr(agent, "pid", None)
+    record["agent_pid"] = pid
+    record["agent_started"] = process_start(pid) if pid else None
+    record["stdout_report"] = pathlib.Path(command[0]).name == "tripwire-investigate"
+    write_json(STATE / "summons.json", summons_today(now) + [now])
+
+
+def release_stale(config, now, current, kill=os.kill, spawn=subprocess.Popen, **hooks):
+    """Finish pending investigations, including incidents without a hold."""
     limit = float(config.get("hold_timeout_min", 60)) * 60
     for path in sorted((STATE / "incidents").glob("*/incident.json")):
+        incident = path.parent
         record = read_json(path, {})
-        if not (record.get("holds") and not record.get("released") and not record.get("timed_out")
-                and not (path.parent / "report.md").exists()):
+        if not record:
             continue
+        # Preserve historical reports already reviewed by the owner or acted upon.
+        holds = record.get("holds", [])
+        retry_restore = (record.get("restore_failed") and record.get("restore_attempts", 0) < MAX_RESTORE_ATTEMPTS
+                         and any(h["kind"] in ("process", "job") for h in holds))
+        report = incident / "report.md"
+        if (not retry_restore and report.exists() and (incident / "verdict.seen").exists()
+                and (not holds or record.get("released") or record.get("timed_out"))):
+            continue
+        verdict = reports.saved_verdict(incident)
+        if verdict in reports.PROVIDER_VERDICTS or (verdict == reports.NEEDS_REVIEW and record.get("timed_out") and not retry_restore):
+            continue
+
         age = now - record.get("raised_epoch", now)
-        # An agent that has exited without a report (out of allowance, crashed) is not coming back:
-        # try the fallback command once, and failing that do not wait out the hour.
-        died = age > 60 and agent_is_gone(record.get("agent_pid"), record.get("agent_started"))
-        if died and config.get("summon_fallback") and not record.get("fallback_tried"):
-            record["fallback_tried"] = True
-            try:
-                brief = (path.parent / "brief.md").read_text()
-                command = [part.replace("{brief}", brief).replace("{incident}", str(path.parent))
-                           for part in config["summon_fallback"]]
-                with open(path.parent / "agent.log", "ab") as log:
-                    agent = spawn(command, cwd=str(path.parent), stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                                  start_new_session=True)
-                pid = getattr(agent, "pid", None)
-                started = process_start(pid) if pid else None
-                record["agent_pid"], record["agent_started"] = (pid, started) if started else (None, None)
-                record["stdout_report"] = pathlib.Path(command[0]).name == "tripwire-investigate"
-                record["agent"] = "first agent exited without a report; fallback agent summoned"
-                write_json(path, record)
-                continue
-            except OSError:
-                pass
-        if not (died or (limit and age > limit)):
+        expired = limit > 0 and age >= limit
+        attempt = "fallback" if record.get("fallback_tried") else "primary"
+        finished = (incident / f"{attempt}-result.json").is_file()
+        died = finished or (age >= 60 and agent_is_gone(record.get("agent_pid"), record.get("agent_started")))
+        skipped = str(record.get("agent", "")).startswith("not summoned")
+        if not (died or expired or skipped or record.get("timed_out") or verdict == reports.NEEDS_REVIEW):
             continue
-        why = "the agent exited without a report" if died else f"no report after {limit / 60:.0f} min"
-        files = [hold for hold in record["holds"] if hold["kind"] == "file"]
-        record["release_notes"] = undo_holds([h for h in record["holds"] if h["kind"] != "file"], kill=kill)
-        record["holds"], record["timed_out"] = files, True
-        if not files:
-            record["released"] = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now)) + " (timeout)"
-        write_json(path, record)
-        kept = (f" {len(files)} file(s) stay put back: `tripwire release {path.parent.name} --owner`."
-                if files else "")
-        notify(config, f"{record.get('host')}: {why} on {path.parent.name}; "
-                       f"the hold was undone for what was running.{kept} Look at it.", **hooks)
+
+        reason = ("provider requested owner review" if verdict == reports.NEEDS_REVIEW else
+                  "the agent exited without a report" if died else
+                  str(record["agent"]) if skipped else f"no complete report after {limit / 60:g} min")
+        fallback = config.get("summon_fallback")
+        if (died and fallback and not expired and not record.get("fallback_tried")
+                and verdict is None and not record.get("timed_out")):
+            record["fallback_tried"] = True
+            write_json(path, record)
+            if len(summons_today(now)) < int(config.get("max_summons_per_day", 4)):
+                try:
+                    start_review(fallback, "fallback", incident, (incident / "brief.md").read_text(),
+                                 record, now, limit - age, spawn)
+                    record["agent"] = "first agent exited without a report; fallback agent summoned"
+                    write_json(path, record)
+                    continue
+                except OSError as exc:
+                    reason += f"; fallback could not start ({exc.strerror})"
+            else:
+                reason += "; daily agent limit reached"
+
+        with reports.locked(incident, "report.lock"):
+            verdict = reports.publish_locked(incident, reports.local_report(incident, record, reason, current))
+            if verdict != reports.NEEDS_REVIEW:
+                continue  # A provider won publication. Its own verdict governs these holds.
+            if not record.get("timed_out") or retry_restore:
+                if holds and not record.get("released"):
+                    operational = [h for h in holds if h["kind"] != "file"]
+                    restore_holds(record, operational, kill)
+                    if not record["holds"]:
+                        record["released"] = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now)) + " (timeout)"
+                record["timed_out"] = True
+            record["local_review_reason"] = reason
+            write_json(path, record)
 
 
 def notify(config, text, runner=subprocess.run):
@@ -527,8 +589,13 @@ def summon(config, incident, host, now, found=(), record=None, spawn=subprocess.
     if len(recent) >= int(config.get("max_summons_per_day", 4)):
         return "not summoned: daily limit reached"
     argv = config.get("summon", DEFAULT_SUMMON)
+    attempt = "primary"
     if not argv or not shutil.which(argv[0]):
-        return "not summoned: no agent command on this Mac"
+        argv = config.get("summon_fallback")
+        if not argv or not shutil.which(argv[0]):
+            return "not summoned: no agent command on this Mac"
+        attempt = "fallback"
+        record["fallback_tried"] = True
     mail_to = config.get("mail_to")
     record["stdout_report"] = pathlib.Path(argv[0]).name == "tripwire-investigate"
     holds = apply_holds(config, found, incident, kill=kill)
@@ -541,29 +608,36 @@ def summon(config, incident, host, now, found=(), record=None, spawn=subprocess.
                    if mail_to else ""),
         mail_note=" and that one mail" if mail_to else "")
     (incident / "brief.md").write_text(brief)
-    command = [part.replace("{brief}", brief).replace("{incident}", str(incident)) for part in argv]
     try:
-        with open(incident / "agent.log", "ab") as log:
-            agent = spawn(command, cwd=str(incident), stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                          start_new_session=True)
-        pid = getattr(agent, "pid", None)
-        started = process_start(pid) if pid else None
-        if started:  # without a start time the pid cannot be told from a later process: leave it to the timeout
-            record["agent_pid"], record["agent_started"] = pid, started
+        allowance = float(config.get("hold_timeout_min", 60)) * 60
+        if attempt == "primary" and config.get("summon_fallback"):
+            allowance /= 2
+        start_review(argv, attempt, incident, brief, record, now, allowance, spawn)
     except OSError as exc:
         if holds:  # nobody is coming to look, so do not leave it paused
-            record["release_notes"] = undo_holds(holds, kill=kill)
-            record["released"] = "at once: no agent"
+            if not restore_holds(record, holds, kill):
+                record["released"] = "at once: no agent"
         return f"not summoned: {exc}"
-    write_json(STATE / "summons.json", recent + [now])
-    return "agent summoned" + (f", {len(holds)} thing(s) held" if holds else "")
+    return ("fallback agent summoned" if attempt == "fallback" else "agent summoned") + (f", {len(holds)} thing(s) held" if holds else "")
 
 
-def raise_incident(config, found, now, host, do_summon=True, **hooks):
+def raise_incident(config, found, now, host, do_summon=True, drill=False, **hooks):
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now))
-    incident = STATE / "incidents" / f"{stamp}-{found[0]['wire']}"
-    incident.mkdir(parents=True, exist_ok=True)
+    root = STATE / "incidents"
+    root.mkdir(parents=True, exist_ok=True)
+    stem = f"{stamp}-{found[0]['wire']}"
+    incident = root / stem
+    suffix = 1
+    while True:
+        try:
+            incident.mkdir()
+            break
+        except FileExistsError:
+            suffix += 1
+            incident = root / f"{stem}-{suffix}"
     record = {"host": host, "raised": stamp, "raised_epoch": now, "changes": found}
+    if drill:
+        record["source"] = "tripwire test CLI"
     write_json(incident / "incident.json", record)
     record["agent"] = (summon(config, incident, host, now, found, record,
                               **{k: v for k, v in hooks.items() if k in ("spawn", "kill")})
@@ -579,32 +653,49 @@ def read_verdicts(config, kill=os.kill, **hooks):
     """An agent's report with a verdict other than BENIGN is pushed to the owner, once."""
     for report in sorted((STATE / "incidents").glob("*/report.md")):
         flag = report.parent / "verdict.seen"
-        if flag.exists():
+        first = reports.saved_verdict(report.parent)
+        if first is None:
             continue
-        try:
-            first = report.read_text(errors="replace").splitlines()[0].strip()
-        except (OSError, IndexError):
-            continue
-        if first == "VERDICT: BENIGN":
-            record = read_json(report.parent / "incident.json", {})
-            if record.get("stdout_report") and record.get("holds") and not record.get("released"):
+        seen = flag.read_text(errors="replace").strip() if flag.exists() else None
+        record = read_json(report.parent / "incident.json", {})
+        retry_restore = record.get("restore_failed") and record.get("restore_attempts", 0) < MAX_RESTORE_ATTEMPTS
+        if first == reports.BENIGN:
+            if (seen != first or retry_restore) and record.get("stdout_report") and record.get("holds") and not record.get("released") and not record.get("timed_out"):
                 release(report.parent.name, config, kill=kill)
+                record = read_json(report.parent / "incident.json", {})
+        elif first != seen:
+            detail = ""
+            if first == reports.NEEDS_REVIEW:
+                detail = " " + str(record.get("local_review_reason") or "")
+                files = sum(h.get("kind") == "file" for h in record.get("holds", []))
+                if files and not record.get("released"):
+                    detail += f". {files} file(s) stay put back."
+            notify(config, f"{host_name(config)}: {first}.{detail} — {report}", **hooks)
+        if (record.get("restore_failed") and record.get("restore_attempts", 0) >= MAX_RESTORE_ATTEMPTS
+                and not record.get("restore_notified")):
+            notify(config, f"{host_name(config)}: restoration still failed for {report.parent.name}; "
+                           f"remaining holds and errors are in {report.parent / 'incident.json'}", **hooks)
+            record["restore_notified"] = True
+            write_json(report.parent / "incident.json", record)
+        if seen == first:
+            continue
         flag.write_text(first + "\n")
-        if first != "VERDICT: BENIGN":
-            notify(config, f"{host_name(config)}: {first or 'report has no verdict'} — {report}", **hooks)
 
 
-def check(config=None, now=None, host=None, wires=WIRES, **hooks):
+def check(*args, **kwargs):
+    with reports.locked(STATE, "check.lock"):
+        return _check(*args, **kwargs)
+
+
+def _check(config=None, now=None, host=None, wires=WIRES, **hooks):
     config = load_config() if config is None else config
     now = time.time() if now is None else now
     host = host or host_name(config)
     baseline = read_json(STATE / "baseline.json", None)
     current = snapshot(config, wires)
     if baseline is None:
-        write_json(STATE / "baseline.json", {k: v for k, v in current.items() if v is not None})
-        keep_copies(config)
         print("tripwire: baseline recorded, nothing compared")
-        return 0
+        baseline = {}
     registered = registered_labels(config)
     found = []
     for name, after in current.items():
@@ -622,8 +713,7 @@ def check(config=None, now=None, host=None, wires=WIRES, **hooks):
         if any(hold["kind"] == "file" for hold in record.get("holds", [])) and not record.get("released"):
             refresh_file_wires(config)  # a file just put back is what the baseline must describe
     keep_copies(config)
-    told = {k: v for k, v in hooks.items() if k == "runner"}
-    release_stale(config, now, **{k: v for k, v in hooks.items() if k in ("runner", "kill", "spawn")})
+    release_stale(config, now, current, **{k: v for k, v in hooks.items() if k in ("runner", "kill", "spawn")})
     read_verdicts(config, **{k: v for k, v in hooks.items() if k in ("runner", "kill")})
     return 0
 
@@ -643,8 +733,9 @@ def status():
         record = read_json(path, {})
         verdict = (path.parent / "verdict.seen")
         word = verdict.read_text().strip() if verdict.exists() else record.get("agent", "?")
-        held = ("" if not record.get("holds") else
-                f"  released {record['released']}" if record.get("released") else "  HELD")
+        held = (f"  released {record['released']}" if record.get("released") else
+                "  RESTORATION FAILED" if record.get("restore_failed") else
+                "  HELD" if record.get("holds") else "")
         print(f"  {path.parent.name}  {len(record.get('changes', []))} change(s)  {word}{held}")
     return 0
 
@@ -655,6 +746,14 @@ def main(argv):
         return check()
     if command == "status":
         return status()
+    if command in {"accept", "release", "test"}:
+        with reports.locked(STATE, "check.lock"):
+            return change_state(command, argv)
+    print(__doc__)
+    return 2
+
+
+def change_state(command, argv):
     if command == "accept":
         write_json(STATE / "baseline.json", {k: v for k, v in snapshot(load_config()).items() if v is not None})
         keep_copies(load_config())
@@ -665,7 +764,7 @@ def main(argv):
     if command == "test":
         found = [{"wire": "test", "what": "tripwire test", "before": None, "after": "raised by hand"}]
         config = load_config()
-        print(raise_incident(config, found, time.time(), host_name(config), do_summon="--summon" in argv))
+        print(raise_incident(config, found, time.time(), host_name(config), do_summon="--summon" in argv, drill=True))
         return 0
     print(__doc__)
     return 2

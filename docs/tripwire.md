@@ -17,8 +17,9 @@ one changes it starts an agent to find out why.
 The first `tripwire check` records a baseline and raises nothing. After that a change raises
 once, and the baseline moves on. An incident is a folder under
 `~/.local/state/fleet/tripwire/incidents/` holding `incident.json` (the evidence), `brief.md`
-(what the agent was told), `agent.log` and the agent's `report.md`, whose first line is
-`VERDICT: BENIGN`, `SUSPICIOUS` or `HOSTILE`. The owner gets a notification and, where `mail_to`
+(what the agent was told), `agent.log` and the agent's `report.md`, whose first line is exactly
+`VERDICT: BENIGN`, `VERDICT: NEEDS REVIEW`, `VERDICT: SUSPICIOUS` or `VERDICT: HOSTILE`,
+followed by an explanation. The owner gets a notification and, where `mail_to`
 is set, agent mail when the incident is raised, and again if the verdict is not benign.
 
 ## Hold first, then think
@@ -36,21 +37,34 @@ Other watched files, system-wide jobs and accounts are investigated but not held
 needs root or would undo ordinary edits. The job that runs `tripwire` is never held, nor are
 the programs in `never_pause`.
 
-The bundled investigator returns its report on stdout, using Gemini's sandboxed plan mode or
-Z.ai with only read, glob and grep tools. The wrapper saves the first complete verdict atomically.
-On its next check Tripwire releases a hold whose report begins with the exact line `VERDICT: BENIGN`.
-Any
-other verdict leaves the hold in place and tells the owner, who releases it with
-`tripwire release <incident> --owner`. When the agent never reports, after
-`hold_timeout_min` (default 60) a stopped process or job goes on again, because that hold
-costs work; login keys and guard hook files stay put back until the owner releases them,
-because that hold costs nothing. The owner is told either way. An agent that exits
-without a report (out of allowance, crashed) is noticed at the next check: `summon_fallback`,
-if set, is started once with the same brief (a second model, say), and failing that the same
-release happens at once rather than after the hour. Nothing is held when no agent can be
-started (the daily limit, no agent command): a pause with nobody coming is just an outage.
-At most `max_summons_per_day` agents (default 4) start on one Mac in a day; past that the
-incident is still recorded and announced. `"hold": false` turns holding off.
+Gemini runs in sandboxed plan mode. The Z.ai route sends a bounded set of typed
+observations to the installed loopback proxy. To use an already configured DeepSeek
+account after Z.ai fails, set the fallback command to
+`["tripwire-investigate", "--engine", "zai", "--last-resort", "deepseek"]`.
+Both text-only routes omit file contents, paths, process arguments and tool definitions.
+Their metadata can establish a benign cause for the explicit local CLI drill. A benign
+guess about an ordinary incident becomes NEEDS REVIEW. The investigator records provider
+outcomes in the incident directory.
+
+Tripwire saves complete verdicts atomically. On its next check it can release a held
+change after a complete BENIGN investigation. SUSPICIOUS and HOSTILE leave the hold
+for the owner, who may use `tripwire release <incident> --owner`. If the resolver
+exhausts its configured providers, reaches the daily limit or runs out of time,
+Tripwire records NEEDS REVIEW with each observed change, any fresh observation and
+the investigation outcome. A subsequent adverse report is retained and escalated.
+Incomplete replies are preserved alongside the terminal report.
+
+The next scheduled check after `hold_timeout_min` (default 60) resumes stopped processes
+and jobs when an investigation remains unresolved. Access and guard files stay put back.
+If the last investigator exits early without a complete verdict, the same policy applies
+at the next check. With a fallback configured, the bundled primary investigator receives at most half the time
+budget. A configured fallback may run once before the deadline. Tripwire verifies that
+previously loaded jobs are back in launchd. A failed restoration remains recorded as held.
+Automatic recovery tries the outstanding operations at most three times, then notifies the owner.
+An explicit owner release can retry after the underlying fault is fixed. These checks
+also cover incidents that have no holds. At most `max_summons_per_day` investigator
+processes (default 4) start per Mac, including configured fallback launches.
+`"hold": false` disables holds.
 
 The cost is honest: the first time a program listens on the network, or a job is installed
 outside the registry, it stops for the few minutes the agent takes. Listeners are remembered
