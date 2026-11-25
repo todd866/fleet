@@ -228,6 +228,7 @@ def _cadence(home, now, environ):
     ~/Library/LaunchAgents whose command is `fleet morning`. None when there is no such job.
     """
     import plistlib
+    from xml.parsers.expat import ExpatError
     from datetime import timezone
     from fleet.morning.probe import _utc_daily, _when
 
@@ -237,7 +238,9 @@ def _cadence(home, now, environ):
         try:
             with path.open("rb") as handle:
                 plist = plistlib.load(handle)
-        except (OSError, ValueError, plistlib.InvalidFileException):
+        except (OSError, ValueError, plistlib.InvalidFileException, ExpatError):
+            continue
+        if not isinstance(plist, dict):
             continue
         args = [str(part) for part in plist.get("ProgramArguments") or []]
         for index, part in enumerate(args[:-1]):

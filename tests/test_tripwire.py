@@ -4,6 +4,8 @@ import json
 import os
 import pathlib
 import tempfile
+import subprocess
+import sys
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -67,6 +69,59 @@ class TripwireTest(unittest.TestCase):
 
     def incidents(self):
         return sorted((self.state / "incidents").glob("*/incident.json"))
+
+    def test_default_wires_restore_each_provider_from_its_own_copy(self):
+        self.wires = {"guards": self.tw.wire_guards}
+        originals = {}
+        for path in (".codex/hooks.json", ".cursor/hooks.json", ".gemini/config/hooks.json", ".claude/settings.json"):
+            target = self.home / path
+            target.parent.mkdir(parents=True)
+            originals[target] = f"{path}: agentkit hook"
+            target.write_text(originals[target])
+        self.check()
+        for target in originals:
+            target.write_text(f"new settings for {target.parent.name}")
+        self.check(now=1300)
+        self.assertEqual(len(self.incidents()), 1)
+        for target, content in originals.items():
+            self.assertEqual(target.read_text(), content)
+        incident = self.incidents()[0].parent
+        (incident / "report.md").write_text("VERDICT: BENIGN\n")
+        self.assertEqual(self.tw.release(incident.name, self.config), 0)
+        for target in originals:
+            self.assertEqual(target.read_text(), f"new settings for {target.parent.name}")
+
+    def test_investigator_saves_only_valid_stdout_and_tripwire_releases(self):
+        self.config["summon"] = [str(ROOT / "bin/tripwire-investigate")]
+        incident = self.hold_keys()
+        fake_bin = self.home / "bin"
+        fake_bin.mkdir()
+        agy = fake_bin / "agy"
+        agy.write_text("""#!/bin/sh
+for arg in "$@"; do printf '%s\\n' "$arg" >> args.txt; done
+printf '%s\\n' "$TEST_REPORT"
+""")
+        agy.chmod(0o700)
+        timeout = fake_bin / "timeout"
+        timeout.write_text('#!/bin/sh\nshift\nexec "$@"\n')
+        timeout.chmod(0o700)
+        env = dict(os.environ, PATH=str(fake_bin) + ":/usr/bin:/bin")
+        command = [sys.executable, str(ROOT / 'bin/tripwire-investigate'), '--engine', 'gemini']
+        def run(report):
+            return subprocess.run(command, cwd=incident, env=dict(env, TEST_REPORT=report),
+                                  capture_output=True).returncode
+        self.assertNotEqual(run("inconclusive"), 0)
+        self.assertFalse((incident / "report.md").exists())
+        self.assertEqual(run("VERDICT: BENIGN\nfixture evidence"), 0)
+        args = (incident / "args.txt").read_text().splitlines()
+        self.assertIn("plan", args)
+        self.assertIn("--sandbox", args)
+        self.assertNotIn("--dangerously-skip-permissions", args)
+        self.assertEqual(run("VERDICT: SUSPICIOUS\nsecond response"), 0)
+        self.assertEqual((incident / "report.md").read_text(), "VERDICT: BENIGN\nfixture evidence\n")
+        self.assertNotIn("stranger", self.keys.read_text())
+        self.check(now=1600)
+        self.assertIn("stranger", self.keys.read_text())
 
     def test_first_run_records_and_raises_nothing(self):
         self.check()
@@ -207,6 +262,8 @@ class TripwireTest(unittest.TestCase):
         incident = self.hold_keys()
         self.assertEqual(self.tw.release(incident.name, self.config), 1)
         (incident / "report.md").write_text("VERDICT: SUSPICIOUS\n")
+        self.assertEqual(self.tw.release(incident.name, self.config), 1)
+        (incident / "report.md").write_text("VERDICT: BENIGN pending confirmation\n")
         self.assertEqual(self.tw.release(incident.name, self.config), 1)
         self.assertNotIn("stranger", self.keys.read_text())
         (incident / "report.md").write_text("VERDICT: BENIGN\nthe owner added a key\n")

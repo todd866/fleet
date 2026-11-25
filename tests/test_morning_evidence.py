@@ -157,6 +157,17 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(rows["sec:probes:mcp"].status, "fail")
         self.assertEqual(rows["sec:probes:mcp"].datum, "top 203.0.113.88 x105")
 
+    def test_incomplete_probe_log_cannot_produce_a_clean_window(self):
+        log = self.home / "probe.log"
+        cfg = {"surface_probes": {"logs": [{"name": "test", "path": str(log)}]}}
+        log.write_text("unparsed previous line\n" * 14000)
+        def row():
+            doc = _surface_probes_local(self.home, cfg, self.now)
+            return evaluate({"hosts": {}, "surface_probes": doc}, cfg, self.now)[0]
+        self.assertEqual((row().status, row().datum), ("warn", "partial log window"))
+        with patch("fleet.morning.collect._tail_lines", side_effect=PermissionError):
+            self.assertEqual((row().status, row().value), ("warn", "unreadable"))
+
     def test_vpn_gateway_evaluation_pass_warn_fail_and_absent(self):
         hosts = {
             "green": {

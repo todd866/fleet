@@ -1,5 +1,18 @@
 import Foundation
 
+// API calls carry a hub bearer and may carry a command body. Both belong to the paired URL.
+final class PairedHubTransport: NSObject, URLSessionTaskDelegate {
+    static let shared = PairedHubTransport()
+
+    func urlSession(
+        _ session: URLSession, task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        completionHandler(nil)
+    }
+}
+
 public enum FleetAPIError: LocalizedError, Sendable, Equatable {
     case unconfigured
     case invalidURL(String)
@@ -199,7 +212,8 @@ public actor FleetAPIClient {
         guard !baseRaw.isEmpty, !token.isEmpty else {
             throw FleetAPIError.unconfigured
         }
-        guard let url = URL(string: baseRaw + path) else {
+        let base = try PairingLink.validatedServerURL(baseRaw)
+        guard let url = URL(string: base + path) else {
             throw FleetAPIError.invalidURL(baseRaw + path)
         }
 
@@ -215,7 +229,7 @@ public actor FleetAPIClient {
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await session.data(for: req)
+            (data, response) = try await session.data(for: req, delegate: PairedHubTransport.shared)
         } catch {
             throw FleetAPIError.transport(error.localizedDescription)
         }

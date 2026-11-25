@@ -8,10 +8,12 @@ import datetime as dt
 import hashlib
 import hmac
 import html
+import ipaddress
 import json
 import os
 import plistlib
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -190,7 +192,8 @@ from pathlib import Path
 
 mode = sys.argv[1]
 arg = sys.argv[2]
-extra = sys.argv[3] if len(sys.argv) > 3 else ""
+extra = sys.argv[3]
+allowed_namespace = re.compile(sys.argv[4], re.IGNORECASE).match
 home = Path.home()
 agents = home / "Library/LaunchAgents"
 uid = os.getuid()
@@ -263,7 +266,7 @@ elif mode in ("job-kickstart", "host-action"):
         suffixes = [s for s in arg.split(",") if s]
         matches = []
         for sfx in suffixes:
-            found = sorted(agents.glob(f"*.{sfx}.plist"))
+            found = sorted(p for p in agents.glob(f"*.{sfx}.plist") if allowed_namespace(p.stem))
             if found:
                 matches = found
                 break
@@ -282,7 +285,8 @@ elif mode in ("job-kickstart", "host-action"):
     time.sleep(0.8)
     _, state, last_exit, _ = parse_launchctl(label)
     if mode == "job-kickstart":
-        for snap_p in sorted(agents.glob("*.fleet-snapshot.plist"))[:1]:
+        snapshots = sorted(p for p in agents.glob("*.fleet-snapshot.plist") if allowed_namespace(p.stem))
+        for snap_p in snapshots[:1]:
             if snap_p.stem != label:
                 subprocess.Popen(["launchctl", "kickstart", f"gui/{uid}/{snap_p.stem}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if k.returncode != 0:
@@ -339,20 +343,21 @@ class FleetDataStore:
                     out.append(hid)
         return out
 
+    def _job_namespace_pattern(self) -> str:
+        prefixes = self._site_meta().get("job_label_prefixes")
+        names = []
+        for raw in prefixes if isinstance(prefixes, list) else []:
+            prefix = raw.strip().lower() if isinstance(raw, str) else ""
+            if re.fullmatch(r"[a-z0-9_-]+(?:\.[a-z0-9_-]+)*", prefix):
+                # Short site keys also match the second component of a launchd label.
+                first = r"(?:[a-z0-9_-]+\.)?" if "." not in prefix else ""
+                names.append(first + re.escape(prefix))
+        return r"^(?:" + "|".join(names) + r")\." if names else ""
+
     def _is_allowed_job_label(self, label: str) -> bool:
-        if not JOB_LABEL_RE.match(label) or ".." in label or "/" in label:
-            return False
-        prefixes = {
-            str(p).strip().lower()
-            for p in (self._site_meta().get("job_label_prefixes") or [])
-            if isinstance(p, str) and p.strip()
-        }
-        parts = label.lower().split(".")
-        if len(parts) < 2:
-            return False
-        if not prefixes:
-            return len(parts) >= 3
-        return parts[0] in prefixes or parts[1] in prefixes
+        namespace = self._job_namespace_pattern()
+        return bool(namespace and JOB_LABEL_RE.fullmatch(label) and ".." not in label
+                    and re.match(namespace, label, re.IGNORECASE))
 
     def _load_snoozes(self) -> dict[str, dict[str, Any]]:
         doc = _read_json(self.snooze_file, {})
@@ -435,13 +440,17 @@ class FleetDataStore:
     def _run_host_job_script(self, host: str, mode: str, arg: str, extra: str = "") -> tuple[int, dict[str, Any]]:
         if host not in self._action_hosts():
             return 403, {"ok": False, "error": f"actions not permitted on host {host!r}"}
+        namespace = self._job_namespace_pattern()
+        if not namespace or (mode != "host-action" and not re.match(namespace, arg, re.IGNORECASE)):
+            return 403, {"ok": False, "error": "job outside configured namespaces"}
+        params = [mode, arg, extra, namespace]
         hub = self._hub_id()
         try:
             if host == hub:
                 env = dict(os.environ)
                 env["HOME"] = str(self.home)
                 res = subprocess.run(
-                    [sys.executable, "-c", _REMOTE_JOB_SCRIPT, mode, arg, extra],
+                    [sys.executable, "-c", _REMOTE_JOB_SCRIPT, *params],
                     capture_output=True,
                     text=True,
                     env=env,
@@ -449,7 +458,7 @@ class FleetDataStore:
                 )
             else:
                 res = subprocess.run(
-                    ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6", host, "python3", "-", mode, arg, extra],
+                    ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6", "--", host, shlex.join(["python3", "-", *params])],
                     input=_REMOTE_JOB_SCRIPT,
                     capture_output=True,
                     text=True,
@@ -1359,14 +1368,6 @@ class FleetAPIHandler(BaseHTTPRequestHandler):
             return qs["t"][0].strip()
         return ""
 
-    def _effective_public_base(self) -> str:
-        base = str(self.srv.cfg.get("public_base") or "").rstrip("/")
-        if base and "example.ts.net" not in base:
-            return base
-        host = self.headers.get("X-Forwarded-Host") or self.headers.get("Host") or "127.0.0.1:8694"
-        proto = self.headers.get("X-Forwarded-Proto") or ("https" if ".ts.net" in host else "http")
-        return f"{proto}://{host}"
-
     def do_HEAD(self) -> None:
         self._handle_get(head_only=True)
 
@@ -1432,7 +1433,22 @@ class FleetAPIHandler(BaseHTTPRequestHandler):
         self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"}, head_only=head_only)
 
     def _serve_ota(self, path: str, tok: str, head_only: bool) -> None:
-        base = self._effective_public_base()
+        # Installation and pairing links carry credentials. Their origin must be
+        # an operator-selected HTTPS endpoint, independent of proxy headers.
+        base = str(self.srv.cfg.get("public_base") or "").rstrip("/")
+        if path in ("/v1/ota/install", "/v1/ota/manifest.plist"):
+            try:
+                origin = urllib.parse.urlsplit(base)
+                _ = origin.port  # Reject malformed ports before generating links.
+                configured = (origin.scheme == "https" and origin.hostname
+                              and origin.hostname != "hub.example.ts.net"
+                              and origin.username is None and origin.password is None
+                              and not origin.query and not origin.fragment)
+            except ValueError:
+                configured = False
+            if not configured:
+                self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"ok": False, "error": "configure HTTPS public_base for OTA"}, head_only=head_only)
+                return
         qt = urllib.parse.quote(tok, safe="")
         title = str(self.srv.cfg.get("app_title") or "Fleet")
         bundle_id = str(self.srv.cfg.get("bundle_id") or "org.example.fleet")
@@ -1510,8 +1526,14 @@ a.btn{{display:block;text-align:center;text-decoration:none;padding:15px 18px;bo
             self._send_json(HTTPStatus.TOO_MANY_REQUESTS, {"ok": False, "error": "rate limit exceeded"})
             return
 
-        length = int(self.headers.get("Content-Length", "0") or 0)
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self.close_connection = True
+            self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid Content-Length"})
+            return
         if length < 0 or length > MAX_BODY_BYTES:
+            self.close_connection = True
             self._send_json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"ok": False, "error": "body too large"})
             return
         raw = self.rfile.read(length) if length > 0 else b"{}"
@@ -1578,9 +1600,16 @@ def main(argv: list[str] | None = None) -> int:
                 if row["purpose"]:
                     print(f"  {row['purpose']}")
         return 0 if doc["catalogAvailable"] or doc["observations"] else 1
+    bind = "127.0.0.1" if cfg["bind"] == "localhost" else str(cfg["bind"])
+    try:
+        loopback = ipaddress.IPv4Address(bind).is_loopback
+    except ValueError:
+        loopback = False
+    if not loopback:
+        ap.error("fleet-api requires an IPv4 loopback bind behind tailscale serve")
     token = load_token(cfg)
     store = FleetDataStore(cfg)
-    server = FleetHTTPServer((str(cfg["bind"]), int(cfg["port"])), store, token, cfg)
+    server = FleetHTTPServer((bind, int(cfg["port"])), store, token, cfg)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

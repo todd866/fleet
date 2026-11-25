@@ -1354,6 +1354,13 @@ class ProbeJobsResilience(unittest.TestCase):
                  mock.patch.object(probe, "_launchctl_print", return_value={"com.example.good": {"state": "not running"}}):
                 rows = probe._jobs()
             self.assertEqual([r["label"] for r in rows], ["com.example.good"])
+            from fleet.morning.cli import _cadence
+            import plistlib
+            (agents / "com.example.morning.plist").write_bytes(plistlib.dumps({
+                "Label": "com.example.morning", "ProgramArguments": ["fleet", "morning"],
+                "StartInterval": 3600,
+            }))
+            self.assertEqual(_cadence(home, 1000, {})["label"], "com.example.morning")
 
     def test_security_evidence_rows_and_staleness(self):
         now = 1_800_000_000
@@ -1376,12 +1383,60 @@ class ProbeJobsResilience(unittest.TestCase):
         self.assertEqual(by_key["sec:lap:integrity"].area, "security")
         self.assertEqual(by_key["sec:audit"].status, "fail")
 
+        for stamp in (None, 0, now + 600):
+            fresh["security_evidence"]["generated"] = stamp
+            flagged = evaluate(fresh, {}, now)
+            self.assertEqual([(r.key, r.status) for r in flagged], [("sec:verify", "warn")])
+        self.assertEqual(evaluate({"security_evidence": {"generated": now, "rows": []}}, {}, now)[0].value, "empty")
+
         stale = {"hosts": {}, "security_evidence": {"version": 1, "generated": now - 3 * 3600, "rows": []}}
         stale_rows = evaluate(stale, {}, now)
         self.assertEqual(len(stale_rows), 1)
         self.assertEqual(stale_rows[0].key, "sec:verify")
         self.assertEqual(stale_rows[0].status, "warn")
         self.assertEqual(stale_rows[0].value, "stale")
+
+    def test_readonly_disk_images_are_skipped_in_mount_row_and_summary(self):
+        from unittest import mock
+        from fleet.morning import probe
+
+        ro_dmg = {"BusProtocol": "Disk Image", "WritableVolume": False, "VolumeUUID": "DMG-1"}
+        rw_usb = {"BusProtocol": "USB", "WritableVolume": True, "VolumeUUID": "USB-1"}
+        ro_internal = {"BusProtocol": "Disk Image", "WritableVolume": False, "VolumeUUID": "INT-1"}
+        with mock.patch.object(probe.shutil, "disk_usage", return_value=SimpleNamespace(free=100, total=200)):
+            with mock.patch.object(probe, "_diskutil", return_value=ro_dmg):
+                self.assertIsNone(probe._mount_row(Path("/Volumes/Example Installer"), "Example Installer", internal=False))
+            with mock.patch.object(probe, "_diskutil", return_value=rw_usb):
+                row = probe._mount_row(Path("/Volumes/Example USB"), "Example USB", internal=False)
+                self.assertEqual(row["name"], "Example USB")
+            with mock.patch.object(probe, "_diskutil", return_value=ro_internal):
+                row = probe._mount_row(Path("/"), "internal", internal=True)
+                self.assertEqual(row["name"], "internal")
+
+        summary = {
+            "drives": [{"name": "Example USB", "volume_uuids": ["USB-1"]}],
+            "locations": [
+                {"name": "internal", "mounted": True, "free_bytes": 200e9},
+                {"name": "Example Installer", "mounted": True, "free_bytes": 6e8},
+                {"name": "Example USB", "mounted": True, "free_bytes": 300e9},
+            ],
+        }
+        orig_exists = Path.exists
+        with mock.patch.object(probe, "_diskutil", return_value=ro_dmg), \
+             mock.patch.object(Path, "exists", lambda self: True if str(self) == "/Volumes/Example Installer" else orig_exists(self)):
+            rows = probe._disks_from_summary(summary)
+        self.assertEqual([r["name"] for r in rows], ["internal", "Example USB"])
+
+    def test_running_job_with_wrapper_sigterm_exit_15_passes(self):
+        snap = {"hosts": {"primary": host(jobs=[{
+            "label": "com.example.agy-control-api",
+            "when": "always on",
+            "loaded": True,
+            "state": "running",
+            "exit": 15,
+            "runs": 16,
+        }])}}
+        self.assertEqual(by_key(evaluate(snap, config(), NOW_S))["job:primary:agy-control-api"].status, "pass")
 
 
 if __name__ == "__main__":

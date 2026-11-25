@@ -89,7 +89,7 @@ class FleetAPITests(unittest.TestCase):
         self.cfg.update({
             "bind": "127.0.0.1",
             "port": 0,
-            "public_base": "https://hub.example.ts.net:8444",
+            "public_base": "https://fleet.example.test:8444",
             "home_dir": str(self.home),
             "mac_sync_dir": str(self.mac_sync),
             "evidence_dir": str(self.evidence),
@@ -193,6 +193,42 @@ class FleetAPITests(unittest.TestCase):
         code, ipa = self._req(f"/v1/ota/Fleet.ipa?t={self.token}")
         self.assertEqual(code, 200)
         self.assertEqual(ipa, b"PK-FAKE-IPA")
+
+    def test_ota_links_use_only_configured_https_origin(self):
+        code, xml = self._req("/v1/ota/manifest.plist", token=self.token)
+        self.assertEqual(code, 200)
+        asset = plistlib.loads(xml)["items"][0]["assets"][0]
+        self.assertTrue(asset["url"].startswith(self.cfg["public_base"] + "/v1/ota/"))
+        for invalid in ("", srv.DEFAULT_CONFIG["public_base"], "http://fleet.example.test"):
+            with self.subTest(origin=invalid):
+                self.cfg["public_base"] = invalid
+                code, raw = self._req("/v1/ota/install", token=self.token)
+                self.assertEqual(code, 503)
+                self.assertNotIn(self.token.encode(), raw)
+
+    def test_nonlocal_binding_refused_before_loading_credentials(self):
+        from unittest.mock import patch
+        with patch.object(srv, "load_config", return_value={"bind": "0.0.0.0"}), \
+             patch.object(srv, "load_token") as load:
+            with self.assertRaises(SystemExit):
+                srv.main(["serve"])
+            load.assert_not_called()
+
+    def test_job_prefixes_require_explicit_namespace(self):
+        store = self.server.store
+        for prefixes, label, allowed in [
+            ([], "com.example.worker", False),
+            (None, "com.example.worker", False),
+            ("example", "com.example.worker", False),
+            (["example"], "com.example.worker", True),
+            (["example"], "example.worker", True),
+            (["example"], "info.example.worker", True),
+            (["example"], "com.exampletools.worker", False),
+            (["com.example"], "com.example.worker", True),
+        ]:
+            with self.subTest(prefixes=prefixes, label=label):
+                store.site_config_path.write_text(json.dumps({"job_label_prefixes": prefixes}))
+                self.assertEqual(store._is_allowed_job_label(label), allowed)
 
     def test_actions_voice_note_and_provider_pause(self) -> None:
         code, raw = self._req("/v1/actions/voice-note", method="POST", body={"text": "test dictation"}, token=self.token)

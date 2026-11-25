@@ -143,6 +143,10 @@ def _disks_from_summary(summary):
             uuids.append(loc["volume_uuid"])
         trend = loc.get("trend_bytes") or {}
         mounted = True if "mounted" not in loc else bool(loc.get("mounted"))
+        if mounted and name != "internal" and name not in by_name:
+            vol = pathlib.Path("/Volumes") / name
+            if vol.exists() and _is_readonly_disk_image(_diskutil(vol)):
+                continue
         rows.append({
             "name": name,
             "free_bytes": loc.get("free_bytes"),
@@ -254,12 +258,26 @@ def _mounted_volumes():
     return [row for row in rows if row]
 
 
+def _is_readonly_disk_image(info):
+    proto = info.get("BusProtocol") or info.get("Protocol")
+    if proto != "Disk Image":
+        return False
+    return bool(
+        info.get("ReadOnly")
+        or info.get("WritableVolume") is False
+        or info.get("WritableMedia") is False
+        or info.get("Writable") is False
+    )
+
+
 def _mount_row(path, name, internal):
     try:
         usage = shutil.disk_usage(path)
     except OSError:
         return None
     info = _diskutil(path)
+    if not internal and _is_readonly_disk_image(info):
+        return None
     return {
         "name": name,
         "uuid": info.get("VolumeUUID") or "",

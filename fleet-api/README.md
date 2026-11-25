@@ -9,4 +9,6 @@ Authenticated tailnet-only HTTP JSON backend and Ad Hoc OTA IPA server for the n
 - Write actions (`/v1/actions/*`) use a strict allow-list with regex/length checks and append every action to `~/.local/state/fleet-api/actions.jsonl`.
 - Authentication checks a 256-bit Bearer token (`Authorization: Bearer ...` or `X-Fleet-Token`) using `hmac.compare_digest`. `/v1/ota/*` accepts `?t=<token>` for iOS Safari / `itms-services://` and returns silent `404` on invalid tokens.
 
+Configure `public_base` with the HTTPS origin of your hub before using OTA. Installation links use only that configured origin. Job log and restart controls require explicit `job_label_prefixes` in the site configuration.
+
 For the authenticated service directory and the equivalent local CLI, see [Find a running service](../docs/stack.md#find-a-running-service).

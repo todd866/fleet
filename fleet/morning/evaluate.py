@@ -20,8 +20,8 @@ REGISTERED = re.compile(r"^[0-9a-f]{64}$")
 SYSTEM_VOLUMES = frozenset((
     "Macintosh HD", "Data", "Recovery", "Preboot", "VM", "Update", "xarts", "iSCPreboot", "Hardware",
 ))
-# SIGTERM as launchd reports it (-15) and as a shell reports a child it ended (143).
-TERM_EXITS = ("-15", "143")
+# SIGTERM as launchd reports it (-15), as wrapper binaries forward it (15), and as a shell reports a child it ended (143).
+TERM_EXITS = ("-15", "15", "143")
 
 
 @dataclass(frozen=True)
@@ -1253,8 +1253,11 @@ def _security_evidence(doc, now):
         generated = 0
     if doc.get("error"):
         return [_row("sec:verify", "warn", "security", "security evidence", "unread", "check.json", str(doc["error"]))]
-    age_s = max(0, now - generated) if generated else None
-    if age_s is not None and age_s > 2 * 3600:
+    if generated <= 0 or generated > now + 300:
+        return [_row("sec:verify", "warn", "security", "security evidence", "invalid time", "check.json",
+                     "verifier output has no usable collection timestamp")]
+    age_s = max(0, now - generated)
+    if age_s > 2 * 3600:
         age_label = f"{age_s // 3600} h"
         return [_row(
             "sec:verify", "warn", "security", "security evidence", "stale", age_label,
@@ -1273,7 +1276,8 @@ def _security_evidence(doc, now):
         datum = str(item.get("datum") or "")
         detail = str(item.get("detail") or "")
         rows.append(_row(key, status, "security", name, value, datum, detail))
-    return rows
+    return rows or [_row("sec:verify", "warn", "security", "security evidence", "empty", "check.json",
+                         "verifier output contains no check results")]
 
 
 def _surface_probes(doc, config):
@@ -1297,7 +1301,8 @@ def _surface_probes(doc, config):
         slug = re.sub(r"[^a-z0-9_-]+", "-", name.lower()).strip("-") or "surface"
         key = f"sec:probes:{slug}"
         if not s.get("present"):
-            rows.append(_row(key, "warn", "security", f"{name} probes", "missing", "no log", f"{name} rejection log missing"))
+            reason = s.get("error") or "missing"
+            rows.append(_row(key, "warn", "security", f"{name} probes", reason, "no reading", f"{name} rejection log {reason}"))
             continue
         total = int(s.get("total") or 0)
         top_ip = s.get("top_ip")
@@ -1319,6 +1324,12 @@ def _surface_probes(doc, config):
             value = f"{total} err ({unique_ips} {ip_noun})" if unique_ips else f"{total} err"
             datum = f"top {top_ip} x{top_count}" if top_ip else f"last {window_h}h"
             detail = f"{name}: {total} rejected in {window_h}h ({codes}); top IP {top_ip} ({top_count}x)" if top_ip else f"{name}: {total} rejected in {window_h}h ({codes})"
+        if s.get("partial"):
+            if status == "pass":
+                status = "warn"
+            datum = "partial log window"
+            value = f"at least {total} rejected"
+            detail = f"{name}: {total} rejected in the available tail; earlier entries in the {window_h}h window were not read"
         rows.append(_row(key, status, "security", f"{name} probes", value, datum, detail))
     return rows
 

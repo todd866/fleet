@@ -159,18 +159,15 @@ def _resolve_log_path(home, raw_path):
     return Path(text).expanduser()
 
 
-def _tail_lines(path: Path) -> list[str]:
-    try:
-        size = path.stat().st_size
-        with path.open("rb") as fh:
-            truncated = size > _PROBE_MAX_BYTES
-            if truncated:
-                fh.seek(-_PROBE_MAX_BYTES, os.SEEK_END)
-            raw = fh.read().decode("utf-8", errors="replace")
-    except OSError:
-        return []
-    lines = raw.splitlines()
-    return lines[1:] if truncated and lines else lines
+def _tail_lines(path: Path):
+    with path.open("rb") as fh:
+        size = fh.seek(0, os.SEEK_END)
+        truncated = size > _PROBE_MAX_BYTES
+        fh.seek(max(0, size - _PROBE_MAX_BYTES))
+        if truncated:
+            fh.readline(_PROBE_MAX_BYTES)
+        raw = fh.read(_PROBE_MAX_BYTES)
+    return raw.decode("utf-8", errors="replace").splitlines(), truncated
 
 
 def _extract_probe_rejection(line: str) -> str | None:
@@ -189,11 +186,17 @@ def _scan_surface_log(path: Path, since: int, until: int) -> dict:
     by_status: dict[str, int] = {}
     ip_counts: dict[str, int] = {}
     total = 0
-    for line in _tail_lines(path):
+    try:
+        lines, partial = _tail_lines(path)
+    except OSError:
+        return {"present": False, "error": "unreadable"}
+    for line in lines:
         ts_m = _PROBE_TS.match(line)
         if not ts_m:
             continue
         ts = _epoch(ts_m.group(1))
+        if ts is not None and ts < since:
+            partial = False
         if ts is None or ts < since or ts > until:
             continue
         code = _extract_probe_rejection(line)
@@ -209,6 +212,7 @@ def _scan_surface_log(path: Path, since: int, until: int) -> dict:
     top_ip, top_ip_count = (max(ip_counts.items(), key=lambda kv: (kv[1], kv[0])) if ip_counts else (None, 0))
     return {
         "present": True,
+        "partial": partial,
         "total": total,
         "by_status": by_status,
         "unique_ips": len(ip_counts),

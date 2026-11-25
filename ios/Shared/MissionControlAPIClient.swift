@@ -62,10 +62,10 @@ public actor MissionControlAPIClient {
         let primary = creds.primaryURL.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         let fallback = creds.fallbackURL.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         if !primary.isEmpty, !primary.contains("example.ts.net") {
-            list.append(primary)
+            list.append(try PairingLink.validatedServerURL(primary))
         }
         if !fallback.isEmpty, !fallback.contains("example.ts.net"), fallback != primary {
-            list.append(fallback)
+            list.append(try PairingLink.validatedServerURL(fallback))
         }
         guard !list.isEmpty, !token.isEmpty else {
             throw MissionControlAPIError.notConfigured
@@ -101,7 +101,7 @@ public actor MissionControlAPIClient {
 
             do {
                 let session = longTimeout ? longSession : fastSession
-                let (data, response) = try await session.data(for: req)
+                let (data, response) = try await session.data(for: req, delegate: PairedHubTransport.shared)
                 guard let http = response as? HTTPURLResponse else {
                     lastError = MissionControlAPIError.networkFailure("Invalid server response")
                     continue

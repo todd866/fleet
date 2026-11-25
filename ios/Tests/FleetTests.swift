@@ -1,3 +1,4 @@
+import AppIntents
 import LocalAuthentication
 import XCTest
 @testable import Fleet
@@ -623,6 +624,30 @@ extension FleetTests {
         )
         let client = MissionControlAPIClient(fastSession: session, longSession: session, credentialsProvider: { credentials })
         return (client, session)
+    }
+
+    func testMutatingShortcutsRequireDeviceAuthentication() {
+        XCTAssertEqual(SendFleetNoteIntent.authenticationPolicy, .requiresLocalDeviceAuthentication)
+        XCTAssertEqual(AskCommanderIntent.authenticationPolicy, .requiresLocalDeviceAuthentication)
+    }
+
+    func testBothClientsRejectInsecureManualEndpointsBeforeSending() async throws {
+        let testID = UUID().uuidString.lowercased()
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [MissionControlStub.self]
+        let session = URLSession(configuration: config)
+        defer { session.invalidateAndCancel() }
+        let address = "http://insecure.\(testID).invalid"
+        do {
+            _ = try await FleetAPIClient(session: session).testConnection(serverURL: address, token: "fixture")
+            XCTFail("Fleet accepted a remote HTTP destination")
+        } catch PairingLinkError.insecureServerURL {}
+        do {
+            _ = try await MissionControlAPIClient(fastSession: session, longSession: session)
+                .testConnection(primaryURL: address, fallbackURL: "", token: "fixture")
+            XCTFail("Mission Control accepted a remote HTTP destination")
+        } catch PairingLinkError.insecureServerURL {}
+        XCTAssertEqual(MissionControlStub.takeCalls(for: testID), [])
     }
 
     func testMissionControlReadFallsBackAndWritesUseTheRespondingMac() async throws {

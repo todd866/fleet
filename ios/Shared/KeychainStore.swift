@@ -1,7 +1,7 @@
 import Foundation
 import Security
 
-public struct FleetCredentials: Sendable, Hashable {
+public struct FleetCredentials: Codable, Sendable, Hashable {
     public var serverURL: String
     public var token: String
 
@@ -16,7 +16,7 @@ public struct FleetCredentials: Sendable, Hashable {
     }
 }
 
-public struct MissionControlCredentials: Sendable, Hashable {
+public struct MissionControlCredentials: Codable, Sendable, Hashable {
     public var primaryURL: String
     public var fallbackURL: String
     public var token: String
@@ -38,6 +38,8 @@ public final class KeychainStore: Sendable {
     public static let shared = KeychainStore()
 
     private let service: String
+    private let fleetPairAccount = "fleet-paired-credentials"
+    private let mcPairAccount = "mc-paired-credentials"
     private let tokenAccount = "api-bearer-token"
     private let mcTokenAccount = "mc-api-bearer-token"
     private let serverDefaultsKey = "fleet.api.serverURL"
@@ -80,25 +82,36 @@ public final class KeychainStore: Sendable {
     }
 
     public func loadCredentials() -> FleetCredentials {
+        if let data = loadKeychainData(account: fleetPairAccount) {
+            return (try? JSONDecoder().decode(FleetCredentials.self, from: data))
+                ?? FleetCredentials(serverURL: "", token: "")
+        }
         let server = loadString(forKey: serverDefaultsKey) ?? Self.defaultServerURL
         let token = loadToken(account: tokenAccount) ?? ""
         return FleetCredentials(serverURL: server, token: token)
     }
 
     public func saveCredentials(serverURL: String, token: String) throws {
-        let cleanServer = serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
-            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        let cleanToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
-        saveString(cleanServer, forKey: serverDefaultsKey)
-        try saveToken(cleanToken, account: tokenAccount)
+        let pair = FleetCredentials(
+            serverURL: try PairingLink.validatedServerURL(serverURL),
+            token: token.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+        try saveKeychainData(JSONEncoder().encode(pair), account: fleetPairAccount)
+        deleteToken(account: tokenAccount)
     }
 
     public func clearToken() {
-        deleteToken(account: tokenAccount, useAccessGroup: true)
-        deleteToken(account: tokenAccount, useAccessGroup: false)
+        let pair = loadCredentials()
+        deleteToken(account: tokenAccount)
+        saveString(pair.serverURL, forKey: serverDefaultsKey)
+        deleteToken(account: fleetPairAccount)
     }
 
     public func loadMCCredentials() -> MissionControlCredentials {
+        if let data = loadKeychainData(account: mcPairAccount) {
+            return (try? JSONDecoder().decode(MissionControlCredentials.self, from: data))
+                ?? MissionControlCredentials(primaryURL: "", token: "")
+        }
         let primary = loadString(forKey: mcPrimaryDefaultsKey) ?? Self.defaultMCPrimaryURL
         let fallback = loadString(forKey: mcFallbackDefaultsKey) ?? Self.defaultMCFallbackURL
         let token = loadToken(account: mcTokenAccount) ?? ""
@@ -106,19 +119,24 @@ public final class KeychainStore: Sendable {
     }
 
     public func saveMCCredentials(primaryURL: String, fallbackURL: String, token: String) throws {
-        let cleanPrimary = primaryURL.trimmingCharacters(in: .whitespacesAndNewlines)
-            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        let cleanFallback = fallbackURL.trimmingCharacters(in: .whitespacesAndNewlines)
-            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        let cleanToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
-        saveString(cleanPrimary, forKey: mcPrimaryDefaultsKey)
-        saveString(cleanFallback, forKey: mcFallbackDefaultsKey)
-        try saveToken(cleanToken, account: mcTokenAccount)
+        let primary = primaryURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let fallback = fallbackURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !primary.isEmpty || !fallback.isEmpty else { throw PairingLinkError.invalidServerURL }
+        let pair = MissionControlCredentials(
+            primaryURL: primary.isEmpty ? "" : try PairingLink.validatedServerURL(primary),
+            fallbackURL: fallback.isEmpty ? "" : try PairingLink.validatedServerURL(fallback),
+            token: token.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+        try saveKeychainData(JSONEncoder().encode(pair), account: mcPairAccount)
+        deleteToken(account: mcTokenAccount)
     }
 
     public func clearMCToken() {
-        deleteToken(account: mcTokenAccount, useAccessGroup: true)
-        deleteToken(account: mcTokenAccount, useAccessGroup: false)
+        let pair = loadMCCredentials()
+        deleteToken(account: mcTokenAccount)
+        saveString(pair.primaryURL, forKey: mcPrimaryDefaultsKey)
+        saveString(pair.fallbackURL, forKey: mcFallbackDefaultsKey)
+        deleteToken(account: mcPairAccount)
     }
 
     private func defaults() -> [UserDefaults] {
@@ -134,7 +152,7 @@ public final class KeychainStore: Sendable {
 
     private func loadString(forKey key: String) -> String? {
         for store in defaults() {
-            if let val = store.string(forKey: key), !val.isEmpty {
+            if let val = store.string(forKey: key) {
                 return val
             }
         }
@@ -148,14 +166,17 @@ public final class KeychainStore: Sendable {
     }
 
     private func loadToken(account: String) -> String? {
-        if let appGroup, let val = readKeychainToken(account: account, accessGroup: appGroup) {
-            return val
-        }
-        return readKeychainToken(account: account, accessGroup: nil)
+        loadKeychainData(account: account).flatMap { String(data: $0, encoding: .utf8) }
     }
 
-    private func saveToken(_ token: String, account: String) throws {
-        guard let data = token.data(using: .utf8) else { return }
+    private func loadKeychainData(account: String) -> Data? {
+        if let appGroup, let val = readKeychainData(account: account, accessGroup: appGroup) {
+            return val
+        }
+        return readKeychainData(account: account, accessGroup: nil)
+    }
+
+    private func saveKeychainData(_ data: Data, account: String) throws {
         if let appGroup {
             let status = writeKeychainToken(data: data, account: account, accessGroup: appGroup)
             if status == errSecSuccess {
@@ -172,7 +193,7 @@ public final class KeychainStore: Sendable {
         }
     }
 
-    private func readKeychainToken(account: String, accessGroup: String?) -> String? {
+    private func readKeychainData(account: String, accessGroup: String?) -> Data? {
         var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -188,7 +209,7 @@ public final class KeychainStore: Sendable {
         guard status == errSecSuccess, let data = result as? Data else {
             return nil
         }
-        return String(data: data, encoding: .utf8)
+        return data
     }
 
     private func writeKeychainToken(data: Data, account: String, accessGroup: String?) -> OSStatus {
@@ -217,15 +238,12 @@ public final class KeychainStore: Sendable {
         return SecItemAdd(addQuery as CFDictionary, nil)
     }
 
-    private func deleteToken(account: String, useAccessGroup: Bool) {
-        var query: [String: Any] = [
+    private func deleteToken(account: String) {
+        let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
         ]
-        if useAccessGroup, let appGroup {
-            query[kSecAttrAccessGroup as String] = appGroup
-        }
         SecItemDelete(query as CFDictionary)
     }
 }

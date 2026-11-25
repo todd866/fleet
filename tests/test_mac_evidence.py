@@ -62,6 +62,16 @@ class UnifiedLogChunkingTests(unittest.TestCase):
         self.assertEqual(len(power_rows), 4)
         self.assertEqual(rows[-1][0], "keychain")
 
+    def test_later_chunk_failure_preserves_completed_rows_and_retries_unread_window(self):
+        now = 1_795_445_000.0
+        st = {"end": now - 1200}
+        event = {"processImagePath": "/kernel", "eventMessage": "PMRD: System Sleep"}
+        run = mock.Mock(side_effect=[(0, json.dumps(event)), (1, "")])
+        rows = me.src_unified_log(self._ctx(now, run, log_chunk_s=300), st)
+        self.assertEqual(st["end"], now - 1200 - 60 + 300)
+        self.assertEqual([r["ev"] for stream, r in rows if stream == "power"], ["sleep"])
+        self.assertIn("retry", next(r["why"] for stream, r in rows if stream == "collector"))
+
     def test_timeout_slice_records_gap_and_advances_without_wedging(self):
         now = 1_795_445_000.0
         st = {"end": now - 1500}
@@ -281,6 +291,18 @@ class PrivilegeAuditSourceTests(unittest.TestCase):
         self.assertEqual(r3[0][0], "manifest")
         self.assertEqual(r3[0][1]["ev"], "changed")
         self.assertEqual(r3[0][1]["prev_sha256"], r1[0][1]["sha256"])
+
+    def test_grant_replacement_with_steady_count_reports_privilege_drift(self):
+        st = {}
+        grant = {"service": "Accessibility", "client": "installed.app.one", "client_type": 0}
+        def audit():
+            return 0, json.dumps({"tcc": {"status": "ok", "grants": [grant], "grant_count": 1}})
+        ctx = {"now": 1_795_500_000.0, "cfg": {}, "run": lambda *_: audit()}
+        me.src_privilege_audit(ctx, st)
+        grant["client"] = "installed.app.two"
+        change = me.src_privilege_audit(ctx, st)
+        self.assertEqual(change[0][1]["ev"], "changed")
+        self.assertEqual(change[0][1]["posture"]["tcc_grant_count"], 1)
 
     def test_evidence_audit_flags_privilege_audit_change_only(self):
         with tempfile.TemporaryDirectory() as tmp:

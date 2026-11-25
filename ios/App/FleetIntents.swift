@@ -2,6 +2,7 @@ import AppIntents
 import Foundation
 
 struct SendFleetNoteIntent: AppIntent {
+    static let authenticationPolicy: IntentAuthenticationPolicy = .requiresLocalDeviceAuthentication
     static let title: LocalizedStringResource = "Send Fleet Voice Note"
     static let description = IntentDescription("Records a quick voice or text note in Fleet's inbox and optionally dispatches it to a host.")
 
@@ -44,6 +45,7 @@ struct CheckFleetStatusIntent: AppIntent {
 }
 
 struct AskCommanderIntent: AppIntent {
+    static let authenticationPolicy: IntentAuthenticationPolicy = .requiresLocalDeviceAuthentication
     static let title: LocalizedStringResource = "Ask Fleet Command"
     static let description = IntentDescription("Send a question or directive to Fleet AI Commander across your connected Macs.")
 

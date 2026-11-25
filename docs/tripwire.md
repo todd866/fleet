@@ -36,9 +36,10 @@ Other watched files, system-wide jobs and accounts are investigated but not held
 needs root or would undo ordinary edits. The job that runs `tripwire` is never held, nor are
 the programs in `never_pause`.
 
-The agent investigates and reports. It is told to treat the evidence as data and to change
-nothing, with one exception: when its verdict is BENIGN it finishes with
-`tripwire release <incident>`, which checks the report says BENIGN and undoes the hold. Any
+The bundled investigator returns its report on stdout, using Gemini's sandboxed plan mode or
+Z.ai with only read, glob and grep tools. The wrapper saves the first complete verdict atomically.
+On its next check Tripwire releases a hold whose report begins with the exact line `VERDICT: BENIGN`.
+Any
 other verdict leaves the hold in place and tells the owner, who releases it with
 `tripwire release <incident> --owner`. When the agent never reports, after
 `hold_timeout_min` (default 60) a stopped process or job goes on again, because that hold

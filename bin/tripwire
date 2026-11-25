@@ -17,15 +17,15 @@ baseline moves on with it.
 Hold first, then think. When an agent is about to look, the changed thing is paused at once in
 a way that can be undone: a new listener's process is stopped (SIGSTOP), a new or changed
 launchd job is disabled and unloaded, a login-key or guard-hook file is put back to its last
-checked version. The agent's last act on a BENIGN verdict is `tripwire release`, which undoes
-it. Any other verdict leaves it held for the owner. When the agent never reports, a stopped
+checked version. Tripwire releases a hold once the investigator reports BENIGN. Any other
+verdict leaves it held for the owner. When the agent never reports, a stopped
 process or job goes on again after `hold_timeout_min` (default 60); a put-back file stays put
 back until the owner releases it. Nothing is held when no agent can be started.
 
 Config (all optional): ~/.config/fleet/tripwire.json
   {"host": "hub", "mail_to": "hub:fleet", "registry": "~/path/jobs.tsv", "max_summons_per_day": 4,
    "files": ["~/.ssh/authorized_keys", ...], "must_contain": [["~/.claude/settings.json", "agentkit hook"]],
-   "summon": ["claude", "-p", "{brief}", "--max-turns", "40", "--allowedTools", "Bash", "Read", "Glob", "Grep", "Write"],
+   "summon": ["tripwire-investigate", "--engine", "gemini"],
    "summon_fallback": [the same shape, started once if the first agent exits without a report],
    "quiet_listeners": ["rapportd"], "hold": true, "hold_timeout_min": 60,
    "hold_files": ["~/.ssh/authorized_keys"], "never_pause": ["sshd", "launchd"]}
@@ -53,11 +53,13 @@ DEFAULT_FILES = [
     "/etc/ssh/sshd_config", "/etc/ssh/sshd_config.d",
 ]
 DEFAULT_MUST_CONTAIN = [
+    ["~/.claude/settings.json", "agentkit hook"],
+    ["~/.codex/hooks.json", "agentkit hook"],
     ["~/.gemini/config/hooks.json", "agentkit hook"],
     ["~/.cursor/hooks.json", "agentkit hook"],
 ]
 LAUNCHD_DIRS = ["~/Library/LaunchAgents", "/Library/LaunchAgents", "/Library/LaunchDaemons"]
-DEFAULT_SUMMON = ["tripwire-investigate", "{brief}"]
+DEFAULT_SUMMON = ["tripwire-investigate"]
 
 HOLD_FILES = ["~/.ssh/authorized_keys"]
 NEVER_PAUSE = ["sshd", "launchd"]
@@ -358,6 +360,8 @@ def apply_holds(config, found, incident, kill=os.kill):
                 held = None
                 if target.is_file():
                     held = incident / "held" / target.name
+                    if held.exists():
+                        held = incident / "held" / digest(str(target).encode()) / target.name
                     put(held, target.read_bytes())
                 mode = (target.stat().st_mode & 0o777) if target.exists() else 0o600
                 earlier = kept.read_bytes()
@@ -424,7 +428,7 @@ def release(name, config=None, owner=False, kill=os.kill):
         first = (incident / "report.md").read_text(errors="replace").splitlines()[0].strip()
     except (OSError, IndexError):
         first = ""
-    if not owner and not first.upper().startswith("VERDICT: BENIGN"):
+    if not owner and first != "VERDICT: BENIGN":
         print("tripwire: not released. It needs a report whose first line is `VERDICT: BENIGN`, "
               "or the owner's `--owner`.")
         return 1
@@ -479,6 +483,7 @@ def release_stale(config, now, kill=os.kill, spawn=subprocess.Popen, **hooks):
                 pid = getattr(agent, "pid", None)
                 started = process_start(pid) if pid else None
                 record["agent_pid"], record["agent_started"] = (pid, started) if started else (None, None)
+                record["stdout_report"] = pathlib.Path(command[0]).name == "tripwire-investigate"
                 record["agent"] = "first agent exited without a report; fallback agent summoned"
                 write_json(path, record)
                 continue
@@ -525,6 +530,7 @@ def summon(config, incident, host, now, found=(), record=None, spawn=subprocess.
     if not argv or not shutil.which(argv[0]):
         return "not summoned: no agent command on this Mac"
     mail_to = config.get("mail_to")
+    record["stdout_report"] = pathlib.Path(argv[0]).name == "tripwire-investigate"
     holds = apply_holds(config, found, incident, kill=kill)
     if holds:
         record["holds"] = holds
@@ -569,7 +575,7 @@ def raise_incident(config, found, now, host, do_summon=True, **hooks):
     return incident
 
 
-def read_verdicts(config, **hooks):
+def read_verdicts(config, kill=os.kill, **hooks):
     """An agent's report with a verdict other than BENIGN is pushed to the owner, once."""
     for report in sorted((STATE / "incidents").glob("*/report.md")):
         flag = report.parent / "verdict.seen"
@@ -579,8 +585,12 @@ def read_verdicts(config, **hooks):
             first = report.read_text(errors="replace").splitlines()[0].strip()
         except (OSError, IndexError):
             continue
+        if first == "VERDICT: BENIGN":
+            record = read_json(report.parent / "incident.json", {})
+            if record.get("stdout_report") and record.get("holds") and not record.get("released"):
+                release(report.parent.name, config, kill=kill)
         flag.write_text(first + "\n")
-        if not first.upper().startswith("VERDICT: BENIGN"):
+        if first != "VERDICT: BENIGN":
             notify(config, f"{host_name(config)}: {first or 'report has no verdict'} — {report}", **hooks)
 
 
@@ -614,7 +624,7 @@ def check(config=None, now=None, host=None, wires=WIRES, **hooks):
     keep_copies(config)
     told = {k: v for k, v in hooks.items() if k == "runner"}
     release_stale(config, now, **{k: v for k, v in hooks.items() if k in ("runner", "kill", "spawn")})
-    read_verdicts(config, **told)
+    read_verdicts(config, **{k: v for k, v in hooks.items() if k in ("runner", "kill")})
     return 0
 
 

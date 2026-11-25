@@ -29,8 +29,10 @@ public struct PairingLink: Sendable, Equatable {
         self.mcToken = mcToken
     }
 
-    private static func validatedServerURL(_ raw: String) throws -> String {
-        guard let parsed = URL(string: raw),
+    static func validatedServerURL(_ raw: String) throws -> String {
+        let base = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let parsed = URLComponents(string: base),
+              parsed.user == nil, parsed.password == nil, parsed.query == nil, parsed.fragment == nil,
               let scheme = parsed.scheme?.lowercased(),
               let host = parsed.host?.lowercased(),
               !host.isEmpty else {
@@ -40,7 +42,7 @@ public struct PairingLink: Sendable, Equatable {
         guard scheme == "https" || isLocalHTTP else {
             throw PairingLinkError.insecureServerURL
         }
-        return raw.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        return base.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
     }
 
     public static func parse(_ url: URL) throws -> PairingLink {
