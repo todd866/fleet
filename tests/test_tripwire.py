@@ -116,6 +116,8 @@ printf '%s\\n' "$TEST_REPORT"
         args = (incident / "args.txt").read_text().splitlines()
         self.assertIn("plan", args)
         self.assertIn("--sandbox", args)
+        record = json.loads((incident / "incident.json").read_text())
+        self.assertIn(json.dumps({key: record[key] for key in ("host", "raised", "changes")}), args)
         self.assertNotIn("--dangerously-skip-permissions", args)
         self.assertEqual(run("VERDICT: SUSPICIOUS\nsecond response"), 0)
         self.assertEqual((incident / "report.md").read_text(), "VERDICT: BENIGN\nfixture evidence\n")
