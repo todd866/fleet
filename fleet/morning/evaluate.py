@@ -397,9 +397,13 @@ def _jobs(name, host, config, now, tz, registry=None, prefixes=("com.example.",)
         state = str(job.get("state") or "")
         if not loaded:
             status, value, datum = "fail", "unloaded", "not loaded"
-        elif state == "running" and str(exit_code) in TERM_EXITS:
-            # SIGTERM is what launchctl sends when a job is restarted or reloaded. The exit code
-            # belongs to the previous instance; the job is up now.
+        elif state == "running" and (
+            str(exit_code) in TERM_EXITS
+            or (isinstance(job.get("uptime_s"), (int, float)) and not isinstance(job.get("uptime_s"), bool) and job["uptime_s"] >= 300)
+        ):
+            # SIGTERM is what launchctl sends when a job is restarted or reloaded, and a process
+            # that has been running stably for 5+ minutes is up now; the exit code belongs to a
+            # previous instance (KeepAlive daemons keep their prior LastExitStatus forever).
             status, value, datum = "pass", "ran", when or "running"
         elif job.get("retry_pending") and str(exit_code) in TERM_EXITS:
             # A UTC run cut short by a restart. The wrapper has reopened its slot and runs it

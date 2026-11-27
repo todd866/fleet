@@ -199,6 +199,50 @@ class BackupScheduling(unittest.TestCase):
                 self.assertIsNone(M.cached_capacity(dict(CFG,min_free_gb=150),1200,1100))
                 self.assertIsNone(M.cached_capacity(dict(CFG,min_free_gb=150),500,30000))
 
+    def test_guarded_copy_stops_cleanly_on_slice(self):
+        import sys
+        cfg = dict(CFG, require_ac=False, slice_s=1)
+        with tempfile.TemporaryFile(mode="w+") as buf:
+            res = M.guarded_copy([sys.executable, "-c", "import time; time.sleep(10)"], buf, cfg)
+            buf.seek(0)
+            out = buf.read()
+        self.assertEqual(res.returncode, 75)
+        self.assertIn("Slice used (1s)", out)
+
+    def test_run_once_records_slice_used_without_marking_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            home = Path(tmp) / "home"
+            home.mkdir()
+            cfg = dict(CFG, require_ac=False, skip_dataless=[], slice_s=1)
+            def fake_copy(args, handle, _cfg):
+                handle.write("\nSlice used (1800s); partial copy retained, continues next pass.\n")
+                return SimpleNamespace(returncode=75)
+            with patch.object(M, "STATE", state), \
+                 patch.object(M, "METERED", state / "METERED_LINK"), \
+                 patch.object(M, "HOME", home), \
+                 patch.object(M, "remote_free_gb", return_value=500.0), \
+                 patch.object(M, "guarded_copy", side_effect=fake_copy):
+                st = M.run_once(cfg)
+            self.assertEqual(st["state"], "slice used, continues")
+            self.assertNotIn("last_success_epoch", st)
+
+    def test_disk_slot_busy_in_preflight_is_deferred_not_failed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            cfg = dict(CFG, preflight_space=True)
+            def fake_copy(args, handle, _cfg):
+                handle.write("disk-slot: disk7 is busy, pid 123 has waited longer; home-mirror not started\n")
+                return SimpleNamespace(returncode=12)
+            with patch.object(M, "STATE", state), \
+                 patch.object(M, "METERED", state / "METERED_LINK"), \
+                 patch.object(M, "on_ac", return_value=True), \
+                 patch.object(M, "remote_free_gb", return_value=500.0), \
+                 patch.object(M, "dataless", return_value=[]), \
+                 patch.object(M, "guarded_copy", side_effect=fake_copy):
+                st = M.run_once(cfg)
+            self.assertEqual(st["state"], "deferred: hub disk busy (disk-slot)")
+
     def test_busy_or_unknown_hub_priority_lock_defers_new_copy(self):
         cfg=dict(CFG,hub_priority_lock='/state/archive/run.lock')
         self.assertFalse(M.priority_busy(CFG,run=lambda *a,**kw: self.fail('unexpected call')))

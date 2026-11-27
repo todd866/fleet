@@ -430,5 +430,37 @@ class Cadence(unittest.TestCase):
             self.assertEqual(summary["generated"], NOW_S)
 
 
+class AuditFixes(unittest.TestCase):
+    def test_check_result_respects_where_host(self):
+        from fleet.morning.discover import Check
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            res = home / ".local/state/fleet/found/check.json"
+            res.parent.mkdir(parents=True)
+            res.write_text(json.dumps({"status": "fail", "value": "25/59", "datum": "search", "detail": "bad", "generated": NOW_S}))
+            spec = Check("fleet", None, 120, "primary", False, "~/.local/state/fleet/found/check.json", 26)
+            # Non-matching host must return None instead of shadowing the designated host's pass.
+            self.assertIsNone(collect._check_result(spec, home / "Projects/fleet", home, "hub", NOW_S, config()))
+            # Designated host reads the file.
+            got = collect._check_result(spec, home / "Projects/fleet", home, collect.site.primary(), NOW_S, config())
+            self.assertIsNotNone(got)
+            self.assertEqual(got["status"], "fail")
+
+    def test_running_job_with_stable_uptime_is_not_failed_by_prior_exit(self):
+        snap = {
+            "hosts": {
+                "primary": host(jobs=[
+                    {"label": "com.example.stable", "loaded": True, "state": "running", "exit": -9, "uptime_s": 3600, "when": "always on"},
+                    {"label": "com.example.crashloop", "loaded": True, "state": "running", "exit": 1, "uptime_s": 12, "when": "always on"},
+                    {"label": "com.example.dead", "loaded": True, "state": "idle", "exit": 1, "when": "every 5m"},
+                ])
+            }
+        }
+        r = rows(snap)
+        self.assertEqual(r["job:primary:stable"].status, "pass")
+        self.assertEqual(r["job:primary:crashloop"].status, "fail")
+        self.assertEqual(r["job:primary:dead"].status, "fail")
+
+
 if __name__ == "__main__":
     unittest.main()

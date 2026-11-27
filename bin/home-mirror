@@ -58,6 +58,7 @@ def load_config(path=CONFIG):
     cfg.setdefault("exclude", [])
     cfg.setdefault("skip_dataless", [])
     cfg.setdefault("first_pass_free_gb", 0)
+    cfg.setdefault("slice_s", 1800)
     cfg["exclude"] = [e["pattern"] if isinstance(e, dict) else e for e in cfg["exclude"]]
     for key in ("hub", "dest"):
         if not cfg.get(key):
@@ -109,16 +110,24 @@ def idle_allowed(cfg):
         return False
 
 
-def guarded_copy(args, handle, cfg):
-    """End our process group cleanly if the shared laptop becomes active or loses mains."""
+def guarded_copy(args, handle, cfg, slice_s=None):
+    """End our process group cleanly if the shared laptop becomes active, loses mains, or uses its disk slice."""
+    limit = int(cfg.get("slice_s") or 0) if slice_s is None else int(slice_s)
+    poll_s = min(15.0, max(0.05, float(limit))) if limit > 0 else 15.0
+    started = time.monotonic()
     child = subprocess.Popen(args, stdout=handle, stderr=subprocess.STDOUT, start_new_session=True)
     try:
         while True:
             try:
-                return subprocess.CompletedProcess(args, child.wait(timeout=15))
+                return subprocess.CompletedProcess(args, child.wait(timeout=poll_s))
             except subprocess.TimeoutExpired:
+                if limit > 0 and (time.monotonic() - started) >= limit:
+                    handle.write(f"\nSlice used ({limit}s); partial copy retained, continues next pass.\n")
+                    handle.flush()
+                    return subprocess.CompletedProcess(args, 75)
                 if not idle_allowed(cfg) or (cfg.get("require_ac") and not on_ac()) or METERED.exists():
                     handle.write("\nDeferred: laptop activity, power or network changed; partial copy retained.\n")
+                    handle.flush()
                     return subprocess.CompletedProcess(args, 75)
     finally:
         if child.poll() is None:
@@ -370,10 +379,16 @@ def run_once(cfg, force=False, dry=False):
             write_status(dict(status, state="preflight: waiting for disk and checking incremental size", attempt_epoch=now))
         plan_log = STATE / "preflight.log"
         with plan_log.open("w") as handle:
-            plan = guarded_copy(rsync_args(cfg, exclude_file, stamp, dry=True), handle, cfg)
-        planned = stats(plan_log.read_text(errors="replace"))
+            plan = guarded_copy(rsync_args(cfg, exclude_file, stamp, dry=True), handle, dict(cfg, slice_s=0))
+        plan_text = plan_log.read_text(errors="replace")
+        planned = stats(plan_text)
         if plan.returncode not in (0, 24) or "bytes" not in planned:
-            status["state"] = "failed: capacity preflight (see preflight.log)"
+            if re.search(r"disk-slot:.*(?:is busy|not started)", plan_text):
+                status["state"] = "deferred: hub disk busy (disk-slot)"
+            elif "destination reserve changed" in plan_text:
+                status["state"] = "deferred: destination reserve changed"
+            else:
+                status["state"] = "failed: capacity preflight (see preflight.log)"
             return status
         free = remote_free_gb(cfg)
         needed = planned["bytes"] / 1e9 * 1.10 + float(cfg["min_free_gb"])
@@ -395,6 +410,12 @@ def run_once(cfg, force=False, dry=False):
     if done.returncode in (0, 24) and not dry:
         status.update(state="ok", last_success_epoch=int(time.time()))
         status.setdefault("first_success_epoch", status["last_success_epoch"])
+    elif not dry and done.returncode == 75 and "Slice used (" in text:
+        status["state"] = "slice used, continues"
+    elif not dry and re.search(r"disk-slot:.*(?:is busy|not started)", text):
+        status["state"] = "deferred: hub disk busy (disk-slot)"
+    elif not dry and "destination reserve changed" in text:
+        status["state"] = "deferred: destination reserve changed"
     else:
         status["state"] = "dry run" if dry else f"failed: rsync exit {done.returncode} (see rsync.log)"
     return status

@@ -89,26 +89,28 @@ pub fn ship(
 ) -> Result<Manifest, String> {
     let dir = vol_dir(archive, host, volume);
     fs::create_dir_all(dir.join("history")).map_err(|e| e.to_string())?;
-    let mut existing = read_events(&dir.join("events.jsonl"));
-    for event in events {
-        existing.insert(
-            event.id,
-            EventLine {
-                id: event.id,
-                t: event.t,
-                path: event.path.clone(),
-                delta_bytes: event.delta_bytes,
-            },
-        );
-    }
-    let mut body = String::new();
     let mut through = 0i64;
-    for row in existing.values() {
-        body.push_str(&serde_json::to_string(row).map_err(|e| e.to_string())?);
-        body.push('\n');
-        through = through.max(row.id);
+    if !events.is_empty() {
+        let mut existing = read_events(&dir.join("events.jsonl"));
+        for event in events {
+            existing.insert(
+                event.id,
+                EventLine {
+                    id: event.id,
+                    t: event.t,
+                    path: event.path.clone(),
+                    delta_bytes: event.delta_bytes,
+                },
+            );
+        }
+        let mut body = String::new();
+        for row in existing.values() {
+            body.push_str(&serde_json::to_string(row).map_err(|e| e.to_string())?);
+            body.push('\n');
+            through = through.max(row.id);
+        }
+        write_atomic(&dir.join("events.jsonl"), body.as_bytes())?;
     }
-    write_atomic(&dir.join("events.jsonl"), body.as_bytes())?;
 
     let mut days: BTreeMap<String, BTreeMap<String, i64>> = BTreeMap::new();
     for row in history {
@@ -242,6 +244,10 @@ pub fn spool_take(
         }
     }
     Ok((events, history))
+}
+
+pub fn has_spool(spool: &Path, host: &str, volume: &str) -> bool {
+    vol_dir(spool, host, volume).exists()
 }
 
 pub fn spool_clear(spool: &Path, host: &str, volume: &str) -> Result<(), String> {

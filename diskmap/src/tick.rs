@@ -1229,7 +1229,8 @@ fn ship_archive(roots: &Roots, cfg: &DiskConfig, drives: &[DriveDef], host: &Res
             }
             let uuid = engine::meta(&path, "uuid")?.unwrap_or_else(|| "volume".into());
             let (events, history) = pending_ship(&path)?;
-            if events.is_empty() && history.is_empty() {
+            let has_spool = mounted_ok && allowed && archive::has_spool(&spool, &host.id, &uuid);
+            if events.is_empty() && history.is_empty() && !has_spool {
                 continue;
             }
             if mounted_ok && allowed {
@@ -1238,6 +1239,10 @@ fn ship_archive(roots: &Roots, cfg: &DiskConfig, drives: &[DriveDef], host: &Res
                 ev.extend(events);
                 let mut hist = spooled_h;
                 hist.extend(history);
+                if ev.is_empty() && hist.is_empty() {
+                    archive::spool_clear(&spool, &host.id, &uuid)?;
+                    continue;
+                }
                 let manifest = archive::ship(&dest, &host.id, &uuid, &ev, &hist)?;
                 archive::spool_clear(&spool, &host.id, &uuid)?;
                 // Shipping is idempotent (events keyed by id), so if the
@@ -1261,10 +1266,18 @@ fn ship_archive(roots: &Roots, cfg: &DiskConfig, drives: &[DriveDef], host: &Res
 }
 
 fn pending_ship(db_path: &Path) -> Result<(Vec<crate::store::EventRow>, Vec<HistRow>), String> {
-    let db = store::open(db_path)?;
+    let db = store::open_readonly(db_path)?;
     let watermark = store::meta_get(&db, "shipped_event_id")?.and_then(|s| s.parse().ok()).unwrap_or(0);
     let events = store::events_after_id(&db, watermark)?;
-    let history = store::history_all(&db)?;
+    let shipped_days: std::collections::HashSet<String> = store::meta_get(&db, "shipped_days")?
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let history = store::history_all(&db)?
+        .into_iter()
+        .filter(|row| !shipped_days.contains(&row.day))
+        .collect();
     Ok((events, history))
 }
 
@@ -1486,6 +1499,21 @@ mod tests {
         let logs = super::SKIP_LOGS.with(|logs| logs.borrow().clone());
         assert_eq!(logs, vec!["diskmap: walker holds the database; skipping writes".to_string()]);
         drop(lock);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pending_ship_skips_already_shipped_days() {
+        let dir = scratch();
+        let path = dir.join("vol.db");
+        let db = store::open(&path).unwrap();
+        db.exec("INSERT INTO history(day, path, total_bytes) VALUES ('2026-11-25', 'a', 100), ('2026-11-26', 'a', 200)").unwrap();
+        store::meta_set(&db, "shipped_days", r#"["2026-11-25"]"#).unwrap();
+        drop(db);
+        let (events, history) = pending_ship(&path).unwrap();
+        assert!(events.is_empty());
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].day, "2026-11-26");
         let _ = fs::remove_dir_all(&dir);
     }
 }

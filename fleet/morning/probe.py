@@ -406,6 +406,8 @@ def _jobs():
         info = printed.get(label) or {}
         known = label in listed or label in printed
         logs = [info.get("stdout"), info.get("stderr"), plist.get("StandardOutPath"), plist.get("StandardErrorPath")]
+        pid = (listed.get(label) or {}).get("pid")
+        uptime_s = _pid_uptime_s(pid) if (info.get("state") == "running" and pid and str(pid).isdigit()) else None
         row = {
             "label": label,
             "loaded": known,
@@ -416,6 +418,8 @@ def _jobs():
             "when": _when(plist),
             "cmd": " ".join(str(part) for part in (plist.get("ProgramArguments") or [])),
         }
+        if uptime_s is not None:
+            row["uptime_s"] = uptime_s
         if _utc_daily(plist):
             # The plist ticks every few minutes; launchd's exit code is the last tick's, almost
             # always a quiet 0. The wrapper's own record is the job's real last run.
@@ -570,6 +574,44 @@ def _print_fields(body):
         "stdout": fields.get("stdout path"),
         "stderr": fields.get("stderr path"),
     }
+
+
+def _parse_etime(text):
+    """Parse `ps -o etime=` (`[[dd-]hh:]mm:ss`) into seconds, or None."""
+    s = (text or "").strip()
+    if not s:
+        return None
+    days = 0
+    if "-" in s:
+        d, s = s.split("-", 1)
+        if not d.isdigit():
+            return None
+        days = int(d)
+    parts = s.split(":")
+    if not (2 <= len(parts) <= 3) or not all(p.isdigit() for p in parts):
+        return None
+    nums = [int(p) for p in parts]
+    if len(nums) == 2:
+        hours, mins, secs = 0, nums[0], nums[1]
+    else:
+        hours, mins, secs = nums
+    return days * 86400 + hours * 3600 + mins * 60 + secs
+
+
+def _pid_uptime_s(pid):
+    try:
+        pid_int = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid_int <= 0:
+        return None
+    try:
+        res = subprocess.run(["/bin/ps", "-o", "etime=", "-p", str(pid_int)], capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if res.returncode != 0:
+        return None
+    return _parse_etime(res.stdout)
 
 
 def _utc_daily(plist):

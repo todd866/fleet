@@ -227,7 +227,12 @@ fn ssh_run(host: &str, remote_cmd: &str, stdin: Option<&[u8]>) -> bool {
             cmd.stdin(Stdio::piped());
             if let Ok(mut child) = cmd.spawn() {
                 if let Some(mut sin) = child.stdin.take() {
+                    // main() resets SIGPIPE to SIG_DFL for stdout pipes (`status | head -1`),
+                    // but an unreachable peer closing ssh early must return EPIPE, not kill relay/send.
+                    let prev = unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
                     let _ = sin.write_all(data);
+                    drop(sin);
+                    unsafe { libc::signal(libc::SIGPIPE, prev) };
                 }
                 child.wait().ok().is_some_and(|s| s.success())
             } else {

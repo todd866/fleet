@@ -334,6 +334,11 @@ def _check_result(spec, repo, home, here, now, config):
         return None
     if spec.result == UNREADABLE:
         return _check_warn(here, "unreadable", ".fleet/check", f"{repo / '.fleet' / 'check'} does not parse")
+    where = (spec.where or "any").strip()
+    if where and where != "any":
+        target = site.hub() if where == "hub" else site.primary() if where == "primary" else where
+        if target != here:
+            return None
     path = _result_path(spec.result, repo, home)
     try:
         if not path.is_file():

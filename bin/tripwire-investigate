@@ -81,7 +81,7 @@ def remote_evidence(record):
 
 
 def text_review(engine, record, seconds):
-    models = {"zai": "glm-5.3", "deepseek": "deepseek-flash"}
+    models = {"zai": "glm-5.4", "deepseek": "deepseek-flash"}
     evidence, drill = remote_evidence(record)
     instruction = ("Review the supplied security observations only. State what changed, what is verified and what "
                    "needs checking. Start with the exact line VERDICT: NEEDS REVIEW, VERDICT: SUSPICIOUS, "

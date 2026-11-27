@@ -210,6 +210,29 @@ exit 0
 }
 
 #[test]
+fn relay_survives_sigpipe_when_peer_closes_stdin() {
+    let (state, config) = temp_dirs();
+    fs::write(config.join("hosts"), "deadpeer\n").unwrap();
+    // Write a large read.txt (> pipe buffer) so write_all hits EPIPE when fake ssh exits immediately.
+    let big_read = "20261127000000-desk-12345\n".repeat(16384);
+    fs::write(state.join("read.txt"), &big_read).unwrap();
+
+    let fake = state.join("dead-ssh.sh");
+    fs::write(&fake, "#!/bin/sh\nexit 255\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let (code, _, _) = run_mail(&state, &config, Some(&fake), &["relay"], None);
+    assert_eq!(code, 0, "relay should not die with SIGPIPE on unreachable peer");
+
+    let _ = fs::remove_dir_all(&state);
+    let _ = fs::remove_dir_all(&config);
+}
+
+#[test]
 fn usage_exit_2() {
     let (state, config) = temp_dirs();
     let (code, stdout, _) = run_mail(&state, &config, None, &["nope"], None);
