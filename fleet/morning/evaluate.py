@@ -273,7 +273,7 @@ def _backups(name, host, config, now):
     if isinstance(host.get("mac_setup"), dict):
         rows.append(_mac_setup(name, host["mac_setup"], now))
     if host.get("home_mirror") is not None:
-        rows.append(_home_mirror(name, host["home_mirror"], cfg, now))
+        rows.extend(_home_mirror(name, host["home_mirror"], cfg, now))
     if "drive_mirror_epoch" in host:
         rows.append(_stamp(
             f"backup:{name}:drive-mirror", f"{name} drive-mirror", host.get("drive_mirror_epoch"),
@@ -1590,16 +1590,81 @@ def _idrive_ingest(name, status, cfg, now):
 
 
 def _home_mirror(name, status, cfg, now):
-    """A laptop's copy of its home on the hub. A laptop away from home for a few days is normal:
-    amber at two days, red at a week; the reason a pass was skipped is in the detail."""
-    key, label = f"backup:{name}:home-mirror", f"{name} home-mirror"
+    """A laptop's copy of its home on the hub, as two rows that never colour each other: the full
+    home, and the personal pass (placement's personal-unique data sets, copied first, one at a
+    time, each with its own space check; `personal` in the status). A laptop away from home for a
+    few days is normal: amber at two days, red at a week; the reason a pass was skipped is in the
+    detail. A status with no personal record comes from a home-mirror older than the personal
+    pass: amber until that pass has run. A Mac with no personal data sets ("not applicable") has
+    no personal row."""
+    rows = [_home_mirror_row(f"backup:{name}:home-mirror", f"{name} home-mirror", status, cfg, now)]
+    personal = status.get("personal")
+    if not isinstance(personal, dict):
+        personal = {"state": "no personal pass recorded; this home-mirror has not run one"}
+    if not str(personal.get("state") or "").startswith("not applicable"):
+        rows.append(_home_mirror_personal(f"backup:{name}:home-mirror-personal", f"{name} home-mirror personal",
+                                          personal, cfg, now))
+    return rows
+
+
+def _home_mirror_personal(key, label, personal, cfg, now):
+    """Green only when every personal data set has a recent good copy. A set waiting for space is
+    amber whatever its age, with the room it needs; so is one never copied, or stopped part-way.
+    Red is a set that failed with no copy to its name, or one whose last copy is a week old."""
+    sets = [s for s in personal.get("sets") or [] if isinstance(s, dict)]
+    if not sets:
+        return _home_mirror_row(key, label, personal, cfg, now, "personal ")
+    warn_h = float(cfg.get("home_mirror_warn_h", 48))
+    fail_h = float(cfg.get("home_mirror_fail_h", 168))
+    word, fresh, ages, waiting, others = "pass", 0, [], [], []
+    for item in sets:
+        state, last = str(item.get("state") or ""), item.get("last_success_epoch")
+        age = None if last is None else (now - int(last)) / 3600
+        mark = "warn" if age is None else "fail" if age >= fail_h else "warn" if age >= warn_h else "pass"
+        if state.startswith("waiting for space"):
+            mark = "warn"
+            waiting.append(f"{item.get('name')} needs {_num(item.get('required_free_gb') or 0)} GB free "
+                           f"({_num((item.get('planned_bytes') or 0) / 1e9)} GB to copy)")
+        elif state.startswith("failed"):
+            mark = "fail" if age is None else _worse(mark, "warn")
+        if mark == "pass":
+            fresh += 1
+            ages.append(age)
+        elif not state.startswith("waiting for space"):
+            others.append(f"{item.get('name')}: {state or 'not run'}"
+                          + (f", last copied {_hours(age)} ago" if age is not None else ""))
+        word = _worse(word, mark)
+    state = str(personal.get("state") or "")
+    if state.startswith("failed") and not any(str(s.get("state")).startswith("failed") for s in sets):
+        word = _worse(word, "warn")   # e.g. placement.toml could not be read this time: the list is stale
+        others.append(state)
+    copied = sum(1 for s in sets if s.get("last_success_epoch"))
+    detail = f"{copied} of {len(sets)} sets copied"
+    if waiting:
+        detail += "; waiting for space: " + ", ".join(waiting)
+    if others:
+        detail += "; " + "; ".join(others)
+    skipped = "; ".join(f"{item.get('path')} ({item.get('why')})" for item in personal.get("skipped") or []
+                        if isinstance(item, dict))
+    if skipped:
+        detail += f"; left out: {skipped}"
+    if word == "pass":
+        return _row(key, word, "backup", label, _hours(max(ages)), f"floor {_num(warn_h)} h",
+                    f"oldest set copied {_hours(max(ages))} ago; warn {_num(warn_h)} h; fail {_num(fail_h)} h; {detail}")
+    datum = f"{len(waiting)} waiting" if waiting else f"{len(sets) - fresh} to copy"
+    return _row(key, word, "backup", label, f"{fresh} of {len(sets)} sets", datum, detail)
+
+
+def _home_mirror_row(key, label, status, cfg, now, what=""):
+    """One pass's row from that pass's own record: its last good copy, its last state."""
     warn_h = float(cfg.get("home_mirror_warn_h", 48))
     fail_h = float(cfg.get("home_mirror_fail_h", 168))
     state = str(status.get("state") or "")
     last = status.get("last_success_epoch")
     if last is None:
         word = "fail" if state.startswith("failed") else "warn"
-        return _row(key, word, "backup", label, "none", "no copy yet", f"no complete copy on the hub yet; {state or 'not run'}")
+        return _row(key, word, "backup", label, "none", "no copy yet",
+                    f"no complete {what}copy on the hub yet; {state or 'not run'}")
     row = _stamp(key, label, last, warn_h, fail_h, now, "no copy")
     word = row.status
     if state.startswith("failed"):

@@ -3,9 +3,13 @@
 
   tripwire check      run every wire against the baseline (launchd, every few minutes)
   tripwire status     wires, baseline age, open incidents
-  tripwire accept     take the current state as the baseline without raising anything
+  tripwire accept     take the current state as the baseline without raising anything (the owner only)
   tripwire test       raise a harmless incident to prove the path (no agent unless --summon)
-  tripwire release ID undo an incident's hold (needs a BENIGN report, or --owner from the owner)
+  tripwire release ID undo an incident's hold: a stopped process or disabled job on the
+                      investigator's signed BENIGN report; a put-back file only with --owner
+
+`accept` and `--owner` are the owner's: they run only at a terminal, after sudo has taken his
+password or Touch ID. Nothing else can vouch for a change nobody investigated.
 
 A wire is a snapshot of one thing an intruder, or an agent that has been talked into
 something, would have to change: who may log in, what starts by itself, what listens on the
@@ -17,10 +21,44 @@ baseline moves on with it.
 Hold first, then think. When an agent is about to look, the changed thing is paused at once in
 a way that can be undone: a new listener's process is stopped (SIGSTOP), a new or changed
 launchd job is disabled and unloaded, a login-key or guard-hook file is put back to its last
-checked version. Tripwire releases a hold once the investigator reports BENIGN. Any other
-verdict leaves it held for the owner. When the agent never reports, a stopped
+checked version. On the investigator's BENIGN, tripwire continues the process or enables the job;
+a put-back file stays put back for the owner, whatever the verdict (see below). Any other
+verdict leaves everything held for the owner. When the agent never reports, a stopped
 process or job goes on again after `hold_timeout_min` (default 60); a put-back file stays put
 back until the owner releases it. Nothing is held when no agent can be started.
+
+Tripwire believes only what it wrote. The baseline, each kept copy, each incident record and each
+report carry a seal (tripwire_seal.py). A file without a valid seal is evidence, never an
+instruction: nothing is released, put back or loaded on its word, and tripwire raises an incident
+about it. Even a sealed hold is undone only where the configuration allows: a file among the hold
+files, from the copy in that incident's own folder; a job whose plist sits in a launchd folder
+under the name recorded. The configuration is held like a login-key file: an edit is not obeyed
+until its incident is released or the owner accepts it.
+
+Only tripwire holds the key. Its investigator (tripwire-investigate) never does: tripwire starts
+it through `tripwire review`, a process whose pid and start time it writes into the sealed
+record, and that process alone takes the investigator's answer from a pipe and seals it. A
+report.md written any other way carries no seal and releases nothing. The investigator is run
+as this checkout's own file by this Python, with a PATH of system folders only; the provider
+program it calls (`agy`) is named by absolute path, its SHA-256 goes into the sealed record and
+is checked again before use, and it is one of the files tripwire watches, so a replaced provider
+raises an incident and is not used for the check that notices it.
+
+What a verdict may release. All of that narrows who can get a report sealed; it does not make the
+verdict trustworthy. The provider program sits in a folder the owner's own programs can write,
+its settings and sign-in are the owner's files, and the model reads evidence whose names and
+contents the author of the change chose. So a BENIGN verdict is good enough to let work carry
+on, and not good enough to decide who may log in: it undoes operational holds only (a stopped
+process, a disabled job). A put-back login-key file, guard hook file or tripwire configuration
+is returned only by the owner, with `tripwire release ID --owner`.
+
+Lockdown. When tripwire has saved state but no baseline it can believe (the baseline or the key
+is missing or was rewritten; also the first run of this version over unsigned state), nothing on
+the Mac is taken as found. The hold files are compared with their sealed kept copies and put back
+where they differ, with or without an investigator; the kept copies, the accepted configuration
+and tripwire's own job stay as they were; a report releases nothing; and the rest is watched
+from a provisional baseline. It lasts until the owner runs `tripwire accept`. Only a state
+folder with nothing in it and no key is a first run.
 
 Config (all optional): ~/.config/fleet/tripwire.json
   {"host": "hub", "mail_to": "hub:fleet", "registry": "~/path/jobs.tsv", "max_summons_per_day": 4,
@@ -29,13 +67,15 @@ Config (all optional): ~/.config/fleet/tripwire.json
    "summon_fallback": [the same shape, started once if the first agent exits without a report],
    "quiet_listeners": ["rapportd"], "hold": true, "hold_timeout_min": 60,
    "hold_files": ["~/.ssh/authorized_keys"], "never_pause": ["sshd", "launchd"]}
-State: ~/.local/state/fleet/tripwire/ (TRIPWIRE_STATE). Config path: TRIPWIRE_CONFIG.
+State: ~/.local/state/fleet/tripwire/ (TRIPWIRE_STATE). Config path: TRIPWIRE_CONFIG. Run with either
+set (or another HOME) and tripwire signs with a key of that state folder's own, never the real one.
 """
 import hashlib
 import json
 import os
 import pathlib
 import plistlib
+import re
 import shutil
 import signal
 import socket
@@ -45,15 +85,23 @@ import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import tripwire_report as reports
+import tripwire_seal as seal
 
 HOME = pathlib.Path(os.environ.get("HOME", "~")).expanduser()
 STATE = pathlib.Path(os.environ.get("TRIPWIRE_STATE", HOME / ".local/state/fleet/tripwire"))
 CONFIG = pathlib.Path(os.environ.get("TRIPWIRE_CONFIG", HOME / ".config/fleet/tripwire.json"))
+KEY = seal.key_path(HOME, STATE, CONFIG)
+HERE = pathlib.Path(__file__).resolve().parent
+# Tripwire's own configuration and programs: whoever edits these decides what tripwire does.
+OWN_FILES = [str(CONFIG)] + [str(HERE / name) for name in
+                             ("tripwire", "tripwire_report.py", "tripwire_seal.py", "tripwire-investigate")]
+OWN_FILES.append(os.path.realpath(sys.executable))   # and the Python that runs them
+INVESTIGATOR = os.path.realpath(HERE / "tripwire-investigate")
 
 DEFAULT_FILES = [
     "~/.ssh/authorized_keys", "~/.ssh/config", "~/.zshenv", "~/.zshrc", "~/.zprofile", "~/.bash_profile",
-    "~/.config/agentkit/agentkit.toml", "/etc/hosts", "/etc/pam.d/sudo", "/etc/sudoers", "/etc/sudoers.d",
-    "/etc/ssh/sshd_config", "/etc/ssh/sshd_config.d",
+    "~/.config/agentkit/agentkit.toml", "/etc/hosts", "/etc/pam.d/sudo", "/etc/pam.d/sudo_local", "/etc/sudoers",
+    "/etc/sudoers.d", "/etc/ssh/sshd_config", "/etc/ssh/sshd_config.d",
 ]
 DEFAULT_MUST_CONTAIN = [
     ["~/.claude/settings.json", "agentkit hook"],
@@ -67,6 +115,24 @@ MAX_RESTORE_ATTEMPTS = 3
 
 HOLD_FILES = ["~/.ssh/authorized_keys"]
 NEVER_PAUSE = ["sshd", "launchd"]
+
+# The investigator gets a PATH of system folders only. A provider program is not found through
+# PATH at all: tripwire looks in PROVIDER_DIRS, hands over the absolute path, pins its SHA-256 in
+# the sealed record and watches the file (those folders are the owner's to write, so that is the
+# most that can be said for what is in them).
+SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+PROVIDERS = ("agy",)
+PROVIDER_DIRS = [str(HOME / ".local/bin"), "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
+PASSED_ON = ("LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "USER", "LOGNAME", "SHELL", "__CF_USER_TEXT_ENCODING",
+             "TRIPWIRE_STATE", "TRIPWIRE_CONFIG")
+
+DRILL_CHANGE = {"wire": "test", "what": "tripwire test", "before": None, "after": "raised by hand"}
+SELF = "tripwire"   # the wire name for trouble with tripwire's own saved state
+META = "_meta"      # the baseline's section for what tripwire has to remember about itself
+NO_KEY = ("tripwire: no usable signing key at {key}. It must be a plain file of this user's, mode 0600, in a "
+          "folder nobody else can write. Nothing was done.")
+OWNER_ONLY = ("tripwire: `{what}` is the owner's. Run it yourself at a terminal: sudo asks for your password "
+              "or Touch ID first (nothing runs as root).")
 
 BRIEF = """You were started by `tripwire` on the Mac `{host}` because something security-relevant changed
 with nobody watching. Work out whether the change is ordinary or not, and report.
@@ -90,13 +156,13 @@ The hold. Until you report, tripwire is holding what changed, so that nothing is
 the time to look. incident.json lists it under `holds`: a process stopped with SIGSTOP, a
 launchd job disabled and unloaded, or a file put back to its last checked version (the changed
 version is kept in {incident}/held/). Bear in mind that what you inspect may be in that state.
-If and only if your verdict is BENIGN, finish by running `tripwire release {name}`: it undoes
-the hold and somebody's work carries on. For any other verdict leave it held, and say in the
-report that the owner releases it with `tripwire release {name} --owner`. Never pass --owner
+You cannot release it and must not try: tripwire undoes a hold only on a report signed by the
+investigator it runs itself, or for the owner. Say in the report that the owner releases it with
+`tripwire release {name} --owner`, which asks for his password or Touch ID. Never run that
 yourself.
 
 Limits. Investigate only: do not delete, move, edit, unload, kill, disable, push or send anything
-except the report{mail_note} and that release. Do not undo the change yourself, even if it
+except the report{mail_note}. Do not undo the change yourself, even if it
 looks hostile; say how to undo it in the report. Do not read private keys or print secrets. If a guard refuses a command,
 do not rephrase it; note it and carry on.
 """
@@ -124,6 +190,21 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()[:16]
 
 
+def file_sha(path):
+    """SHA-256 of a file, read in pieces."""
+    code = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for piece in iter(lambda: handle.read(1 << 20), b""):
+            code.update(piece)
+    return code.hexdigest()
+
+
+def provider_files():
+    """{name: real path} of each provider program the investigator may be given."""
+    found = {name: shutil.which(name, path=":".join(PROVIDER_DIRS)) for name in PROVIDERS}
+    return {name: os.path.realpath(path) for name, path in found.items() if path}
+
+
 def fingerprint(path):
     """Content hash where readable, else size and mtime; a directory is its listing."""
     try:
@@ -133,7 +214,7 @@ def fingerprint(path):
         if not path.exists():
             return "absent"
         try:
-            return "sha:" + digest(path.read_bytes())
+            return "sha:" + file_sha(path)[:16]
         except OSError:
             st = path.stat()
             return f"stat:{st.st_size}:{int(st.st_mtime)}"
@@ -151,17 +232,66 @@ def run(argv, timeout=20):
 # ---- wires: each returns {key: value}, or None when it could not look ----
 
 def wire_files(config):
-    return {str(p): fingerprint(expand(p)) for p in config.get("files", DEFAULT_FILES)}
+    watched = list(config.get("files", DEFAULT_FILES)) + OWN_FILES + list(provider_files().values())
+    return {str(p): fingerprint(expand(p)) for p in dict.fromkeys(watched)}
+
+
+PLAIN_WORD = re.compile(r"[A-Za-z0-9_.,:=@%+-]+")
+
+
+def hook_commands(node, trail=(), matchers=()):
+    """Every hook command in a provider's hook file, with where it sits: (keys on the way down,
+    matchers on the way down, command)."""
+    if isinstance(node, dict):
+        if "matcher" in node:
+            matchers = matchers + (str(node["matcher"]),)
+        for name, value in node.items():
+            if name == "command" and isinstance(value, str):
+                yield [list(trail), list(matchers), value]
+            else:
+                yield from hook_commands(value, trail + (str(name),), matchers)
+    elif isinstance(node, list):
+        for value in node:
+            yield from hook_commands(value, trail, matchers)
+
+
+def guard_wiring(path, text, needle):
+    """Where the file calls the guard, or [] when it does not. A hook counts only when its whole
+    command is the needle's words followed by plain arguments: `true # agentkit hook`, a needle
+    inside another command, or `... || true` after it is not the guard. A .json file must parse
+    and its commands are judged; any other file is judged line by line."""
+    want = needle.split()
+    if pathlib.Path(path).suffix == ".json":
+        try:
+            data = json.loads(text)
+        except ValueError:
+            return []
+        if isinstance(data, dict) and data.get("disableAllHooks") is True:
+            return []
+        rows = list(hook_commands(data))
+    else:
+        rows = [[[], [], line.strip()] for line in text.splitlines()]
+    def is_guard(command):
+        words = command.split()
+        return bool(want) and words[:len(want)] == want and all(PLAIN_WORD.fullmatch(w) for w in words[len(want):])
+    return sorted(row for row in rows if is_guard(row[2]))
 
 
 def wire_guards(config):
+    """`no file`, `no`, or a fingerprint of the guard's wiring (which events, which matchers,
+    which command), so that moving the hook somewhere harmless is a change like removing it."""
     out = {}
     for path, needle in config.get("must_contain", DEFAULT_MUST_CONTAIN):
         try:
-            out[f"{path} has `{needle}`"] = "yes" if needle in expand(path).read_text(errors="replace") else "no"
+            out[f"{path} has `{needle}`"] = guard_value(path, expand(path).read_text(errors="replace"), needle)
         except OSError:
             out[f"{path} has `{needle}`"] = "no file"
     return out
+
+
+def guard_value(path, text, needle):
+    rows = guard_wiring(path, text, needle)
+    return "sha:" + digest(json.dumps(rows).encode()) if rows else "no"
 
 
 def wire_launchd(config):
@@ -255,16 +385,16 @@ def differences(wire, before, after, registered=frozenset()):
             continue
         if wire == "launchd" and old is None and pathlib.Path(key).stem in registered:
             continue
-        if wire == "guards" and not (old == "yes" and value != "yes"):
-            continue
+        if wire == "guards" and not str(old).startswith("sha:"):
+            continue  # it was not wired in before: only losing or changing the guard's wiring is news
         if wire == "files" and old is None:
             continue  # a path newly added to the watch list
         found.append({"wire": wire, "what": key, "before": old, "after": value})
     return found
 
 
-def snapshot(config, wires=WIRES):
-    return {name: collect(config) for name, collect in wires.items()}
+def snapshot(config, wires=None):
+    return {name: collect(config) for name, collect in (WIRES if wires is None else wires).items()}
 
 
 def read_json(path, default):
@@ -281,10 +411,209 @@ def write_json(path, value):
     os.replace(tmp, path)
 
 
+# ---- seals: tripwire believes only the state it wrote itself (tripwire_seal.py) ----
+
+def key():
+    return seal.load_key(KEY)[0]
+
+
+def read_baseline():
+    """(baseline, trust). Trust is "ok", "absent", or the reason it cannot be believed, and then
+    the baseline returned is empty: an unsealed baseline says nothing about what was there."""
+    try:
+        value = json.loads((STATE / "baseline.json").read_text())
+    except FileNotFoundError:
+        return {}, "absent"
+    except (OSError, ValueError):
+        return {}, "unreadable"
+    if not isinstance(value, dict) or seal.FIELD not in value:
+        return {}, "not signed"
+    if not seal.check(key(), "baseline", "", value):
+        return {}, "wrongly signed"
+    value.pop(seal.FIELD)
+    if not isinstance(value.get(META), dict):
+        value[META] = {}
+    return value, "ok"
+
+
+def write_baseline(baseline):
+    write_json(STATE / "baseline.json", seal.sealed(key(), "baseline", "", baseline))
+
+
+def read_record(incident):
+    """(record, sealed). A record tripwire did not seal is evidence, never an instruction."""
+    record = read_json(incident / "incident.json", None)
+    if not isinstance(record, dict):
+        return None, False
+    ok = seal.check(key(), "incident", incident.name, record)
+    record.pop(seal.FIELD, None)
+    return record, ok
+
+
+def write_record(incident, record):
+    write_json(incident / "incident.json", seal.sealed(key(), "incident", incident.name, record))
+
+
+def write_receipt(incident, attempt, outcomes):
+    """That an investigation attempt ended, and how: sealed, because tripwire gives up a hold on it."""
+    write_json(incident / f"{attempt}-result.json",
+               seal.sealed(key(), "receipt", f"{incident.name}/{attempt}", {"outcomes": outcomes}))
+
+
+def receipt(incident, attempt):
+    value = read_json(incident / f"{attempt}-result.json", None)
+    return value.get("outcomes") if seal.check(key(), "receipt", f"{incident.name}/{attempt}", value) else None
+
+
+def has_state():
+    """Anything tripwire saved earlier. A key that is missing beside any of it is not a first run."""
+    if (STATE / "baseline.json").exists() or (STATE / "summons.json").exists():
+        return True
+    return any(True for folder in ("kept", "incidents") for _ in (STATE / folder).glob("*"))
+
+
+def lockdown():
+    """Why tripwire trusts nothing it has not sealed until the owner's `accept`, or None."""
+    baseline, trust = read_baseline()
+    return baseline[META].get("lockdown") if trust == "ok" else f"its baseline is {trust}"
+
+
+def kept_baseline(config):
+    """All that can still be compared when the baseline cannot be believed: the hold files,
+    against the kept copies tripwire sealed. A file that differs from its copy is then a change
+    like any other, and is put back."""
+    files, guards = {}, {}
+    for path in hold_paths(config):
+        kept = kept_bytes(path)
+        if kept is not None:
+            files[path] = "sha:" + digest(kept)
+    for path, needle in config.get("must_contain", DEFAULT_MUST_CONTAIN):
+        kept = kept_bytes(path)
+        if kept is not None:
+            guards[f"{path} has `{needle}`"] = guard_value(path, kept.decode(errors="replace"), needle)
+    return {"files": files, "guards": guards}
+
+
+def unsigned_kept(config):
+    """Hold files whose kept copy is there but not sealed (edited, or left by a version without seals)."""
+    return [path for path in hold_paths(config) if kept_path(path).exists() and kept_bytes(path) is None]
+
+
+def unsigned_incidents():
+    return [path.parent.name for path in sorted((STATE / "incidents").glob("*/incident.json"))
+            if not read_record(path.parent)[1]]
+
+
+def config_sha():
+    try:
+        return seal.sha(CONFIG.read_bytes())
+    except OSError:
+        return "absent"
+
+
+def accepted_config(meta):
+    """The configuration tripwire obeys: the file on disk only while it is the version last
+    accepted (at the first run, by the owner's `accept`, or by releasing the incident its change
+    raised). An edit could switch the holds off or name the investigator, so until one of those
+    the accepted version stays in force, or the defaults when there was no file."""
+    try:
+        data = CONFIG.read_bytes()
+    except OSError:
+        data = None
+    want = meta.get("config")
+    if want is not None and want != ("absent" if data is None else seal.sha(data)):
+        data = None if want == "absent" else kept_bytes(str(CONFIG))
+        if data is not None and seal.sha(data) != want:
+            data = None
+    try:
+        config = json.loads(data) if data is not None else {}
+    except ValueError:
+        config = {}
+    return config if isinstance(config, dict) else {}
+
+
+def current_config():
+    """The accepted configuration, or None while there is no baseline tripwire can believe."""
+    baseline, trust = read_baseline()
+    return accepted_config(baseline[META]) if trust == "ok" else None
+
+
+def owner_present(run=subprocess.run):
+    """True only when a person at this terminal proves who they are. A terminal alone proves
+    nothing (agents have pseudo-terminals), so sudo must take a password or Touch ID with its
+    cached ticket ignored; and a Mac where sudo asks for nothing cannot prove anything."""
+    if not (sys.stdin.isatty() and sys.stderr.isatty()):
+        return False
+    quiet = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+    try:
+        if run(["/usr/bin/sudo", "-k", "-n", "-v"], **quiet).returncode == 0:
+            print("tripwire: sudo asks for nothing on this Mac, so it cannot show the owner is here", file=sys.stderr)
+            return False
+        print("tripwire: for the owner only. sudo now asks for your password or Touch ID; nothing runs as root.",
+              file=sys.stderr)
+        return run(["/usr/bin/sudo", "-k", "-v"]).returncode == 0
+    except OSError:
+        return False
+
+
+# ---- this job: the only launchd job a hold never touches ----
+
+def job_label(plist, data=None):
+    try:
+        label = plistlib.loads(plist.read_bytes() if data is None else data).get("Label")
+    except Exception:
+        label = None
+    return label if isinstance(label, str) and label else plist.stem
+
+
+def own_jobs(config):
+    """Labels of the launchd jobs that run this program. They are pinned in the sealed baseline at
+    the first run and at the owner's `accept`, so that a plist written later cannot claim the
+    exemption by mentioning tripwire."""
+    here, labels = os.path.realpath(__file__), set()
+    for folder in config.get("launchd_dirs", LAUNCHD_DIRS):
+        try:
+            plists = sorted(expand(folder).glob("*.plist"))
+        except OSError:
+            continue
+        for plist in plists:
+            try:
+                data = plistlib.loads(plist.read_bytes())
+                argv = data.get("ProgramArguments")
+                if (isinstance(argv, list) and isinstance(data.get("Label"), str)
+                        and any(isinstance(arg, str) and os.path.realpath(os.path.expanduser(arg)) == here for arg in argv)):
+                    labels.add(data["Label"])
+            except Exception:
+                continue
+    return sorted(labels)
+
+
+def job_pid(label):
+    found = re.search(r"^\s*pid = (\d+)\s*$", run(["launchctl", "print", f"gui/{os.getuid()}/{label}"]) or "", re.M)
+    return int(found.group(1)) if found else None
+
+
+def this_job():
+    """The launchd label this very process runs as, when launchd confirms it: the name in the
+    environment only says which job to ask about. Disabling it would stop tripwire for good."""
+    label = os.environ.get("XPC_SERVICE_NAME", "")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", label) or label == "0":
+        return None
+    return label if job_pid(label) in (os.getpid(), os.getppid()) else None
+
+
+def own_labels():
+    baseline, trust = read_baseline()
+    pinned = baseline[META].get("own_labels", []) if trust == "ok" else []
+    return set(pinned) | ({this_job()} - {None})
+
+
 # ---- holds: pause the changed thing now, in a way `release` can undo ----
 
 def hold_paths(config):
-    return list(config.get("hold_files", HOLD_FILES)) + [p for p, _ in config.get("must_contain", DEFAULT_MUST_CONTAIN)]
+    """Files a hold may put back, and so the only files a release may ever write."""
+    paths = list(config.get("hold_files", HOLD_FILES)) + [p for p, _ in config.get("must_contain", DEFAULT_MUST_CONTAIN)]
+    return list(dict.fromkeys(paths + [str(CONFIG)]))
 
 
 def kept_path(path):
@@ -300,13 +629,30 @@ def put(target, data, mode=0o600):
     os.replace(tmp, target)
 
 
-def keep_copies(config):
-    """Remember the checked version of each file a hold may need to put back."""
+def kept_bytes(path):
+    """The last checked version of a hold file, only if tripwire sealed it for that path."""
+    try:
+        mark, _, data = kept_path(path).read_bytes().partition(b"\n")
+    except OSError:
+        return None
+    return data if seal.same(mark.decode("ascii", "replace"), seal.mac(key(), "kept", path, seal.sha(data))) else None
+
+
+def keep_copies(config, meta, vouched=()):
+    """Remember the checked version of each file a hold may need to put back. In lockdown what is
+    on the Mac is not a checked version of anything: only a file the owner has just released
+    (`vouched`) is kept."""
     for path in hold_paths(config):
+        if meta.get("lockdown") and path not in vouched:
+            continue
         try:
-            put(kept_path(path), expand(path).read_bytes())
+            data = expand(path).read_bytes()
         except OSError:
-            pass
+            continue
+        if path == str(CONFIG) and seal.sha(data) != meta.get("config"):
+            continue  # an edit nobody has accepted is never the version to go back to
+        if kept_bytes(path) != data:
+            put(kept_path(path), seal.mac(key(), "kept", path, seal.sha(data)).encode() + b"\n" + data)
 
 
 def process_start(pid):
@@ -329,6 +675,7 @@ def apply_holds(config, found, incident, kill=os.kill):
     if config.get("hold", True) is False:
         return holds
     never = set(config.get("never_pause", NEVER_PAUSE))
+    own = own_labels()
     for change in found:
         try:
             if change["wire"] == "listeners":
@@ -343,41 +690,85 @@ def apply_holds(config, found, incident, kill=os.kill):
             elif change["wire"] == "launchd":
                 plist = pathlib.Path(change["what"])
                 text = plist.read_bytes()
-                try:
-                    label = plistlib.loads(text).get("Label") or plist.stem
-                except Exception:
-                    label = plist.stem
+                label = job_label(plist, text)
                 # Only this user's jobs can be unloaded without root; never the job that runs this.
-                if not str(plist).startswith(str(HOME)) or label in never or b"tripwire" in text:
+                # That job is known by its label, pinned or confirmed by launchd: not by what a plist says.
+                if HOME not in plist.parents or label in never or label in own:
                     continue
                 target = f"gui/{os.getuid()}/{label}"
                 loaded = launchctl(["print", target]) == 0
                 launchctl(["disable", target])
                 if loaded:
                     launchctl(["bootout", target])
-                holds.append({"kind": "job", "label": label, "plist": str(plist), "was_loaded": loaded})
+                holds.append({"kind": "job", "label": label, "plist": str(plist), "plist_sha": seal.sha(text),
+                              "was_loaded": loaded})
             elif change["wire"] in ("files", "guards"):
                 path = changed_path(change)
-                kept, target = kept_path(path), expand(path)
-                if path not in hold_paths(config) or not kept.exists():
+                target = expand(path)
+                if path not in hold_paths(config) or target.is_dir():
                     continue
-                held = None
+                if change["wire"] == "files" and change.get("before") == "absent":
+                    earlier = None  # it was not there when last checked: holding it takes it away again
+                else:
+                    earlier = kept_bytes(path)
+                    if earlier is None:
+                        if kept_path(path).exists():
+                            raise OSError("its kept copy is not signed by tripwire, so nothing was put back")
+                        continue
+                held = changed = None
+                mode = 0o600
                 if target.is_file():
+                    changed, mode = target.read_bytes(), target.stat().st_mode & 0o777
                     held = incident / "held" / target.name
                     if held.exists():
                         held = incident / "held" / digest(str(target).encode()) / target.name
-                    put(held, target.read_bytes())
-                mode = (target.stat().st_mode & 0o777) if target.exists() else 0o600
-                earlier = kept.read_bytes()
-                put(target, earlier, mode)
+                    put(held, changed)
+                if earlier is not None:
+                    put(target, earlier, mode)
+                elif held is not None:
+                    target.unlink()
+                else:
+                    continue
                 holds.append({"kind": "file", "path": path, "held": str(held) if held else None,
-                              "put_back": "sha:" + digest(earlier)})
+                              "held_sha": seal.sha(changed) if held else None, "mode": mode,
+                              "put_back": "absent" if earlier is None else "sha:" + digest(earlier)})
         except OSError as exc:
             holds.append({"kind": "failed", "what": change["what"], "error": str(exc)})
     return holds
 
 
-def restore_holds(record, selected, kill):
+def hold_fault(config, incident, hold):
+    """Why a recorded hold must not be undone, or None. A seal says tripwire wrote the record; it
+    does not decide what tripwire may write to. That is decided here, from the configuration:
+    a file among the hold files, from the copy in this incident's own folder; a job whose plist
+    is in a launchd folder of this user's and still carries the recorded label."""
+    kind = hold.get("kind")
+    if kind == "process":
+        ok = isinstance(hold.get("pid"), int) and hold["pid"] > 1 and isinstance(hold.get("started"), str)
+        return None if ok and isinstance(hold.get("program"), str) else "it does not describe a stopped process"
+    if kind == "job":
+        label, plist = hold.get("label"), hold.get("plist")
+        if not (isinstance(label, str) and re.fullmatch(r"[A-Za-z0-9_.-]+", label) and isinstance(plist, str)):
+            return "it does not describe a launchd job"
+        plist = pathlib.Path(plist)
+        folders = {expand(folder).resolve() for folder in config.get("launchd_dirs", LAUNCHD_DIRS)}
+        if plist.suffix != ".plist" or plist.parent.resolve() not in folders or HOME.resolve() not in plist.resolve().parents:
+            return f"{plist} is not in a launchd folder of this user's"
+        if plist.exists() and job_label(plist) != label:
+            return f"{plist} does not define {label}"
+        return None
+    if kind == "file":
+        if hold.get("path") not in hold_paths(config):
+            return f"{hold.get('path')} is not a file tripwire holds"
+        if hold.get("held") is not None:
+            held = pathlib.Path(str(hold["held"]))
+            if (incident / "held").resolve() not in held.resolve().parents:
+                return "its held copy is outside this incident's folder"
+        return None
+    return None
+
+
+def restore_holds(config, incident, record, selected, kill):
     """Record just the outstanding holds; retrying must not repeat successful operations."""
     if not selected:
         return []
@@ -386,6 +777,9 @@ def restore_holds(record, selected, kill):
     pending = []
     for hold in selected:
         try:
+            fault = hold_fault(config, incident, hold)
+            if fault:
+                raise OSError(f"refused: {fault}")
             if hold["kind"] == "process":
                 started = process_start(hold["pid"])
                 if started == hold["started"] and started:
@@ -397,19 +791,24 @@ def restore_holds(record, selected, kill):
                     raise OSError("cannot confirm the stopped process identity")
             elif hold["kind"] == "job":
                 target = f"gui/{os.getuid()}/{hold['label']}"
-                if launchctl(["enable", target]) != 0:
-                    raise OSError(f"launchctl could not enable {hold['label']}")
-                note = f"enabled {hold['label']}"
-                if hold["was_loaded"]:
-                    if not pathlib.Path(hold["plist"]).exists():
-                        raise OSError(f"missing plist for {hold['label']}")
-                    # Bootstrapping an already running job is rejected. Read it
-                    # first so retries after partial or external recovery are safe.
-                    if launchctl(["print", target]) != 0:
-                        launchctl(["bootstrap", f"gui/{os.getuid()}", hold["plist"]])
+                plist = pathlib.Path(hold["plist"])
+                if plist.exists() and hold.get("plist_sha") and seal.sha(plist.read_bytes()) != hold["plist_sha"]:
+                    # What would be loaded is not what was held and reviewed.
+                    note = f"{hold['label']} changed again while held; left disabled for the incident that change raises"
+                else:
+                    if launchctl(["enable", target]) != 0:
+                        raise OSError(f"launchctl could not enable {hold['label']}")
+                    note = f"enabled {hold['label']}"
+                    if hold["was_loaded"]:
+                        if not plist.exists():
+                            raise OSError(f"missing plist for {hold['label']}")
+                        # Bootstrapping an already running job is rejected. Read it
+                        # first so retries after partial or external recovery are safe.
                         if launchctl(["print", target]) != 0:
-                            raise OSError(f"launchctl could not restore {hold['label']}")
-                    note += " and confirmed loaded"
+                            launchctl(["bootstrap", f"gui/{os.getuid()}", str(plist)])
+                            if launchctl(["print", target]) != 0:
+                                raise OSError(f"launchctl could not restore {hold['label']}")
+                        note += " and confirmed loaded"
             elif hold["kind"] == "file":
                 target = expand(hold["path"])
                 if not hold["held"]:
@@ -417,11 +816,15 @@ def restore_holds(record, selected, kill):
                 elif fingerprint(target) != hold["put_back"]:
                     note = f"{hold['path']} changed again while held; left as it is"
                 else:
-                    put(target, pathlib.Path(hold["held"]).read_bytes(), target.stat().st_mode & 0o777)
+                    data = pathlib.Path(hold["held"]).read_bytes()
+                    if seal.sha(data) != hold.get("held_sha"):
+                        raise OSError("refused: the held copy is not the one tripwire saved")
+                    mode = target.stat().st_mode & 0o777 if target.exists() else int(hold.get("mode") or 0o600) & 0o777
+                    put(target, data, mode)
                     note = f"put the changed {hold['path']} back"
             else:
                 continue
-        except OSError as exc:
+        except (OSError, KeyError, TypeError, ValueError) as exc:
             pending.append(hold)
             note = f"could not undo {hold.get('kind')}: {exc}"
         if note not in notes:
@@ -432,42 +835,72 @@ def restore_holds(record, selected, kill):
     return pending
 
 
-def refresh_file_wires(config):
+def refresh_file_wires(config, released=(), owner=False):
     """After a file was put back or returned, the baseline must describe what is there now."""
-    baseline = read_json(STATE / "baseline.json", None)
-    if baseline is not None:
-        for name, collect in (("files", wire_files), ("guards", wire_guards)):
-            if name in baseline:
-                baseline[name] = collect(config)
-        write_json(STATE / "baseline.json", baseline)
-    keep_copies(config)
+    baseline, trust = read_baseline()
+    if trust != "ok":
+        return  # the next check raises that; nothing here may be built on it
+    for name, collect in (("files", wire_files), ("guards", wire_guards)):
+        if name in baseline:
+            baseline[name] = collect(config)
+    for hold in released:
+        # A released configuration becomes the accepted one only if it is the version that was held and reviewed.
+        if hold.get("path") == str(CONFIG) and hold.get("held_sha") and config_sha() == hold["held_sha"]:
+            baseline[META]["config"] = hold["held_sha"]
+    write_baseline(baseline)
+    keep_copies(config, baseline[META], [hold.get("path") for hold in released] if owner else ())
 
 
-def release(name, config=None, owner=False, kill=os.kill):
-    config = load_config() if config is None else config
+def release(name, config=None, owner=False, kill=os.kill, verified=None):
+    """Undo an incident's hold. `owner=True` is for a caller who has proved the owner is present
+    (`owner_present`); main does that before it passes --owner on. `verified` is the sealed
+    verdict a caller has just read: it is used as read, never read again."""
+    if key() is None:
+        print(NO_KEY.format(key=KEY), file=sys.stderr)
+        return 1
+    config = current_config() if config is None else config
+    if config is None:
+        print("tripwire: not released. The baseline is not signed by tripwire; the next `tripwire check` raises that.")
+        return 1
     incident = STATE / "incidents" / pathlib.Path(name).name
-    record = read_json(incident / "incident.json", None)
+    record, trusted = read_record(incident)
     if record is None:
         print(f"tripwire: no incident {name}")
         return 2
+    if not trusted:
+        print("tripwire: not released. This incident's record is not signed by tripwire, so nothing in it is "
+              "acted on. If the hold is real, undo it by hand from the record.")
+        return 1
     if record.get("released") or not record.get("holds"):
         print("tripwire: nothing held")
         return 0
-    if not owner and reports.saved_verdict(incident) != reports.BENIGN:
-        print("tripwire: not released. It needs a report whose first line is `VERDICT: BENIGN`, "
-              "or the owner's `--owner`.")
+    if not owner and lockdown():
+        print(f"tripwire: not released. Tripwire is in lockdown ({lockdown()}): until `tripwire accept` only the "
+              "owner releases, with `--owner`.")
         return 1
-    selected = list(record["holds"])
-    pending = restore_holds(record, selected, kill)
-    if not pending:
+    if not owner and (verified or reports.sealed_verdict(incident, key())) != reports.BENIGN:
+        print("tripwire: not released. It needs a report signed by tripwire's investigator whose first line is "
+              "`VERDICT: BENIGN`, or the owner's `--owner`.")
+        return 1
+    # A verdict lets work carry on; it does not decide who may log in. Files are the owner's to return.
+    selected = [hold for hold in record["holds"] if owner or hold.get("kind") != "file"]
+    kept_back = len(record["holds"]) - len(selected)
+    waiting = (f" {kept_back} put-back file(s) stay put back: only the owner returns one, with "
+               f"`tripwire release {incident.name} --owner`." if kept_back else "")
+    if not selected:
+        print("tripwire: not released." + waiting)
+        return 1
+    pending = restore_holds(config, incident, record, selected, kill)
+    if not record["holds"]:
         record["released"] = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + (" (owner)" if owner else "")
-    write_json(incident / "incident.json", record)
-    if any(hold["kind"] == "file" and hold not in pending for hold in selected):
-        refresh_file_wires(config)
+    write_record(incident, record)
+    returned = [hold for hold in selected if hold["kind"] == "file" and hold not in pending]
+    if returned:
+        refresh_file_wires(config, returned, owner)
     if pending:
         print(f"tripwire: {len(pending)} hold(s) still require restoration: " + "; ".join(record["release_notes"]))
         return 1
-    print("tripwire: released: " + "; ".join(record["release_notes"]))
+    print("tripwire: released: " + "; ".join(record["release_notes"]) + "." + waiting)
     return 0
 
 
@@ -487,19 +920,135 @@ def agent_is_gone(pid, started):
     return now_started is not None and now_started != started
 
 
+def is_drill(record):
+    return record.get("source") == "tripwire test CLI"
+
+
+def brief_for(config, incident, host):
+    mail_to = config.get("mail_to")
+    return BRIEF.format(
+        host=host, incident=incident, name=incident.name,
+        mail_step=(f"4. Send one line with the verdict and the report path: `agent-mail send {mail_to} \"...\"`.\n"
+                   if mail_to else ""),
+        mail_note=" and that one mail" if mail_to else "")
+
+
+def own_investigator(argv):
+    return pathlib.Path(argv[0]).name == "tripwire-investigate"
+
+
+def program(argv):
+    """The investigator's program as an absolute path, or None. Tripwire's own investigator is
+    always the file beside this one, whatever path the configuration or PATH gives that name."""
+    if own_investigator(argv):
+        return INVESTIGATOR if os.path.isfile(INVESTIGATOR) else None
+    return shutil.which(argv[0])
+
+
+def clean_env(**extra):
+    """The environment for the investigator: what it needs, and nothing the caller slipped in."""
+    env = {name: os.environ[name] for name in PASSED_ON if name in os.environ}
+    env.update(HOME=str(HOME), PATH=SYSTEM_PATH, **extra)
+    return env
+
+
+def pinned_providers(record):
+    """The provider programs this review may use, each with its SHA-256, for the sealed record.
+    One that changed in the very check that raised this incident is left out: until that change
+    has been looked at it can vouch for nothing, least of all for itself."""
+    fresh = {os.path.realpath(os.path.expanduser(str(c.get("what")))) for c in record.get("changes", [])
+             if c.get("wire") == "files"}
+    pinned = {}
+    for name, path in provider_files().items():
+        try:
+            if path not in fresh:
+                pinned[name] = {"path": path, "sha": file_sha(path)}
+        except OSError:
+            continue
+    return pinned
+
+
 def start_review(argv, attempt, incident, brief, record, now, remaining, spawn):
     command = [part.replace("{brief}", brief).replace("{incident}", str(incident)) for part in argv]
     env = dict(os.environ, TRIPWIRE_ATTEMPT=attempt)
     if remaining > 0:
         env["TRIPWIRE_REVIEW_SECONDS"] = str(remaining)
+    if own_investigator(argv):
+        # Its answer is sealed, so it is not started directly: `tripwire review` runs it and takes the
+        # answer from a pipe. The order goes in the sealed record; the supervisor acts on nothing else,
+        # and only once the record names its own pid and start time.
+        if not program(argv):
+            raise FileNotFoundError(2, "tripwire-investigate is not beside tripwire", INVESTIGATOR)
+        record.setdefault("reviews", {})[attempt] = {"args": command[1:], "seconds": remaining,
+                                                     "providers": pinned_providers(record)}
+        write_record(incident, record)
+        command, env = [sys.executable, "-I", str(HERE / "tripwire"), "review", incident.name, attempt], clean_env()
     with open(incident / "agent.log", "ab") as log:
         agent = spawn(command, cwd=str(incident), env=env, stdin=subprocess.DEVNULL,
                       stdout=log, stderr=log, start_new_session=True)
     pid = getattr(agent, "pid", None)
     record["agent_pid"] = pid
     record["agent_started"] = process_start(pid) if pid else None
-    record["stdout_report"] = pathlib.Path(command[0]).name == "tripwire-investigate"
-    write_json(STATE / "summons.json", summons_today(now) + [now])
+    record["stdout_report"] = own_investigator(argv)
+    note_summon(now, is_drill(record))
+
+
+def review(name, attempt, run=subprocess.run, wait=60.0):
+    """The detached half of a summons (`tripwire review INCIDENT ATTEMPT`): run tripwire's own
+    investigator, take its answer from a pipe, and seal it. It does this only as the process the
+    sealed record names, pid and start time, so that starting it by hand, or starting the
+    investigator by hand, yields nothing tripwire will act on. The investigator never sees the key."""
+    incident = STATE / "incidents" / pathlib.Path(name).name
+    me = (os.getpid(), process_start(os.getpid()))
+    deadline = time.monotonic() + wait
+    while True:   # the check that started this process writes the record a moment later
+        record, trusted = read_record(incident)
+        order = (record.get("reviews") or {}).get(attempt) if trusted else None
+        if order and me[1] and (record.get("agent_pid"), record.get("agent_started")) == me:
+            break
+        if time.monotonic() >= deadline:
+            print("tripwire: this is not the review tripwire started for that incident; nothing was run", file=sys.stderr)
+            return 2
+        time.sleep(0.5)
+    if reports.sealed_verdict(incident, key()):
+        return 0
+    seconds = float(order.get("seconds") or 0)
+    extra = {"TRIPWIRE_REVIEW_SECONDS": str(seconds)} if seconds > 0 else {}
+    report, outcomes, refused, engine = None, {}, {}, None
+    # The investigator is given what this process has just verified, on stdin. It reads no file of the
+    # incident's, and what the record says about being a drill is decided here, from the sealed record.
+    drill = is_drill(record) and record.get("changes") == [DRILL_CHANGE]
+    evidence = json.dumps({"host": record.get("host"), "raised": record.get("raised"),
+                           "changes": record.get("changes"), "drill": drill})
+    env = clean_env(TRIPWIRE_ATTEMPT=attempt, **extra)
+    for name, pinned in (order.get("providers") or {}).items():
+        try:
+            same = file_sha(pinned["path"]) == pinned["sha"]
+        except (OSError, KeyError, TypeError):
+            same = False
+        if same:
+            env[f"TRIPWIRE_PROVIDER_{name.upper()}"] = pinned["path"]
+        else:
+            refused[name] = "the provider program changed after tripwire summoned this review; not used"
+    try:
+        # This checkout's investigator, by this Python: not through PATH, a shebang or the configured path.
+        done = run([sys.executable, "-I", INVESTIGATOR] + [str(arg) for arg in order.get("args", [])],
+                   cwd=str(incident), env=env, input=evidence, stdout=subprocess.PIPE, text=True,
+                   errors="replace", timeout=(seconds if seconds > 0 else 3600) + 60)
+        reply = json.loads(done.stdout)
+        report, outcomes, engine = reply.get("report"), reply.get("outcomes"), reply.get("engine")
+    except subprocess.TimeoutExpired:
+        outcomes = {"review": "the investigator ran out of time"}
+    except (OSError, ValueError, AttributeError):
+        outcomes = {"review": "the investigator did not start or did not answer as agreed"}
+    if isinstance(report, str) and reports.verdict(report):
+        if reports.verdict(report) == reports.BENIGN and engine != "gemini" and not drill:
+            # A reviewer that saw only typed observations cannot name a cause. Only a drill is benign on that.
+            report = (reports.NEEDS_REVIEW + "\nMetadata alone cannot establish authorization. Provider analysis:\n"
+                      + report.partition("\n")[2])
+        reports.publish(incident, report, key())
+    write_receipt(incident, attempt, dict(outcomes if isinstance(outcomes, dict) else {}, **refused))
+    return 0 if reports.sealed_verdict(incident, key()) else 1
 
 
 def release_stale(config, now, current, kill=os.kill, spawn=subprocess.Popen, **hooks):
@@ -507,9 +1056,9 @@ def release_stale(config, now, current, kill=os.kill, spawn=subprocess.Popen, **
     limit = float(config.get("hold_timeout_min", 60)) * 60
     for path in sorted((STATE / "incidents").glob("*/incident.json")):
         incident = path.parent
-        record = read_json(path, {})
-        if not record:
-            continue
+        record, trusted = read_record(incident)
+        if not record or not trusted:
+            continue  # not tripwire's record: nothing is restored, restarted or reported on its word
         # Preserve historical reports already reviewed by the owner or acted upon.
         holds = record.get("holds", [])
         retry_restore = (record.get("restore_failed") and record.get("restore_attempts", 0) < MAX_RESTORE_ATTEMPTS
@@ -525,7 +1074,7 @@ def release_stale(config, now, current, kill=os.kill, spawn=subprocess.Popen, **
         age = now - record.get("raised_epoch", now)
         expired = limit > 0 and age >= limit
         attempt = "fallback" if record.get("fallback_tried") else "primary"
-        finished = (incident / f"{attempt}-result.json").is_file()
+        finished = receipt(incident, attempt) is not None
         died = finished or (age >= 60 and agent_is_gone(record.get("agent_pid"), record.get("agent_started")))
         skipped = str(record.get("agent", "")).startswith("not summoned")
         if not (died or expired or skipped or record.get("timed_out") or verdict == reports.NEEDS_REVIEW):
@@ -538,13 +1087,15 @@ def release_stale(config, now, current, kill=os.kill, spawn=subprocess.Popen, **
         if (died and fallback and not expired and not record.get("fallback_tried")
                 and verdict is None and not record.get("timed_out")):
             record["fallback_tried"] = True
-            write_json(path, record)
-            if len(summons_today(now)) < int(config.get("max_summons_per_day", 4)):
+            write_record(incident, record)
+            if len(summons_today(now, is_drill(record))) < int(config.get("max_summons_per_day", 4)):
                 try:
-                    start_review(fallback, "fallback", incident, (incident / "brief.md").read_text(),
+                    # The brief is written again, not read back: the copy in the folder is anyone's to edit.
+                    start_review(fallback, "fallback", incident,
+                                 brief_for(config, incident, record.get("host") or host_name(config)),
                                  record, now, limit - age, spawn)
                     record["agent"] = "first agent exited without a report; fallback agent summoned"
-                    write_json(path, record)
+                    write_record(incident, record)
                     continue
                 except OSError as exc:
                     reason += f"; fallback could not start ({exc.strerror})"
@@ -552,18 +1103,19 @@ def release_stale(config, now, current, kill=os.kill, spawn=subprocess.Popen, **
                 reason += "; daily agent limit reached"
 
         with reports.locked(incident, "report.lock"):
-            verdict = reports.publish_locked(incident, reports.local_report(incident, record, reason, current))
+            receipts = {name: receipt(incident, name) for name in ("primary", "fallback")}
+            verdict = reports.publish_locked(incident, reports.local_report(incident, record, reason, current, receipts), key())
             if verdict != reports.NEEDS_REVIEW:
                 continue  # A provider won publication. Its own verdict governs these holds.
             if not record.get("timed_out") or retry_restore:
                 if holds and not record.get("released"):
                     operational = [h for h in holds if h["kind"] != "file"]
-                    restore_holds(record, operational, kill)
+                    restore_holds(config, incident, record, operational, kill)
                     if not record["holds"]:
                         record["released"] = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now)) + " (timeout)"
                 record["timed_out"] = True
             record["local_review_reason"] = reason
-            write_json(path, record)
+            write_record(incident, record)
 
 
 def notify(config, text, runner=subprocess.run):
@@ -577,36 +1129,61 @@ def notify(config, text, runner=subprocess.run):
                 pass
 
 
-def summons_today(now):
-    log = read_json(STATE / "summons.json", [])
-    return [t for t in log if now - t < 86400]
+def summons_log(now):
+    """Today's agent starts, real and drill, from the sealed log. A log tripwire did not seal
+    counts for nothing: writing one must not be a way to use up the day's investigators."""
+    log = read_json(STATE / "summons.json", None)
+    if not seal.check(key(), "summons", "", log):
+        log = {}
+    return {name: [t for t in log.get(name, []) if isinstance(t, (int, float)) and now - t < 86400]
+            for name in ("at", "drills")}
 
 
-def summon(config, incident, host, now, found=(), record=None, spawn=subprocess.Popen, kill=os.kill):
+def summons_today(now, drill=False):
+    """A drill (`tripwire test --summon`) draws on its own allowance, so that anything able to
+    run drills cannot leave a real change without an investigator, and so without a hold."""
+    return summons_log(now)["drills" if drill else "at"]
+
+
+def note_summon(now, drill=False):
+    log = summons_log(now)
+    log["drills" if drill else "at"].append(now)
+    write_json(STATE / "summons.json", seal.sealed(key(), "summons", "", log))
+
+
+def held_without_agent(config, incident, found, record, kill, why):
+    """In lockdown a hold file that differs from its sealed copy is put back even with nobody to
+    look: tripwire's own state has been interfered with, so it holds and says why."""
+    holds = apply_holds(config, [c for c in found if c["wire"] in ("files", "guards")], incident, kill=kill)
+    if holds:
+        record["holds"] = record.get("holds", []) + holds
+        write_record(incident, record)
+        why += f"; {len(holds)} file(s) put back all the same, because tripwire is in lockdown"
+    return why
+
+
+def summon(config, incident, host, now, found=(), record=None, spawn=subprocess.Popen, kill=os.kill, hold_anyway=False):
     """Hold what changed, then start one agent on the incident, detached. Returns a word for the record."""
     record = {} if record is None else record
-    recent = summons_today(now)
-    if len(recent) >= int(config.get("max_summons_per_day", 4)):
-        return "not summoned: daily limit reached"
+    recent = summons_today(now, is_drill(record))
     argv = config.get("summon", DEFAULT_SUMMON)
     attempt = "primary"
-    if not argv or not shutil.which(argv[0]):
+    why = "not summoned: daily limit reached" if len(recent) >= int(config.get("max_summons_per_day", 4)) else None
+    if not why and (not argv or not program(argv)):
         argv = config.get("summon_fallback")
-        if not argv or not shutil.which(argv[0]):
-            return "not summoned: no agent command on this Mac"
+        if not argv or not program(argv):
+            why = "not summoned: no agent command on this Mac"
         attempt = "fallback"
+    if why:
+        return held_without_agent(config, incident, found, record, kill, why) if hold_anyway else why
+    if attempt == "fallback":
         record["fallback_tried"] = True
-    mail_to = config.get("mail_to")
-    record["stdout_report"] = pathlib.Path(argv[0]).name == "tripwire-investigate"
+    record["stdout_report"] = own_investigator(argv)
     holds = apply_holds(config, found, incident, kill=kill)
     if holds:
         record["holds"] = holds
-        write_json(incident / "incident.json", record)
-    brief = BRIEF.format(
-        host=host, incident=incident, name=incident.name,
-        mail_step=(f"4. Send one line with the verdict and the report path: `agent-mail send {mail_to} \"...\"`.\n"
-                   if mail_to else ""),
-        mail_note=" and that one mail" if mail_to else "")
+        write_record(incident, record)
+    brief = brief_for(config, incident, host)
     (incident / "brief.md").write_text(brief)
     try:
         allowance = float(config.get("hold_timeout_min", 60)) * 60
@@ -614,14 +1191,15 @@ def summon(config, incident, host, now, found=(), record=None, spawn=subprocess.
             allowance /= 2
         start_review(argv, attempt, incident, brief, record, now, allowance, spawn)
     except OSError as exc:
-        if holds:  # nobody is coming to look, so do not leave it paused
-            if not restore_holds(record, holds, kill):
-                record["released"] = "at once: no agent"
+        # Nobody is coming to look, so do not leave it paused; except, in lockdown, the files.
+        undo = [hold for hold in holds if not (hold_anyway and hold["kind"] == "file")]
+        if undo and not restore_holds(config, incident, record, undo, kill) and not record.get("holds"):
+            record["released"] = "at once: no agent"
         return f"not summoned: {exc}"
     return ("fallback agent summoned" if attempt == "fallback" else "agent summoned") + (f", {len(holds)} thing(s) held" if holds else "")
 
 
-def raise_incident(config, found, now, host, do_summon=True, drill=False, **hooks):
+def raise_incident(config, found, now, host, do_summon=True, drill=False, hold_anyway=False, **hooks):
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now))
     root = STATE / "incidents"
     root.mkdir(parents=True, exist_ok=True)
@@ -638,48 +1216,76 @@ def raise_incident(config, found, now, host, do_summon=True, drill=False, **hook
     record = {"host": host, "raised": stamp, "raised_epoch": now, "changes": found}
     if drill:
         record["source"] = "tripwire test CLI"
-    write_json(incident / "incident.json", record)
-    record["agent"] = (summon(config, incident, host, now, found, record,
-                              **{k: v for k, v in hooks.items() if k in ("spawn", "kill")})
-                       if do_summon else "not summoned: test")
-    write_json(incident / "incident.json", record)
-    names = "; ".join(f"{c['wire']}: {c['what']}" for c in found[:3]) + (" …" if len(found) > 3 else "")
+    write_record(incident, record)
+    if not do_summon:
+        record["agent"] = "not summoned: test"
+    elif all(change["wire"] == SELF for change in found):
+        # No investigator can vouch for tripwire's own state; with nobody summoned it goes to NEEDS REVIEW.
+        record["agent"] = "not summoned: tripwire's own state failed its check, which is the owner's to judge"
+    else:
+        record["agent"] = summon(config, incident, host, now, found, record, hold_anyway=hold_anyway,
+                                 **{k: v for k, v in hooks.items() if k in ("spawn", "kill")})
+    write_record(incident, record)
+    names = "; ".join(f"{c['wire']}: {c['what']}" + (f" {c['after']}" if c["wire"] == SELF else "")
+                      for c in found[:3]) + (" …" if len(found) > 3 else "")
     notify(config, f"{host}: {len(found)} change(s) [{names}]. {record['agent']}. {incident}",
            **{k: v for k, v in hooks.items() if k == "runner"})
     return incident
 
 
 def read_verdicts(config, kill=os.kill, **hooks):
-    """An agent's report with a verdict other than BENIGN is pushed to the owner, once."""
+    """Act on each report once. A verdict other than BENIGN is pushed to the owner. A BENIGN
+    report undoes the operational holds, and only when tripwire sealed it and the record is
+    tripwire's. Whatever a BENIGN leaves held (a put-back file always; everything when the report
+    is unsealed or tripwire is in lockdown) is told to the owner, once, with the reason."""
+    in_lockdown = lockdown()
     for report in sorted((STATE / "incidents").glob("*/report.md")):
-        flag = report.parent / "verdict.seen"
-        first = reports.saved_verdict(report.parent)
+        incident = report.parent
+        flag = incident / "verdict.seen"
+        first, signed = reports.read_report(incident, key())   # one read: this verdict is the one acted on
         if first is None:
             continue
+        record, trusted = read_record(incident)
+        record = record if trusted else {}
         seen = flag.read_text(errors="replace").strip() if flag.exists() else None
-        record = read_json(report.parent / "incident.json", {})
+        benign = first == reports.BENIGN
+        locked = in_lockdown if signed else None
         retry_restore = record.get("restore_failed") and record.get("restore_attempts", 0) < MAX_RESTORE_ATTEMPTS
-        if first == reports.BENIGN:
-            if (seen != first or retry_restore) and record.get("stdout_report") and record.get("holds") and not record.get("released") and not record.get("timed_out"):
-                release(report.parent.name, config, kill=kill)
-                record = read_json(report.parent / "incident.json", {})
-        elif first != seen:
-            detail = ""
-            if first == reports.NEEDS_REVIEW:
-                detail = " " + str(record.get("local_review_reason") or "")
-                files = sum(h.get("kind") == "file" for h in record.get("holds", []))
-                if files and not record.get("released"):
-                    detail += f". {files} file(s) stay put back."
+        if (benign and signed and not locked and record.get("stdout_report") and record.get("holds")
+                and not record.get("released") and not record.get("timed_out")
+                # Not yet acted on: unseen, or seen while it could not be (unsigned then, or in lockdown).
+                and (retry_restore or seen not in (first, first + " (files stay put back)"))
+                and any(hold.get("kind") != "file" for hold in record["holds"])):
+            release(incident.name, config, kill=kill, verified=first)
+            record, trusted = read_record(incident)
+            record = record if trusted else {}
+        held = record.get("holds", []) if not record.get("released") else []
+        files = sum(hold.get("kind") == "file" for hold in held)
+        word, detail = first, ""
+        if benign and held:
+            if not signed:
+                word, detail = first + " (not signed)", " but tripwire's investigator did not sign that report, so the hold stays"
+            elif locked:
+                word, detail = first + " (lockdown)", f" but tripwire is in lockdown ({locked}), so the hold stays"
+            elif files == len(held):   # kept short: the notification shows 200 characters
+                word, detail = first + " (files stay put back)", f" Work carries on; {files} file(s) stay put back"
+            if word != first:
+                detail += f"; the owner releases it with `tripwire release {incident.name} --owner`"
+        elif first == reports.NEEDS_REVIEW:
+            detail = " " + str(record.get("local_review_reason") or "")
+            if files:
+                detail += f". {files} file(s) stay put back."
+        if word != seen and (not benign or word != first):
             notify(config, f"{host_name(config)}: {first}.{detail} — {report}", **hooks)
         if (record.get("restore_failed") and record.get("restore_attempts", 0) >= MAX_RESTORE_ATTEMPTS
                 and not record.get("restore_notified")):
-            notify(config, f"{host_name(config)}: restoration still failed for {report.parent.name}; "
-                           f"remaining holds and errors are in {report.parent / 'incident.json'}", **hooks)
+            notify(config, f"{host_name(config)}: restoration still failed for {incident.name}; "
+                           f"remaining holds and errors are in {incident / 'incident.json'}", **hooks)
             record["restore_notified"] = True
-            write_json(report.parent / "incident.json", record)
-        if seen == first:
+            write_record(incident, record)
+        if seen == word:
             continue
-        flag.write_text(first + "\n")
+        flag.write_text(word + "\n")
 
 
 def check(*args, **kwargs):
@@ -688,16 +1294,48 @@ def check(*args, **kwargs):
 
 
 def _check(config=None, now=None, host=None, wires=WIRES, **hooks):
-    config = load_config() if config is None else config
     now = time.time() if now is None else now
-    host = host or host_name(config)
-    baseline = read_json(STATE / "baseline.json", None)
-    current = snapshot(config, wires)
-    if baseline is None:
+    first_run = not has_state()            # looked at before the key: making one must not look like a first run
+    secret, created = seal.load_key(KEY, create=True)
+    if secret is None:
+        print(NO_KEY.format(key=KEY), file=sys.stderr)
+        return 1
+    baseline, trust = read_baseline()
+    found, entered = [], None
+    if trust == "ok":
+        meta = baseline[META]
+    elif first_run and created:
+        # Nothing saved and no key: the first run. What is on this Mac is taken as found.
+        disk = load_config() if config is None else config
+        meta = {"config": config_sha(), "own_labels": sorted(set(own_jobs(disk)) | ({this_job()} - {None}))}
         print("tripwire: baseline recorded, nothing compared")
-        baseline = {}
+    else:
+        # Saved state without a baseline tripwire can believe: lockdown. Nothing on this Mac is taken as
+        # found. The configuration is the sealed kept copy, else the defaults; the only job known to be
+        # tripwire's own is the one launchd says is running this.
+        entered = ("its signing key was missing although it has saved state (the first run of the version that "
+                   "signs, or the key was removed)" if created else
+                   "its baseline is missing" if trust == "absent" else f"its baseline is {trust}")
+        kept = kept_bytes(str(CONFIG))
+        meta = {"config": seal.sha(kept) if kept is not None else "absent", "own_labels": sorted({this_job()} - {None}),
+                "lockdown": entered}
+    config = accepted_config(meta) if config is None else config
+    host = host or host_name(config)
+    current = snapshot(config, wires)
+    if entered:
+        baseline = kept_baseline(config)
+        unkept = [path for path in hold_paths(config) if path not in baseline["files"] and expand(path).exists()]
+        found.append({"wire": SELF, "what": "its own saved state", "before": None,
+                      "after": f"cannot be trusted: {entered}. Tripwire is in lockdown until the owner runs `tripwire accept`: "
+                               "hold files are put back to their signed copies, nothing is released on a report, and "
+                               "everything else is watched from now, not from before"})
+        if unkept:
+            found.append({"wire": SELF, "what": "hold files with no signed copy", "before": None,
+                          "after": "cannot be put back until `tripwire accept`: " + ", ".join(unkept)})
+        if meta["config"] != config_sha():
+            found.append({"wire": SELF, "what": str(CONFIG), "before": None,
+                          "after": "is not a configuration tripwire has accepted; it is not obeyed until `tripwire accept`"})
     registered = registered_labels(config)
-    found = []
     for name, after in current.items():
         if after is None:
             continue  # could not look this time: keep the old baseline, raise nothing
@@ -705,35 +1343,55 @@ def _check(config=None, now=None, host=None, wires=WIRES, **hooks):
             found += differences(name, baseline[name], after, registered)
         # A program that listens only while it is open is remembered, so reopening it is not news.
         baseline[name] = {**baseline.get(name, {}), **after} if name in REMEMBERED else after
-    write_json(STATE / "baseline.json", baseline)
+    # Tripwire's other saved state. What is not sealed is reported once and never acted on.
+    unsigned, known = unsigned_incidents(), set(meta.get("unsigned", []))
+    loose, known_loose = unsigned_kept(config), set(meta.get("unsigned_kept", []))
+    if trust == "ok":
+        found += [{"wire": SELF, "what": f"the kept copy of {path}", "before": None, "after": "not signed by tripwire"}
+                  for path in loose if path not in known_loose]
+        found += [{"wire": SELF, "what": f"the record of incident {name}", "before": None, "after": "not signed by tripwire"}
+                  for name in unsigned if name not in known]
+    meta["unsigned"], meta["unsigned_kept"] = unsigned, loose
+    baseline[META] = meta
+    write_baseline(baseline)
     if found:
-        incident = raise_incident(config, found, now, host, **hooks)
+        incident = raise_incident(config, found, now, host, hold_anyway=bool(meta.get("lockdown")), **hooks)
         print(f"tripwire: {len(found)} change(s) -> {incident}")
-        record = read_json(incident / "incident.json", {})
-        if any(hold["kind"] == "file" for hold in record.get("holds", [])) and not record.get("released"):
+        record, _ = read_record(incident)
+        if any(hold["kind"] == "file" for hold in (record or {}).get("holds", [])) and not record.get("released"):
             refresh_file_wires(config)  # a file just put back is what the baseline must describe
-    keep_copies(config)
+    keep_copies(config, meta)
     release_stale(config, now, current, **{k: v for k, v in hooks.items() if k in ("runner", "kill", "spawn")})
     read_verdicts(config, **{k: v for k, v in hooks.items() if k in ("runner", "kill")})
     return 0
 
 
 def status():
-    baseline = read_json(STATE / "baseline.json", None)
-    if baseline is None:
+    baseline, trust = read_baseline()
+    if trust == "absent":
         print("no baseline yet: run `tripwire check`")
+        return 0
+    if trust != "ok":
+        print(f"baseline {trust.upper()}: tripwire did not write it; the next `tripwire check` raises that")
         return 0
     age = (time.time() - (STATE / "baseline.json").stat().st_mtime) / 60
     print(f"baseline checked {age:.0f} min ago")
     for name in WIRES:
         print(f"  {name:10} {len(baseline.get(name, {})):4} watched" if name in baseline else f"  {name:10} not read")
+    if baseline[META].get("lockdown"):
+        print(f"  LOCKDOWN: {baseline[META]['lockdown']}. Hold files go back to their signed copies and nothing is "
+              "released on a report until the owner runs `tripwire accept`")
+    if baseline[META].get("config") != config_sha():
+        print(f"  {CONFIG} is not the accepted configuration: not obeyed until its incident is released or `tripwire accept`")
     incidents = sorted((STATE / "incidents").glob("*/incident.json"))
     print(f"incidents: {len(incidents)}, agents summoned in the last day: {len(summons_today(time.time()))}")
     for path in incidents[-8:]:
-        record = read_json(path, {})
+        record, trusted = read_record(path.parent)
+        record = record or {}
         verdict = (path.parent / "verdict.seen")
         word = verdict.read_text().strip() if verdict.exists() else record.get("agent", "?")
-        held = (f"  released {record['released']}" if record.get("released") else
+        held = ("  NOT SIGNED, never acted on" if not trusted else
+                f"  released {record['released']}" if record.get("released") else
                 "  RESTORATION FAILED" if record.get("restore_failed") else
                 "  HELD" if record.get("holds") else "")
         print(f"  {path.parent.name}  {len(record.get('changes', []))} change(s)  {word}{held}")
@@ -746,25 +1404,51 @@ def main(argv):
         return check()
     if command == "status":
         return status()
+    if command == "review" and len(argv) == 4:
+        return review(argv[2], argv[3])
     if command in {"accept", "release", "test"}:
+        owner = command == "accept" or (command == "release" and "--owner" in argv)
+        if owner and not owner_present():  # before the lock: a password prompt must not stall the scheduled check
+            print(OWNER_ONLY.format(what="accept" if command == "accept" else "release --owner"), file=sys.stderr)
+            return 1
         with reports.locked(STATE, "check.lock"):
-            return change_state(command, argv)
+            return change_state(command, argv, owner)
     print(__doc__)
     return 2
 
 
-def change_state(command, argv):
-    if command == "accept":
-        write_json(STATE / "baseline.json", {k: v for k, v in snapshot(load_config()).items() if v is not None})
-        keep_copies(load_config())
-        print("tripwire: current state accepted as the baseline")
-        return 0
+def accept():
+    """The owner vouches for this Mac as it is now, its configuration and tripwire's job included.
+    It is also how lockdown ends, and how a Mac with state from before the seals starts using them."""
+    if seal.load_key(KEY, create=True)[0] is None:
+        print(NO_KEY.format(key=KEY), file=sys.stderr)
+        return 1
+    config = load_config()
+    meta = {"config": config_sha(), "own_labels": sorted(set(own_jobs(config)) | ({this_job()} - {None})),
+            "unsigned": unsigned_incidents()}
+    baseline = {k: v for k, v in snapshot(config).items() if v is not None}
+    baseline[META] = meta
+    write_baseline(baseline)
+    keep_copies(config, meta)
+    meta["unsigned_kept"] = unsigned_kept(config)   # copies of files no longer there: known, never used
+    write_baseline(baseline)
+    print("tripwire: current state accepted as the baseline")
+    return 0
+
+
+def change_state(command, argv, owner=False):
+    """`owner` is True only when main has just had the owner prove he is present."""
+    if command == "accept" and owner:
+        return accept()
     if command == "release" and len(argv) > 2:
-        return release(argv[2], owner="--owner" in argv)
+        return release(argv[2], owner=owner and "--owner" in argv)
     if command == "test":
-        found = [{"wire": "test", "what": "tripwire test", "before": None, "after": "raised by hand"}]
-        config = load_config()
-        print(raise_incident(config, found, time.time(), host_name(config), do_summon="--summon" in argv, drill=True))
+        config = current_config()
+        if config is None:
+            print("tripwire: no baseline signed by tripwire yet: run `tripwire check` first")
+            return 1
+        print(raise_incident(config, [dict(DRILL_CHANGE)], time.time(), host_name(config),
+                             do_summon="--summon" in argv, drill=True))
         return 0
     print(__doc__)
     return 2

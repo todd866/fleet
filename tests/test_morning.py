@@ -217,6 +217,63 @@ class Thresholds(unittest.TestCase):
         self.assertEqual(self.status(snap(state="skipped: on battery"), key), "warn")
         self.assertEqual(self.status(snap(state="failed: rsync exit 12"), key), "fail")
 
+    def test_home_mirror_personal_and_full_rows_do_not_colour_each_other(self):
+        full, personal = "backup:hub:home-mirror", "backup:hub:home-mirror-personal"
+        rows = lambda **s: by_key(evaluate({"hosts": {"hub": host(home_mirror=s)}}, config(), NOW_S))
+        waiting = "waiting for space: 300.0 GB free, recent plan needs 810.0 GB including reserve"
+        skipped = [{"path": "Movies", "dataset": "Films", "why": "not on this Mac"}]
+        ok = lambda name, hours=5: {"name": name, "paths": [name], "state": "ok", "last_success_epoch": NOW_S - hours * HOUR}
+        big = {"name": "Projects", "paths": ["Projects"], "planned_bytes": 400 * 10**9, "required_free_gb": 480.0,
+               "state": "waiting for space: 100.0 GB free, this set needs 480.0 GB including reserve"}
+        # Every personal set is on the hub while the whole home still waits for room.
+        found = rows(state=waiting, personal={"state": "ok", "sets": [ok("Documents"), ok("Music", 9)], "skipped": skipped})
+        self.assertEqual((found[personal].status, found[full].status), ("pass", "warn"))
+        self.assertEqual(found[personal].value, "9 h")   # the oldest set's copy
+        self.assertIn("2 of 2 sets copied", found[personal].detail)
+        self.assertIn("left out: Movies (not on this Mac)", found[personal].detail)
+        self.assertIn(waiting, found[full].detail)
+        self.assertNotIn("Movies", found[full].detail)
+        # A big set that does not fit: amber, how many are safe, and what the waiting one needs.
+        found = rows(state="ok", last_success_epoch=NOW_S - 5 * HOUR,
+                     personal={"state": big["state"], "sets": [big, ok("Documents"), ok("Music")]})
+        row = found[personal]
+        self.assertEqual((row.status, row.value, row.datum, found[full].status), ("warn", "2 of 3 sets", "1 waiting", "pass"))
+        self.assertIn("2 of 3 sets copied; waiting for space: Projects needs 480 GB free (400 GB to copy)", row.detail)
+        # Waiting is amber however long it lasts; a copy stopped part-way, or never begun, is amber too.
+        old = dict(big, last_success_epoch=NOW_S - 300 * HOUR)
+        part = {"name": "Photos", "paths": ["Pictures"], "state": "deferred: laptop activity, power or network changed"}
+        queued = {"name": "Notes", "paths": ["Notes"], "state": "queued: Photos goes first"}
+        found = rows(state="ok", personal={"state": "x", "sets": [old, part, queued, ok("Documents")]})
+        self.assertEqual((found[personal].status, found[personal].value), ("warn", "1 of 4 sets"))
+        self.assertIn("Photos: deferred: laptop activity", found[personal].detail)
+        # Red is a real failure: a set that failed with no copy to its name, or a copy a week old.
+        failed = {"name": "Photos", "paths": ["Pictures"], "state": "failed: rsync exit 23 (see personal/photos.rsync.log)"}
+        found = rows(state="ok", last_success_epoch=NOW_S - 5 * HOUR, personal={"state": "x", "sets": [failed, ok("Documents")]})
+        self.assertEqual((found[personal].status, found[full].status), ("fail", "pass"))
+        self.assertIn("Photos: failed: rsync exit 23", found[personal].detail)
+        found = rows(state="ok", personal={"state": "x", "sets": [dict(failed, last_success_epoch=NOW_S - 5 * HOUR)]})
+        self.assertEqual(found[personal].status, "warn")
+        found = rows(state="ok", last_success_epoch=NOW_S - 5 * HOUR,
+                     personal={"state": "x", "sets": [ok("Documents", 200), ok("Music")]})
+        self.assertEqual((found[personal].status, found[personal].value, found[full].status), ("fail", "1 of 2 sets", "pass"))
+        self.assertIn("Documents: ok, last copied 200 h ago", found[personal].detail)
+        # The list could not be read at all: red with no copy, amber over copies already made.
+        unread = "failed: placement.toml gave no data sets"
+        found = rows(state="ok", last_success_epoch=NOW_S - 5 * HOUR, personal={"state": unread})
+        self.assertEqual((found[personal].status, found[full].status), ("fail", "pass"))
+        found = rows(state="ok", personal={"state": unread, "sets": [ok("Documents")]})
+        self.assertEqual(found[personal].status, "warn")
+        self.assertIn(unread, found[personal].detail)
+        # A status from a home-mirror older than the personal pass: amber until that pass has run.
+        found = rows(state="ok", last_success_epoch=NOW_S - 5 * HOUR)
+        self.assertEqual((found[personal].status, found[full].status), ("warn", "pass"))
+        self.assertIn("no personal pass recorded", found[personal].detail)
+        # A Mac with no personal data sets has nothing to show apart.
+        found = rows(state="ok", last_success_epoch=NOW_S - 5 * HOUR,
+                     personal={"state": "not applicable: no placement.toml on this Mac", "paths": []})
+        self.assertNotIn(personal, found)
+        self.assertEqual(found[full].status, "pass")
+
     def test_backup_ages_idrive_mirror_hdd_and_icloud(self):
         fresh = NOW_S - HOUR
         self.assertEqual(self.status(

@@ -7,6 +7,7 @@ mains power; the hub's `idrive-ingest` backs that folder up with everything else
 also the "verified on the hub" half of an offload.
 
   home-mirror run [--force] [--dry-run]   one pass when due (or --force); writes status.json
+  home-mirror run --dry-run --personal    plan each personal data set, copy nothing, print the result
   home-mirror status                       status.json
 
 Config ~/.config/fleet/home-mirror.json:
@@ -20,6 +21,16 @@ Files that are cloud placeholders (dataless) under `skip_dataless` are never rea
 makes the cloud download it. Deleted or changed files are moved to `<dest>-versions/<stamp>` on
 the hub, not lost. On the hub the copy runs under `disk-slot`, so it never shares a disk with
 another heavy job. State: ~/.local/state/home-mirror/.
+
+Two passes, each with its own space check and its own record in status.json. The personal pass
+goes first: the `class = "personal-unique"` data sets in ~/.config/fleet/placement.toml whose
+paths exist under this home, one data set at a time in the file's order (a data set's optional
+integer `priority` moves it: lower first, none counts as 0), each to the same place in the same
+tree, so the full pass sends nothing twice. A set is copied when its own plan plus `min_free_gb`
+fits in what is free now, never `first_pass_free_gb`; one that does not fit waits and the sets
+after it still go, so what cannot be replaced is copied even while the full home, or one large
+set, does not fit. Its record is `personal` in status.json, with one entry per set in `sets`; the
+top-level fields stay the full pass's. A Mac with no placement.toml has no personal pass.
 
 A laptop's home holds keys and personal files, so on a removable drive the copy belongs inside an
 encrypted disk image: set "hub_prepare": "~/.local/bin/home-mirror hub-attach", point `dest` into
@@ -48,6 +59,13 @@ RSYNC = next((p for p in ("/opt/homebrew/bin/rsync", "/usr/local/bin/rsync") if 
 REMOTE_RSYNC = "/opt/homebrew/bin/rsync"
 METERED = HOME / ".local/state/METERED_LINK"
 WILD = re.compile(r"([*?\[\]\\])")
+# The fleet's one reader of placement.toml data sets is the morning probe's. TOML needs Python 3.11
+# and this script also runs under macOS's own older python3, so the reader is run by whichever
+# interpreter has it.
+PROBE = pathlib.Path(__file__).resolve().parents[1] / "fleet/morning/probe.py"
+READ_DATASETS = ("import json, runpy, sys; probe = runpy.run_path(sys.argv[1]); "
+                 "print(json.dumps(probe['_placement_datasets'](sys.argv[2]) if probe['tomllib'] else None))")
+PYTHONS = ("/opt/homebrew/bin/python3", "/usr/local/bin/python3")
 
 
 def load_config(path=CONFIG):
@@ -69,6 +87,129 @@ def load_config(path=CONFIG):
 def rsync_pattern(rel):
     """An anchored rsync pattern matching exactly this relative path (wildcards escaped)."""
     return "/" + WILD.sub(r"\\\1", rel)
+
+
+def placement_datasets(run=subprocess.run):
+    """Data sets declared in this home's placement.toml, or None when no interpreter could read it."""
+    for python in dict.fromkeys((sys.executable, *PYTHONS)):
+        try:
+            done = run([python, "-c", READ_DATASETS, str(PROBE), str(HOME)],
+                       capture_output=True, text=True, timeout=60)
+            rows = json.loads(done.stdout)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            continue
+        if isinstance(rows, list):
+            return rows
+    return None
+
+
+def home_relative(path):
+    """A data set path as a path under this home, or None when it is not inside it."""
+    text = str(path)[2:] if str(path).startswith("~/") else str(path)
+    if text.startswith("/"):
+        try:
+            text = str(pathlib.PurePosixPath(text).relative_to(HOME))
+        except ValueError:
+            return None
+    rel = os.path.normpath(text)
+    return None if rel in (".", "..") or rel.startswith("../") else rel
+
+
+def personal_sets(cfg, run=subprocess.run):
+    """What the personal pass copies, in the order it copies it: placement.toml's personal-unique
+    data sets, each with its paths that exist under this home, so a newly declared data set is
+    covered with no change here. The order is the file's, which is the owner's priority; a data
+    set's optional integer `priority` moves it (lower first, none counts as 0). A path that is not
+    on this Mac, or that the config excludes, is named in `skipped`; within a set a path inside
+    another is dropped (its parent carries it). `state` is set when there is no pass to run: "not
+    applicable" (no placement.toml, or nothing of it here) or "failed" (the file could not be read,
+    which must never look like a copy)."""
+    out = {"sets": [], "skipped": [], "state": None}
+    if not (HOME / ".config/fleet/placement.toml").is_file():
+        out["state"] = "not applicable: no placement.toml on this Mac"
+        return out
+    rows = placement_datasets(run)
+    if not rows:
+        out["state"] = "failed: placement.toml gave no data sets (unreadable, or no python3 with tomllib)"
+        return out
+    excluded = excepted(cfg["exclude"])
+    for ds in sorted(rows, key=lambda ds: ds.get("priority") or 0):   # stable: ties keep the file's order
+        if ds.get("class") != "personal-unique":
+            continue
+        found = set()
+        for path in ds.get("paths") or []:
+            rel = home_relative(path)
+            if rel is None:
+                why = "outside this home"
+            elif any(rel == e or rel.startswith(e + "/") for e in excluded):
+                why = "excluded in home-mirror.json"
+            elif not os.path.lexists(HOME / rel):
+                why = "not on this Mac"
+            else:
+                found.add(rel)
+                continue
+            out["skipped"].append({"path": path, "dataset": ds.get("name"), "why": why})
+        if found:
+            out["sets"].append({"name": str(ds.get("name")),
+                                "paths": sorted(p for p in found if not any(p.startswith(q + "/") for q in found))})
+    if not out["sets"]:
+        out["state"] = "not applicable: no personal data set of placement.toml is on this Mac"
+    return out
+
+
+def needed_gb(cfg, planned_bytes):
+    """Free space a planned transfer needs: its size, a tenth of headroom, and the reserve."""
+    return planned_bytes / 1e9 * 1.10 + float(cfg["min_free_gb"])
+
+
+def still_waiting(cfg, rec, free, now):
+    """True when this set's own recent plan still does not fit, so it is not planned again: that
+    would hold the hub's disk slot to learn the same thing. Only that set is put off; a plan older
+    than `preflight_cache_h`, or more room than it needed, is a new plan."""
+    if not str(rec.get("state")).startswith("waiting for space") or not rec.get("planned_bytes"):
+        return False
+    age, needed = now - int(rec.get("attempt_epoch") or 0), needed_gb(cfg, rec["planned_bytes"])
+    if age < 0 or age > float(cfg.get("preflight_cache_h", 6)) * 3600 or free >= needed:
+        return False
+    rec.update(required_free_gb=needed,
+               state=f"waiting for space: {free:.1f} GB free, recent plan needs {needed:.1f} GB including reserve")
+    return True
+
+
+def summarise(personal, cfg, problem=None):
+    """The personal record's own fields, from its per-set records: the counts, what counts as
+    copied for placement, and one state (the worst set's). `last_success_epoch` is the oldest of
+    the sets' last good copies, and is there only when every set has one."""
+    if problem:
+        personal["state"] = problem
+        if problem.startswith("not applicable"):
+            personal.update(paths=[], sets=[], copied_paths=[])
+            personal.pop("last_success_epoch", None)
+        return
+    sets = personal.get("sets") or []
+    done = [s for s in sets if s.get("last_success_epoch")]
+    waiting = [s for s in sets if str(s.get("state")).startswith("waiting for space")]
+    personal.update(sets_total=len(sets), sets_copied=len(done), sets_waiting=len(waiting),
+                    planned_bytes=sum(s.get("planned_bytes") or 0 for s in waiting),
+                    **{key: sum(s.get(key) or 0 for s in done) for key in ("files", "bytes", "total_bytes")})
+    personal.pop("required_free_gb", None)
+    if waiting:
+        personal["required_free_gb"] = needed_gb(cfg, personal["planned_bytes"])
+    personal.pop("last_success_epoch", None)
+    if sets and len(done) == len(sets):
+        personal["last_success_epoch"] = min(s["last_success_epoch"] for s in done)
+        personal.setdefault("first_success_epoch", personal["last_success_epoch"])
+    # A path earns a row for placement when its set is copied. Not twice (inside another copied
+    # path), and not inside a path of a set still to copy: placement would read the smaller copy as
+    # a copy of the larger.
+    have = {p for s in done for p in s["paths"]}
+    lack = {p for s in sets if not s.get("last_success_epoch") for p in s["paths"]}
+    personal["copied_paths"] = sorted(p for p in have if not any(p.startswith(q + "/") for q in have | lack))
+    rank = ("failed", "deferred", "slice used", "queued", "waiting for space", "skipped")
+    worst = min((s for s in sets if s.get("state") != "ok"), default=None,
+                key=lambda s: next((i for i, word in enumerate(rank) if str(s.get("state")).startswith(word)), len(rank)))
+    personal["state"] = "ok" if worst is None else \
+        f"{worst.get('state')} [{worst['name']}]; {len(done)} of {len(sets)} sets copied"
 
 
 def dataless(home, folders, run=subprocess.run):
@@ -190,7 +331,10 @@ def sh(text):
     return "'" + str(text).replace("'", "'\\''") + "'"
 
 
-def rsync_args(cfg, exclude_file, stamp, dry=False, verify=False):
+def rsync_args(cfg, exclude_file, stamp, dry=False, verify=False, sources=None):
+    """The copy's command line. `sources` (the personal pass) limits it to those home-relative paths:
+    --relative puts each at the same path under the destination as the whole-home copy would, so
+    anchored excludes still match, and nothing outside those paths is sent, deleted or replaced."""
     dest = cfg["dest"].rstrip("/")
     remote = (f"$HOME/.local/bin/disk-slot --label home-mirror --wait 7200 {sh(os.path.dirname(dest))} -- "
               f"{REMOTE_RSYNC}")
@@ -212,6 +356,8 @@ def rsync_args(cfg, exclude_file, stamp, dry=False, verify=False):
         args += ["--checksum", "--itemize-changes"]
     if dry or verify:
         args.append("--dry-run")
+    if sources is not None:
+        return args + ["--relative", *[f"{HOME}/./{rel}" for rel in sources], f"{cfg['hub']}:{dest}/"]
     return args + [str(HOME) + "/", f"{cfg['hub']}:{dest}/"]
 
 
@@ -240,22 +386,42 @@ def replica_rows(cfg, status, entries, held_at=None):
     """Rows for placement (replicas.d/home-mirror.json): one per top-level home entry the last
     good pass copied. `encrypted` says the copy sits in an encrypted image (config `encrypted`);
     `verified` means rsync finished without error, which checks each file it moved. A second row
-    per entry is off-site once the hub's backup has held the copy's source since that pass."""
-    first = status.get("first_success_epoch")
-    if not status.get("last_success_epoch") or not status.get("total_bytes"):
-        return []
+    per entry is off-site once the hub's backup has held the copy's source since that pass.
+
+    The personal pass adds one row per path of a data set it has copied (`copied_paths`; a set
+    still waiting earns none), unless a full-pass row already covers that path: placement counts
+    rows, so two rows for one copy would read as two copies. A row's pass is the newest good copy
+    that wrote under its path, each personal set having its own, and off-site needs the hub's
+    backup to have held the source since then. `held_at` is that time, or a function of the pass
+    time."""
+    held = held_at if callable(held_at) else (lambda since: held_at)
+    personal = status.get("personal") or {}
+    full_pass = status.get("last_success_epoch") if status.get("total_bytes") else None
+    wrote = [(p, s["last_success_epoch"]) for s in personal.get("sets") or [] if s.get("last_success_epoch")
+             for p in s.get("paths") or []]
+
+    def newest(top):
+        return max([when for p, when in wrote if p == top or p.startswith(top + "/")], default=0)
+
     skip = set(excepted(cfg["exclude"]))
-    rows = []
-    for name in sorted(entries):
+    copied = [p for p in (personal.get("copied_paths") or []) if personal.get("total_bytes") and newest(p)
+              and not any(p == e or p.startswith(e + "/") for e in skip)]
+    found = []
+    for name in sorted(entries) if full_pass else []:
         if name.startswith(".") or name in skip:
             continue
-        inner = [e for e in skip if e.startswith(name + "/")]
-        base = {"path": name, "bytes": status["total_bytes"], "verified": True, "except": inner,
-                "pass": status["last_success_epoch"]}
+        found.append((name, max(full_pass, newest(name)), status["total_bytes"]))
+    tops = {name for name, _, _ in found}
+    found += [(p, newest(p), personal["total_bytes"]) for p in copied if p.split("/")[0] not in tops]
+    rows = []
+    for path, since, size in found:
+        inner = sorted(e for e in skip if e.startswith(path + "/"))
+        base = {"path": path, "bytes": size, "verified": True, "except": inner, "pass": since}
         rows.append(dict(base, volume=cfg.get("volume") or cfg["hub"], encrypted=bool(cfg.get("encrypted"))))
-        if held_at and held_at >= status["last_success_epoch"]:
+        when = held(since)
+        if when and when >= since:
             rows.append(dict(base, volume=cfg["offsite"].get("name", "offsite"), encrypted=True,
-                             offsite=True, held_at=held_at))
+                             offsite=True, held_at=when))
     return rows
 
 
@@ -276,6 +442,17 @@ def offsite_held_at(cfg, run=subprocess.run, after_epoch=None):
     return held.get(off["source"])
 
 
+def held_since(cfg, run=subprocess.run):
+    """offsite_held_at as a function of the pass time; the hub is asked once per distinct time."""
+    seen = {}
+
+    def held(since):
+        if since not in seen:
+            seen[since] = offsite_held_at(cfg, run, after_epoch=since)
+        return seen[since]
+    return held
+
+
 def write_replicas(rows):
     target = pathlib.Path(os.environ.get("HOME_MIRROR_REPLICAS",
                                          HOME / ".local/state/placement/replicas.d/home-mirror.json"))
@@ -292,29 +469,193 @@ def write_status(status):
     os.replace(tmp, STATE / "status.json")
 
 
-def run_once(cfg, force=False, dry=False):
+STOPPED = "deferred: laptop activity, power or network changed; partial copy retained"
+
+
+def set_logs(name):
+    """A personal set's plan and copy logs, in a folder of their own that the copy leaves out."""
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", name).strip("-").lower() or "set"
+    return STATE / "personal" / f"{slug}.plan.log", STATE / "personal" / f"{slug}.rsync.log"
+
+
+def copy_pass(cfg, rec, save, now, dry, shared, sources=None, promised=0.0):
+    """One copy, recorded in `rec` (its own part of status.json): the exclude list, a size plan
+    checked against the free space, then the copy, which yields the hub's disk slot after `slice_s`
+    and resumes next time. `sources` makes it one personal data set, named by `rec`: it always
+    plans, and its space check is its own plan plus the reserve; a dry run stops at that plan, with
+    `promised` GB already spoken for by the sets planned before it. `shared` carries the exclude
+    list from one copy of a run to the next, so cloud placeholders are scanned once."""
+    plan_log, log = (STATE / "preflight.log", STATE / "rsync.log") if sources is None else set_logs(rec["name"])
+    log.parent.mkdir(parents=True, exist_ok=True)
+    rec.update(attempt_epoch=now)
+    for old_result in ('rc', 'duration_s'):
+        rec.pop(old_result, None)
+    exclude_file = STATE / "exclude.txt"
+    if "lines" not in shared and "failed" not in shared:
+        rec["state"] = "preparing: checking cloud placeholders"
+        save()
+        try:
+            # The personal sets' logs change while a copy runs and are no part of the home's data.
+            own = [rsync_pattern(str((STATE / "personal").relative_to(HOME))) + "/"] if HOME in STATE.parents else []
+            placeholders = dataless(HOME, cfg["skip_dataless"])
+            shared.update(lines=list(cfg["exclude"]) + own + [rsync_pattern(rel) for rel in placeholders],
+                          dataless=len(placeholders))
+            exclude_file.write_text("\n".join(shared["lines"]) + "\n")
+        except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+            shared["failed"] = f"failed: {exc}"
+    if "failed" in shared:
+        rec["state"] = shared["failed"]
+        return rec
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now))
+    if cfg.get("preflight_space") or sources is not None:
+        rec["state"] = "preflight: waiting for disk and checking incremental size"
+        save()
+        with plan_log.open("w") as handle:
+            plan = guarded_copy(rsync_args(cfg, exclude_file, stamp, dry=True, sources=sources), handle,
+                                dict(cfg, slice_s=0))
+        plan_text = plan_log.read_text(errors="replace")
+        planned = stats(plan_text)
+        if plan.returncode not in (0, 24) or "bytes" not in planned:
+            if re.search(r"disk-slot:.*(?:is busy|not started)", plan_text):
+                rec["state"] = "deferred: hub disk busy (disk-slot)"
+            elif "destination reserve changed" in plan_text:
+                rec["state"] = "deferred: destination reserve changed"
+            elif plan.returncode == 75 and "Deferred:" in plan_text:
+                rec["state"] = STOPPED
+            else:
+                rec["state"] = f"failed: capacity preflight (see {plan_log.relative_to(STATE)})"
+            return rec
+        free = remote_free_gb(cfg)
+        free = free - promised if free is not None and promised else free
+        needed = needed_gb(cfg, planned["bytes"])
+        rec.update(planned_bytes=planned["bytes"], required_free_gb=needed)
+        if free is None or free < needed:
+            rec["state"] = (f"waiting for space: {free} GB free, {'incremental pass' if sources is None else 'this set'} "
+                            f"needs {needed:.1f} GB including reserve")
+            return rec
+        if dry and sources is not None:
+            rec["state"] = "dry run: fits"
+            return rec
+        cfg = dict(cfg, required_free_gb=needed)
+    rec.update(state="running", attempt_epoch=now)
+    save()
+    with open(log, "w") as handle:
+        done = guarded_copy(["/usr/bin/caffeinate", "-is",
+                             *rsync_args(cfg, exclude_file, stamp, dry, sources=sources)], handle, cfg)
+    text = log.read_text(errors="replace")[-20000:]
+    rec.update(stats(text), rc=done.returncode, duration_s=int(time.time()) - now, dataless_skipped=shared["dataless"])
+    # 24: some files vanished while copying (a live home): the pass still counts.
+    if done.returncode in (0, 24) and not dry:
+        rec.update(state="ok", last_success_epoch=int(time.time()))
+        rec.setdefault("first_success_epoch", rec["last_success_epoch"])
+    elif not dry and done.returncode == 75 and "Slice used (" in text:
+        rec["state"] = "slice used, continues"
+    elif not dry and done.returncode == 75 and "Deferred:" in text:
+        rec["state"] = STOPPED   # the laptop came into use, lost mains or went metered: not a failure
+    elif not dry and re.search(r"disk-slot:.*(?:is busy|not started)", text):
+        rec["state"] = "deferred: hub disk busy (disk-slot)"
+    elif not dry and "destination reserve changed" in text:
+        rec["state"] = "deferred: destination reserve changed"
+    else:
+        rec["state"] = "dry run" if dry else f"failed: rsync exit {done.returncode} (see {log.relative_to(STATE)})"
+    return rec
+
+
+def personal_walk(cfg, personal, todo, free, save, now, dry, force, shared):
+    """The personal pass: each data set that is due, in order, on its own. A set is planned alone
+    and copied when its plan and the reserve fit in what is free now; one that does not fit waits,
+    with the room it needs recorded, and the walk goes on, so a large set never holds back the
+    small ones after it. A set that uses its slice, or is asked to yield, ends the walk for this
+    run: the sets already copied are not due next time, so the next run resumes at that set.
+    Returns (that set or None, the free space now)."""
+    promised = 0.0
+    for index, rec in enumerate(todo):
+        if free - promised < float(cfg["min_free_gb"]):
+            rec["state"] = f"skipped: {free - promised:.0f} GB free at the destination (floor {cfg['min_free_gb']})"
+            continue
+        if not force and not dry and still_waiting(cfg, rec, free, now):
+            continue
+        copy_pass(cfg, rec, save, now, dry, shared, sources=rec["paths"], promised=promised)
+        if rec.get("rc") is not None:
+            personal["rc"] = rec["rc"]
+        if rec.get("rc") == 75 or rec["state"].startswith("deferred"):
+            for later in todo[index + 1:]:
+                later["state"] = f"queued: {rec['name']} goes first"
+            return rec, free
+        if rec["state"].startswith("dry run"):
+            promised += rec["planned_bytes"] / 1e9
+        elif rec.get("rc") is not None:
+            free = remote_free_gb(cfg)
+            if free is None:
+                for later in todo[index + 1:]:
+                    later["state"] = "skipped: hub unreachable or destination missing"
+                return None, None
+    return None, free
+
+
+def run_once(cfg, force=False, dry=False, full=True):
+    """The personal pass, then the full one (unless `full` is off), each when due. The personal
+    pass is never held up by the full pass's space checks: those come after it and stop only the
+    full pass."""
     now = int(time.time())
     try:
         previous = json.loads((STATE / "status.json").read_text())
     except (OSError, ValueError):
         previous = {}
     status = dict(previous, checked_at=now)
-    last = previous.get("last_success_epoch")
-    if not force and last and now - int(last) < float(cfg["every_h"]) * 3600:
+    personal = status["personal"] = dict(previous.get("personal") or {})
+    wanted = personal_sets(cfg)
+    if not wanted["state"]:
+        # A set keeps its record only while it means the same paths: a changed set is not yet copied.
+        old = {s.get("name"): s for s in personal.get("sets") or [] if isinstance(s, dict)}
+        personal.update(skipped=wanted["skipped"], paths=sorted({p for s in wanted["sets"] for p in s["paths"]}),
+                        sets=[dict(old[s["name"]] if old.get(s["name"], {}).get("paths") == s["paths"] else {}, **s)
+                              for s in wanted["sets"]])
+
+    def save():
+        if not dry:
+            summarise(personal, cfg, wanted["state"])
+            write_status(status)
+
+    passes(cfg, status, [] if wanted["state"] else personal["sets"], previous, save, now, force, dry, full)
+    summarise(personal, cfg, wanted["state"])
+    return status
+
+
+def passes(cfg, status, sets, previous, save, now, force, dry, full):
+    """The checks both passes share (link, power, hub), then the personal sets that are due, then
+    the full pass with its own space checks."""
+    personal, last = status["personal"], previous.get("last_success_epoch")
+
+    def due(rec):
+        done = rec.get("last_success_epoch")
+        return force or not done or now - int(done) >= float(cfg["every_h"]) * 3600
+
+    todo = [s for s in sets if due(s)]
+    for s in sets:
+        s["state"] = s.get("state") or "not run yet" if s in todo else "ok"
+    do_personal, do_full = bool(todo), full and due(previous)
+    if full and not do_full:
         status["state"] = "ok"
+    if not (do_personal or do_full):
         return status
+
+    def stop(state):
+        """Neither pass can start now; each pass that was due, and each set, records why."""
+        for s in todo:
+            s["state"] = state
+        if do_full:
+            status["state"] = state
+        return status
+
     if METERED.exists():
-        status["state"] = "skipped: metered link"
-        return status
+        return stop("skipped: metered link")
     if cfg["require_ac"] and not on_ac():
-        status["state"] = "skipped: on battery"
-        return status
+        return stop("skipped: on battery")
     if not idle_allowed(cfg):
-        status["state"] = "skipped: shared laptop is in use"
-        return status
+        return stop("skipped: shared laptop is in use")
     if priority_busy(cfg):
-        status['state'] = 'deferred: hub archive verification has priority (or hub check unavailable)'
-        return status
+        return stop('deferred: hub archive verification has priority (or hub check unavailable)')
     mounted = False
     if cfg.get("hub_mount"):
         check = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", cfg["hub"],
@@ -342,9 +683,24 @@ def run_once(cfg, force=False, dry=False):
         except (OSError, subprocess.SubprocessError) as exc:
             ok, why = False, str(exc)
         if not ok:
-            status["state"] = f"skipped: the hub could not prepare the destination ({why})"
-            return status
+            return stop(f"skipped: the hub could not prepare the destination ({why})")
     free = remote_free_gb(cfg)
+    if free is None:
+        return stop("skipped: hub unreachable or destination missing")
+    shared = {}
+    if do_personal:
+        personal.update(attempt_epoch=now)
+        personal.pop("rc", None)
+        yielded, free = personal_walk(cfg, personal, todo, free, save, now, dry, force, shared)
+        personal.update(duration_s=int(time.time()) - now, dataless_skipped=shared.get("dataless", 0))
+        if yielded:
+            # Its slice is used, or the laptop or the hub's disk asked it to yield. The full pass
+            # does not start in the same run: it would take the slot the personal pass gave up.
+            if do_full:
+                status["state"] = f"deferred: personal pass goes first ({yielded['name']}: {yielded['state']})"
+            return status
+    if not do_full:
+        return status
     if free is None:
         status["state"] = "skipped: hub unreachable or destination missing"
         return status
@@ -359,65 +715,7 @@ def run_once(cfg, force=False, dry=False):
         if cached:
             status.update(cached)
             return status
-    STATE.mkdir(parents=True, exist_ok=True)
-    status.update(attempt_epoch=now)
-    for old_result in ('rc', 'duration_s'):
-        status.pop(old_result, None)
-    exclude_file = STATE / "exclude.txt"
-    if not dry:
-        write_status(dict(status, state="preparing: checking cloud placeholders", attempt_epoch=now))
-    try:
-        placeholders = dataless(HOME, cfg["skip_dataless"])
-    except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
-        status["state"] = f"failed: {exc}"
-        return status
-    lines = list(cfg["exclude"]) + [rsync_pattern(rel) for rel in placeholders]
-    exclude_file.write_text("\n".join(lines) + "\n")
-    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now))
-    if cfg.get("preflight_space"):
-        if not dry:
-            write_status(dict(status, state="preflight: waiting for disk and checking incremental size", attempt_epoch=now))
-        plan_log = STATE / "preflight.log"
-        with plan_log.open("w") as handle:
-            plan = guarded_copy(rsync_args(cfg, exclude_file, stamp, dry=True), handle, dict(cfg, slice_s=0))
-        plan_text = plan_log.read_text(errors="replace")
-        planned = stats(plan_text)
-        if plan.returncode not in (0, 24) or "bytes" not in planned:
-            if re.search(r"disk-slot:.*(?:is busy|not started)", plan_text):
-                status["state"] = "deferred: hub disk busy (disk-slot)"
-            elif "destination reserve changed" in plan_text:
-                status["state"] = "deferred: destination reserve changed"
-            else:
-                status["state"] = "failed: capacity preflight (see preflight.log)"
-            return status
-        free = remote_free_gb(cfg)
-        needed = planned["bytes"] / 1e9 * 1.10 + float(cfg["min_free_gb"])
-        status.update(planned_bytes=planned["bytes"], required_free_gb=needed)
-        if free is None or free < needed:
-            status["state"] = f"waiting for space: {free} GB free, incremental pass needs {needed:.1f} GB including reserve"
-            return status
-        cfg = dict(cfg, required_free_gb=needed)
-    status.update(state="running", attempt_epoch=now)
-    if not dry:
-        write_status(status)
-    log = STATE / "rsync.log"
-    with open(log, "w") as handle:
-        done = guarded_copy(["/usr/bin/caffeinate", "-is", *rsync_args(cfg, exclude_file, stamp, dry)], handle, cfg)
-    text = log.read_text(errors="replace")[-20000:]
-    status.update(stats(text), rc=done.returncode, duration_s=int(time.time()) - now,
-                  dataless_skipped=len(lines) - len(cfg["exclude"]))
-    # 24: some files vanished while copying (a live home): the pass still counts.
-    if done.returncode in (0, 24) and not dry:
-        status.update(state="ok", last_success_epoch=int(time.time()))
-        status.setdefault("first_success_epoch", status["last_success_epoch"])
-    elif not dry and done.returncode == 75 and "Slice used (" in text:
-        status["state"] = "slice used, continues"
-    elif not dry and re.search(r"disk-slot:.*(?:is busy|not started)", text):
-        status["state"] = "deferred: hub disk busy (disk-slot)"
-    elif not dry and "destination reserve changed" in text:
-        status["state"] = "deferred: destination reserve changed"
-    else:
-        status["state"] = "dry run" if dry else f"failed: rsync exit {done.returncode} (see rsync.log)"
+    copy_pass(cfg, status, save, now, dry, shared)
     return status
 
 
@@ -491,6 +789,7 @@ def main(argv=None):
     r = sub.add_parser("run")
     r.add_argument("--force", action="store_true")
     r.add_argument("--dry-run", action="store_true")
+    r.add_argument("--personal", action="store_true", help="the personal pass only; the full pass is left alone")
     sub.add_parser("status")
     sub.add_parser("hub-attach")
     ht = sub.add_parser("hub-trigger")
@@ -516,14 +815,14 @@ def main(argv=None):
     except BlockingIOError:
         print("home-mirror: another pass is running")
         return 0
-    status = run_once(cfg, force=args.force, dry=args.dry_run)
+    status = run_once(cfg, force=args.force, dry=args.dry_run, full=not args.personal)
     if not args.dry_run:
         write_status(status)
-        if status.get("last_success_epoch"):
-            held = offsite_held_at(cfg, after_epoch=status["last_success_epoch"])
-            write_replicas(replica_rows(cfg, status, os.listdir(HOME), held))
+        if status.get("last_success_epoch") or status["personal"].get("sets"):
+            write_replicas(replica_rows(cfg, status, os.listdir(HOME), held_since(cfg)))
     print(json.dumps(status, indent=1))
-    return 0 if not str(status.get("state", "")).startswith("failed") else 1
+    states = (status.get("state"), status["personal"].get("state"))
+    return 1 if any(str(state or "").startswith("failed") for state in states) else 0
 
 
 if __name__ == "__main__":

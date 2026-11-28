@@ -6,13 +6,15 @@
 	<string>com.example.tripwire</string>
 	<key>ProgramArguments</key>
 	<array>
+		<string>/usr/bin/python3</string>
+		<string>-I</string>
 		<string>REPLACE_HOME/.local/bin/tripwire</string>
 		<string>check</string>
 	</array>
 	<key>EnvironmentVariables</key>
 	<dict>
 		<key>PATH</key>
-		<string>REPLACE_HOME/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<string>/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:REPLACE_HOME/.local/bin</string>
 	</dict>
 	<key>StartInterval</key>
 	<integer>300</integer>

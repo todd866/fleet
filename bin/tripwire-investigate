@@ -1,15 +1,28 @@
 #!/usr/bin/env python3
-"""Review a Tripwire incident in plan mode and save the investigator's verdict.
+"""Review a Tripwire incident in plan mode and answer with the investigator's verdict.
 
-Tripwire starts this process in the incident directory. The legacy positional
-brief is accepted for existing configurations. Only Tripwire handles releases.
+Tripwire starts this process in the incident directory, through `tripwire review`, and
+gives it the evidence on stdin as one JSON object ({"host", "raised", "changes", "drill"}):
+what Tripwire has just verified in its sealed record. This program reads no file of the
+incident's. The legacy positional brief is accepted for existing configurations. Only
+Tripwire handles releases.
+
+It saves nothing and holds no key. Its answer is one JSON object on stdout,
+{"report": text or null, "engine": which one answered, "outcomes": {engine: outcome}};
+the `tripwire review` process
+that started it takes that from the pipe, checks it and seals it. Run by hand it prints
+an answer nobody acts on: Tripwire releases a hold only on a report it sealed itself.
+
+It finds no program through PATH. The provider program is the absolute path Tripwire
+passes in TRIPWIRE_PROVIDER_AGY, which Tripwire has pinned by SHA-256 in the sealed
+record and watches; without it the Gemini route is simply unavailable.
 """
 import argparse
 import json
 import os
 import re
 from pathlib import Path
-import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -30,26 +43,34 @@ run release commands, send messages or change state."""
 
 
 def gemini_review(model, prompt, seconds):
-    cli = shutil.which("agy")
-    if not cli:
+    cli = os.environ.get("TRIPWIRE_PROVIDER_AGY", "")
+    if not os.path.isabs(cli) or not os.path.isfile(cli):
         return None, "provider CLI unavailable"
     command = [cli, "-p", prompt, "--mode", "plan", "--sandbox",
                "--disable-slash-commands", "--model", model, "--print-timeout", "9m"]
-    timeout = shutil.which("timeout") or "/opt/homebrew/bin/timeout"
     try:
-        result = subprocess.run([timeout, str(max(1, int(seconds))), *command], stdin=subprocess.DEVNULL,
-                                stdout=subprocess.PIPE, text=True, errors="replace")
+        provider = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True,
+                                    errors="replace", start_new_session=True)
     except OSError:
         return None, "provider could not start"
-    if result.returncode != 0:
-        return None, f"provider exited {result.returncode}"
-    if reports.verdict(result.stdout) in reports.PROVIDER_VERDICTS:
-        return result.stdout, "complete"
+    try:
+        answer, _ = provider.communicate(timeout=max(1, int(seconds)))
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(provider.pid, signal.SIGKILL)   # the provider and whatever it started
+        except OSError:
+            pass
+        provider.communicate()
+        return None, "provider ran out of time"
+    if provider.returncode != 0:
+        return None, f"provider exited {provider.returncode}"
+    if reports.verdict(answer) in reports.PROVIDER_VERDICTS:
+        return answer, "complete"
     return None, "provider returned no complete verdict"
 
 
 DRILL_CHANGE = {"wire": "test", "what": "tripwire test", "before": None, "after": "raised by hand"}
-REMOTE_WIRES = {"test", "files", "guards", "launchd", "listeners", "accounts", "public_repos"}
+REMOTE_WIRES = {"test", "files", "guards", "launchd", "listeners", "accounts", "public_repos", "tripwire"}
 
 
 # What each wire watches, in words a reviewer cannot misread. A text-only reviewer sees only the wire's name:
@@ -64,13 +85,15 @@ WIRE_MEANING = {
     "accounts": "a local user account or admin-group membership changed",
     "public_repos": "a repository under the owner's account became public or a new public one appeared",
     "test": "a synthetic change raised by the tripwire self-test",
+    "tripwire": "part of tripwire's own saved state (its baseline, a kept copy of a file, or an incident record) "
+                "was missing or did not carry tripwire's seal, so something other than tripwire wrote or removed it",
 }
 
 
 def remote_evidence(record):
     """Project only typed observations. Arbitrary paths, names and content stay on the host."""
     changes = record.get("changes") or []
-    drill = record.get("source") == "tripwire test CLI" and changes == [DRILL_CHANGE]
+    drill = record.get("drill") is True and changes == [DRILL_CHANGE]
     observations = []
     for change in changes[:48]:
         if not isinstance(change, dict):
@@ -148,13 +171,11 @@ def main():
     parser.add_argument("--last-resort", choices=["deepseek"], help="Use the configured text-only DeepSeek route if prior providers fail")
     parser.add_argument("brief", nargs="?")
     args = parser.parse_args()
-    state = Path(os.environ.get("TRIPWIRE_STATE", Path.home() / ".local/state/fleet/tripwire"))
-    if Path.cwd().parent != (state / "incidents").resolve() or not Path("incident.json").is_file():
-        parser.error("run inside a recorded Tripwire incident")
-    if reports.saved_verdict(Path.cwd()):
-        return 0
-    record = json.loads(Path("incident.json").read_text())
-    evidence = json.dumps({key: record[key] for key in ("host", "raised", "changes")}, ensure_ascii=True)
+    try:
+        record = json.loads(sys.stdin.read())
+        evidence = json.dumps({key: record[key] for key in ("host", "raised", "changes")}, ensure_ascii=True)
+    except (ValueError, KeyError, TypeError):
+        parser.error("the evidence comes on stdin from `tripwire review`, as one JSON object")
     drill = remote_evidence(record)[1]
     context = "\nThis incident was raised through the local tripwire test CLI and contains only its synthetic test change." if drill else ""
     if len(evidence) <= 32000:
@@ -165,9 +186,8 @@ def main():
     if args.last_resort and args.last_resort not in engines:
         engines.append(args.last_resort)
     model = os.environ.get("TRIPWIRE_GEMINI_MODEL", "gemini-4-carbon-high" if args.engine else "gemini-3.8-flash-high")
-    attempt = "fallback" if os.environ.get("TRIPWIRE_ATTEMPT") == "fallback" else "primary"
     deadline = time.monotonic() + float(os.environ.get("TRIPWIRE_REVIEW_SECONDS", 600 * len(engines)))
-    outcomes = {}
+    outcomes, answer, answered = {}, None, None
     for index, engine in enumerate(engines):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -180,15 +200,12 @@ def main():
             report, outcome = text_review(engine, record, budget)
         outcomes[engine] = outcome
         if report is not None:
-            reports.publish(Path.cwd(), report)
+            answer, answered = report, engine
             break
-    # A very short-lived CLI can exit before its PID start time is captured.
-    # Keep only engine names and status. The monitor can see this attempt completed.
-    receipt = Path(f"{attempt}-result.json")
-    temp = Path(f".{attempt}-result-{os.getpid()}")
-    temp.write_text(json.dumps(outcomes))
-    os.replace(temp, receipt)
-    if reports.saved_verdict(Path.cwd()):
+    # Engine names and status only. `tripwire review` seals them as the receipt for this attempt.
+    json.dump({"report": answer, "engine": answered, "outcomes": outcomes}, sys.stdout)
+    sys.stdout.write("\n")
+    if answer is not None:
         return 0
     print("tripwire-investigate: no investigator returned a complete verdict", file=sys.stderr)
     return 1

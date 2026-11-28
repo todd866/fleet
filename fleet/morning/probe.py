@@ -993,6 +993,8 @@ def _placement_datasets(home=None):
             "replica_volumes": replicas,
             "keep": keep,
         })
+        if type(ds.get("priority")) is int:   # optional: home-mirror copies personal sets lowest first
+            rows[-1]["priority"] = ds["priority"]
     return rows or None
 
 

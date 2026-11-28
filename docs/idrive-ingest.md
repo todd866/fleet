@@ -62,8 +62,60 @@ encrypted disk image that the hub attaches before each pass (`home-mirror hub-at
 creates it on first use); the image's volume is a source, the image file itself is masked, and
 the copy goes off-site with everything else. Every
 exclude in `~/.config/fleet/home-mirror.json` carries a reason, cloud placeholders are never read
-(reading one makes the cloud download it), and replaced files are kept beside the copy. The
-morning check shows `backup:<laptop>:home-mirror`: amber after two days away, red after a week.
+(reading one makes the cloud download it), and replaced files are kept beside the copy.
+
+Each run is two passes, each with its own space check and its own record.
+
+| Pass | What it copies | Space it needs | Record in `status.json` | Morning row |
+|---|---|---|---|---|
+| Personal, first | The `class = "personal-unique"` data sets in `~/.config/fleet/placement.toml` whose paths exist under this home, one data set at a time | Per data set: its own measured plan, 10 % headroom and `min_free_gb`, against what is free at that moment; never `first_pass_free_gb` | `personal`, one entry per data set in `personal.sets` | `backup:<laptop>:home-mirror-personal` |
+| Full | The whole home | As before: `first_pass_free_gb` for a first seed, or the measured plan with `preflight_space` | the top-level fields | `backup:<laptop>:home-mirror` |
+
+The personal pass exists so that what cannot be replaced reaches the hub while the whole home
+does not fit: a full pass that is waiting for space never skips, delays or fails it. Its list is
+read from placement.toml on every run, so a newly declared personal data set is covered with no
+change to home-mirror. A path that is not on this Mac, or that `home-mirror.json` excludes, is
+named in `personal.skipped` with the reason.
+
+The data sets are taken in the order placement.toml declares them, which is the order of
+importance. An optional integer `priority` on a data set moves it: lower goes first, a data set
+without one counts as 0, and equal numbers keep the file's order. Each set is planned alone and
+copied when its plan fits; free space is read again after every copy. A set that does not fit is
+recorded as waiting, with the room it needs, and the sets after it still go: one large set never
+holds back the small ones. A set's waiting answer is kept for `preflight_cache_h` (6 hours) so
+it is not planned again to learn the same thing; that never puts off another set.
+
+Each set copies into the same tree the full pass uses, at the same paths, so the full pass sends
+none of it again; the excludes and the placeholder rule apply unchanged. Like the full pass a set
+gives up the hub's disk slot after `slice_s`. That ends the personal pass for the run and the
+full pass does not start; the next run skips the sets already copied in this cycle and resumes at
+that set. A copy stopped because the laptop came into use, lost mains or went onto a metered link
+is `deferred`, in either pass, not a failure. A Mac with no placement.toml has no personal pass
+and no personal row.
+
+`personal` in `status.json` holds, for each set, `name`, `paths`, `state` (`ok`, `waiting for
+space: …`, `slice used, continues`, `deferred: …`, `queued: …`, `skipped: …` or `failed: …`),
+`planned_bytes`, `required_free_gb` and `last_success_epoch`; and for the pass `sets_total`,
+`sets_copied`, `sets_waiting`, `copied_paths`, and a `last_success_epoch` that is the oldest
+set's and is present only when every set has been copied.
+
+The full row is amber after two days without a good copy and red after a week. The personal row
+is judged set by set:
+
+| Personal row | When | Shows |
+|---|---|---|
+| Green | Every set has a good copy less than two days old | the age of the oldest set's copy |
+| Amber | A set is waiting for space (however long), has never been copied, was stopped part-way, or its copy is two days old | `9 of 14 sets`, and in the detail each waiting set with the free space it needs and the size it has to copy |
+| Red | A set failed and has no copy at all, or a set's last copy is a week old | the set and its state |
+
+Neither row colours the other: the personal row is green with every set copied while the full
+row stays amber with "waiting for space". A laptop whose home-mirror predates the personal pass
+shows the personal row amber until that pass has run.
+
+To see what the personal pass would do without copying anything, run
+`home-mirror run --dry-run --personal` on the laptop. It plans every set (an rsync dry run each,
+under the hub's disk slot), counts each set that fits against the ones after it, prints the
+result and writes neither `status.json` nor the replica rows.
 
 ## Telling placement what is held
 
@@ -74,6 +126,16 @@ image, with the folder's excludes listed as `except`), and a second, off-site ro
 for its source (`offsite.source` in its config) is later than its first pass. `placement status`
 reads every file in `replicas.d/` beside `replicas.json`, so its copy and off-site checks report
 what really exists.
+
+A copied personal data set counts the same way before any full pass has finished: one row per
+path of a set that has been copied (`personal.copied_paths`), so a personal data set has its
+encrypted second copy as soon as its own copy succeeds, and a set still waiting has none. It is
+off-site only once the hub's backup has started and finished a run after that set's copy; until
+then there is no off-site row. A path is never given two rows for one copy (placement counts rows
+as copies): where a full-pass row for the top-level folder exists it is the only row, and its
+off-site row then waits for a backup run later than the newest copy under that folder. A copied
+path that lies inside a set still to be copied earns no row until that set is copied: placement
+would read the smaller copy as a copy of the whole set.
 
 ## Coverage: nothing misses the backup unnoticed
 
@@ -93,6 +155,11 @@ copy. The receiver rechecks that requirement inside its disk slot; the reserve i
 `bwlimit_kib` can limit transfer pressure while cloud ingest runs. Each host has one run lock.
 A failed cloud-placeholder scan aborts the copy. Off-site replica claims require a backup run
 started after the latest completed home copy; an older seed is not proof of newer files.
+The personal pass always measures each set's transfer, whatever `preflight_space` says, and keeps
+a plan log and a copy log per set in `~/.local/state/home-mirror/personal/`, a folder home-mirror
+itself leaves out of the copy. placement.toml is TOML,
+which needs Python 3.11: under macOS's own older `python3` home-mirror has a Homebrew `python3`
+read it, and when none can, the personal record says `failed`, never a copy.
 
 The existing mounted home source can hold separate host folders without restarting the IDrive
 container. Files added after its initial scan require a later successful ingest before they
