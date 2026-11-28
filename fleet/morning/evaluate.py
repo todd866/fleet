@@ -265,6 +265,8 @@ def _backups(name, host, config, now):
         rows.extend(_server_health(host["server_health"], now))
     if isinstance(host.get("data_map"), dict):
         rows.append(_data_map(name, host["data_map"], now))
+    if isinstance(host.get("signatures"), dict):
+        rows.append(_signatures(name, host["signatures"]))
     if host.get("offload_queue") is not None:
         rows.append(_offload_queue(name, host["offload_queue"], now))
         rows.extend(_offload_autopilot(name, host["offload_queue"].get("autopilot"), now))
@@ -781,6 +783,20 @@ PLACEMENT_STALE_S = 3 * 3600
 UNCLAIMED_WARN_GB = 50
 MAP_STALE_S = 26 * 3600
 _PERSONAL_CODES = {"personal-copies", "offsite"}
+
+
+def _signatures(host, sig):
+    """Every installed fleet binary is signed with the fleet certificate (`fleet-install check`).
+    An ad-hoc copy, put in by hand from a cargo build, makes macOS forget the owner's privacy grants
+    for it; the fix is `bin/fleet-install TOOL` on the Mac with the certificate, never a re-grant."""
+    if sig.get("ok"):
+        return _row(f"sec:{host}:signatures", "pass", "security", "fleet binaries", "signed", "fleet-install check",
+                    "every installed fleet binary carries the fleet certificate's signature")
+    bad = [str(b) for b in sig.get("bad") or []]
+    return _row(f"sec:{host}:signatures", "fail", "security", "fleet binaries", f"{len(bad)} unsigned",
+                "fleet-install check",
+                "not signed with the fleet certificate (privacy grants are lost until fixed; reinstall with "
+                "`bin/fleet-install TOOL` on the Mac with the certificate, do not re-grant): " + "; ".join(bad))
 
 
 def _data_map_fresh(status, now):

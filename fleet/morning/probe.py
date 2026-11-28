@@ -48,6 +48,23 @@ def main():
     print(json.dumps(_gather()))
 
 
+def _signatures():
+    """`fleet-install check`: every installed fleet binary carries the fleet certificate's stable
+    signature. A binary copied in by hand from a cargo build is ad-hoc signed, and macOS then
+    forgets the owner's privacy grants for it (Full Disk Access for diskmap was lost this way on
+    27 Nov 2026 and re-granted by hand more than once). {"ok": bool, "bad": [lines]} or None."""
+    tool = pathlib.Path(__file__).resolve().parents[2] / "bin" / "fleet-install"
+    if not tool.is_file():
+        return None
+    try:
+        out = subprocess.run(["/usr/bin/python3", str(tool), "check"], capture_output=True, text=True,
+                             errors="replace", timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    bad = [line.strip() for line in out.stdout.splitlines() if line.strip() and not line.startswith("ok ")]
+    return {"ok": out.returncode == 0, "bad": bad[:12]}
+
+
 def _gather():
     idrive = _idrive_reading()
     reading = {
@@ -74,6 +91,7 @@ def _gather():
         "idrive_ingest": _json(HOME / ".local/state/idrive-ingest/status.json"),
         # Rented servers outside the fleet, where this Mac reads them (bin/server-health).
         "server_health": _json(HOME / ".local/state/fleet/server-health/status.json"),
+        "signatures": _signatures(),
         "data_map": _json(HOME / ".local/state/fleet/data-map/status.json"),
         # A laptop's copy of its home on the hub (home-mirror), where this Mac pushes one.
         "home_mirror": _json(HOME / ".local/state/home-mirror/status.json"),
