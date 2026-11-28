@@ -154,6 +154,48 @@ class Thresholds(unittest.TestCase):
         # A Mac with no ingest status file gets no row at all.
         self.assertNotIn(key, by_key(evaluate({"hosts": {"hub": host()}}, config(), NOW_S)))
 
+    def test_server_health_backup_services_and_disk(self):
+        # A rented server read over ssh: a backup whose last run failed, or that has not run for
+        # the fail age, fails; a failed unit or a named service that is not active fails; an
+        # unreachable server or a reading that stopped ticking fails rather than vanishing.
+        def snap(checked=NOW_S - 600, **extra):
+            server = {"name": "web1", "reachable": True, "failed_units": [], "disk_pct": 37,
+                      "services": {"web": "active", "caddy": "active"},
+                      "backups": [{"unit": "db-backup.service", "result": "success", "activestate": "inactive",
+                                   "loadstate": "loaded", "last_exit_epoch": NOW_S - 5 * HOUR,
+                                   "warn_h": 30, "fail_h": 54}]}
+            server.update(extra)
+            return {"hosts": {"hub": host(server_health={"version": 1, "checked_at": checked, "servers": [server]})}}
+
+        def backup(**change):
+            row = {"unit": "db-backup.service", "result": "success", "activestate": "inactive",
+                   "loadstate": "loaded", "last_exit_epoch": NOW_S - 5 * HOUR, "warn_h": 30, "fail_h": 54}
+            row.update(change)
+            return [row]
+        b, s, d, r = "server:web1:backup", "server:web1:services", "server:web1:disk", "server:web1:reach"
+        self.assertEqual([self.status(snap(), k) for k in (b, s, d)], ["pass", "pass", "pass"])
+        self.assertEqual(self.status(snap(backups=backup(result="exit-code", activestate="failed")), b), "fail")
+        self.assertEqual(self.status(snap(backups=backup(last_exit_epoch=NOW_S - 31 * HOUR)), b), "warn")
+        self.assertEqual(self.status(snap(backups=backup(last_exit_epoch=NOW_S - 60 * HOUR)), b), "fail")
+        self.assertEqual(self.status(snap(backups=backup(last_exit_epoch=None)), b), "fail")
+        self.assertEqual(self.status(snap(backups=backup(loadstate="not-found")), b), "fail")
+        # One good backup does not hide a failed one beside it.
+        both = backup() + backup(unit="other-backup.service", result="exit-code")
+        self.assertEqual(self.status(snap(backups=both), b), "fail")
+        self.assertEqual(self.status(snap(failed_units=["db-backup.service"]), s), "fail")
+        self.assertEqual(self.status(snap(services={"web": "inactive", "caddy": "active"}), s), "fail")
+        # A unit the server's entry says to ignore (a boot-time unit that always fails) stays quiet.
+        ignored = snap(failed_units=["grub2-common.service"], ignore_failed=["grub2-common.service"])
+        self.assertEqual(self.status(ignored, s), "pass")
+        self.assertEqual(self.status(snap(disk_pct=85), d), "warn")
+        self.assertEqual(self.status(snap(disk_pct=93), d), "fail")
+        self.assertEqual(self.status(snap(reachable=False, error="timed out"), r), "fail")
+        self.assertNotIn(b, by_key(evaluate(snap(reachable=False), config(), NOW_S)))
+        self.assertEqual(self.status(snap(checked=NOW_S - 3 * HOUR), r), "fail")
+        # A Mac that reads no servers gets no rows.
+        found = by_key(evaluate({"hosts": {"hub": host()}}, config(), NOW_S))
+        self.assertFalse([k for k in found if k.startswith("server:")])
+
     def test_diskmap_without_full_disk_access_is_one_row(self):
         key = "disk:hub:diskmap-access"
         trees = [{"path": "~u/Desktop", "bytes": 12_000_000_000}, {"path": "/Volumes/Ext1", "bytes": 1}]

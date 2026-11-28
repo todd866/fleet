@@ -72,6 +72,9 @@ def _gather():
         "idrive": idrive,
         # The IDrive Linux client's daily backup, where this Mac hosts it (idrive-ingest-tick).
         "idrive_ingest": _json(HOME / ".local/state/idrive-ingest/status.json"),
+        # Rented servers outside the fleet, where this Mac reads them (bin/server-health).
+        "server_health": _json(HOME / ".local/state/fleet/server-health/status.json"),
+        "data_map": _json(HOME / ".local/state/fleet/data-map/status.json"),
         # A laptop's copy of its home on the hub (home-mirror), where this Mac pushes one.
         "home_mirror": _json(HOME / ".local/state/home-mirror/status.json"),
         "offload_queue": _json(HOME / str(_site().get("offload_status_path") or ".local/state/offload/status.json")),

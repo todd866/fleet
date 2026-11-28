@@ -175,11 +175,31 @@ pub fn format_at(secs: i64) -> String {
     }
 }
 
+/// A name for this Mac that passes `host_valid`, or None. This Mac's own name is spliced into remote
+/// shell commands (`read-receipts-{me}.txt`), message ids and JSON, so it gets the same check as a
+/// target host. A system name that only differs by case or stray characters (`Ians-MacBook-Pro`) is
+/// folded; anything left invalid is refused.
+pub fn safe_own_name(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    if host_valid(t) {
+        return Some(t.to_string());
+    }
+    let folded: String = t
+        .chars()
+        .map(|c| c.to_ascii_lowercase())
+        .filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '.' || *c == '_' || *c == '-')
+        .collect();
+    let folded = folded.trim_start_matches(['.', '_', '-']).to_string();
+    host_valid(&folded).then_some(folded)
+}
+
 pub fn resolve_me() -> String {
     let name_path = config_dir().join("name");
     if let Ok(s) = fs::read_to_string(&name_path) {
+        // The configured name is used exactly or not at all. Any local agent can write that file, and
+        // folding a tampered name would still let its author choose who this Mac claims to be.
         let t = s.trim();
-        if !t.is_empty() {
+        if host_valid(t) {
             return t.to_string();
         }
     }
@@ -188,19 +208,16 @@ pub fn resolve_me() -> String {
         .arg("LocalHostName")
         .output()
         && out.status.success()
+        && let Some(name) = safe_own_name(&String::from_utf8_lossy(&out.stdout))
     {
-        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !s.is_empty() {
-            return s;
-        }
+        return name;
     }
     Command::new("hostname")
         .arg("-s")
         .output()
         .ok()
         .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
+        .and_then(|o| safe_own_name(&String::from_utf8_lossy(&o.stdout)))
         .unwrap_or_else(|| "localhost".to_string())
 }
 
@@ -1678,6 +1695,10 @@ fn cmd_install(args: &[String]) -> i32 {
         return 2;
     };
     if let Some(name) = name {
+        if !host_valid(&name) {
+            eprintln!("agent-mail: host name must be lower-case letters, digits, '.', '_' or '-': {name:?}");
+            return 2;
+        }
         let cfg = config_dir();
         let _ = fs::create_dir_all(&cfg);
         let _ = fs::write(cfg.join("name"), format!("{name}\n"));
@@ -1874,6 +1895,17 @@ mod tests {
             &empty,
             &seen
         ));
+    }
+
+    #[test]
+    fn own_name_is_never_shell_text() {
+        assert_eq!(safe_own_name("hub\n").as_deref(), Some("hub"));
+        assert_eq!(safe_own_name("Ians-MacBook-Pro").as_deref(), Some("ians-macbook-pro"));
+        let folded = safe_own_name("a;$(echo x|sh);:").unwrap();
+        assert!(host_valid(&folded), "{folded}");
+        assert!(!folded.contains([';', '$', '(', '|', ' ']));
+        assert_eq!(safe_own_name(";;;"), None);
+        assert_eq!(safe_own_name(""), None);
     }
 
     #[test]

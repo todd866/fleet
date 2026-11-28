@@ -60,7 +60,13 @@ def evaluate(snapshot, config, now):
     rows.extend(_ai_usage(snapshot.get("ai_usage"), now))
     rows.extend(_agents(snapshot.get("board"), now))
     rows.extend(_projects(snapshot.get("projects") or [], _reported_jobs(snapshot.get("hosts") or {}), prefixes))
-    rows.extend(_placement(snapshot.get("placement"), rows, now))
+    # One map of copies, not two. When a Mac has a current data map, its data:map row (and map.md) is the
+    # answer to "how many copies, where": placement's own copy counts never saw the cloud receipts, so its
+    # rows said "no offsite" for sets the map shows on Google. Placement keeps the rows only it can give
+    # (free space, where bulk lives, unplaced and unclaimed data).
+    mapped = any(isinstance(h.get("data_map"), dict) and _data_map_fresh(h["data_map"], now)
+                 for h in (snapshot.get("hosts") or {}).values() if isinstance(h, dict))
+    rows.extend(_placement(snapshot.get("placement"), rows, now, copies_mapped=mapped))
     rows.extend(_cloud(snapshot.get("cloud"), now))
     rows.extend(_coverage(snapshot.get("coverage"), now))
     rows.extend(_agentkit(snapshot.get("agentkit")))
@@ -255,6 +261,10 @@ def _backups(name, host, config, now):
                             f'macOS IDrive held since {attempt["held_since"]} (owner hold). Keep it held; Linux ingest and home-mirror coverage are evaluated separately.')
     if host.get("idrive_ingest") is not None:
         rows.append(_idrive_ingest(name, host["idrive_ingest"], cfg, now))
+    if isinstance(host.get("server_health"), dict):
+        rows.extend(_server_health(host["server_health"], now))
+    if isinstance(host.get("data_map"), dict):
+        rows.append(_data_map(name, host["data_map"], now))
     if host.get("offload_queue") is not None:
         rows.append(_offload_queue(name, host["offload_queue"], now))
         rows.extend(_offload_autopilot(name, host["offload_queue"].get("autopilot"), now))
@@ -773,7 +783,13 @@ MAP_STALE_S = 26 * 3600
 _PERSONAL_CODES = {"personal-copies", "offsite"}
 
 
-def _placement(placement, existing, now=None):
+def _data_map_fresh(status, now):
+    generated = status.get("generated")
+    return (isinstance(generated, (int, float)) and not isinstance(generated, bool)
+            and 0 <= int(now) - int(generated) <= 36 * 3600)
+
+
+def _placement(placement, existing, now=None, copies_mapped=False):
     """Placement gaps, condensed: one row per data set naming every gap (and the hosts where a
     gap is host-specific), and one row for all personal sets that only lack their encrypted
     second copy and off-site copy. A status row gives the result's age; past 3 h it is stale.
@@ -820,6 +836,8 @@ def _placement(placement, existing, now=None):
         if not isinstance(viol, dict):
             continue
         name = str(viol.get("dataset") or viol.get("host") or "placement")
+        if copies_mapped and str(viol.get("code") or "") in _PERSONAL_CODES:
+            continue                              # the data map's row carries copy counts
         if str(viol.get("code") or "") == "offsite" and name in google_covered:
             continue
         sets.setdefault(name, []).append(viol)
@@ -1412,6 +1430,92 @@ def _agentkit(kit):
                     detail or ("conformance ok" if ok else "not installed/trusted/firing"),
                 )
             )
+    return rows
+
+
+def _data_map(host, status, now):
+    """The data map (`bin/data-map`): every data set, where its copies are, and its verdict.
+
+    One row. It fails when personal data sets are short of two verified copies with one off-site,
+    and it fails when the map is more than 36 hours old: the 21 Nov 2026 map was written once
+    and never refreshed, so a week later nobody could say what was where.
+    """
+    generated = status.get("generated")
+    if not _data_map_fresh(status, now):
+        age = _hours((now - int(generated)) / 3600) + " ago" if isinstance(generated, (int, float)) and not isinstance(generated, bool) else "never"
+        return _row(f"data:map:{host}", "fail", "backup", "data map", "stale", "not refreshed",
+                    f"the data map on {host} was last generated {age}; run data-map and check its job")
+    word = {"fail": "fail", "warn": "warn"}.get(status.get("status"), "pass")
+    return _row(f"data:map:{host}", word, "backup", "data map", status.get("value") or "generated",
+                "copies", status.get("detail") or "")
+
+
+def _server_health(status, now):
+    """Rented servers outside the fleet, as `bin/server-health` last read them over ssh.
+
+    Three rows a server: its backups (each unit's last result and age), its services (units
+    systemd marks failed, named services not active) and its root disk. A reading older than
+    two hours, or a server ssh could not reach, fails: an unwatched server is the fault this
+    exists for (28 Nov 2026: a nightly database backup failed after a migration, unseen).
+    """
+    rows = []
+    checked = status.get("checked_at")
+    stale = not checked or now - int(checked) > 2 * 3600
+    if status.get("config_error"):
+        rows.append(_row("server:config", "fail", "backup", "server list", "unreadable", "servers.json",
+                         str(status["config_error"])))
+    for server in status.get("servers") or []:
+        name = str(server.get("name") or "server")
+        if stale:
+            age = "never" if not checked else _hours((now - int(checked)) / 3600)
+            rows.append(_row(f"server:{name}:reach", "fail", "backup", f"{name} health", "stale", "tick stopped",
+                             f"server-health last read {name} {age} ago; the job is not ticking"))
+            continue
+        if not server.get("reachable"):
+            rows.append(_row(f"server:{name}:reach", "fail", "backup", f"{name} health", "unreachable", "ssh",
+                             f"server-health could not read {name}: {server.get('error') or 'no reply'}"))
+            continue
+        worst, parts, newest = "pass", [], None
+        for backup in server.get("backups") or []:
+            unit = str(backup.get("unit"))
+            last = backup.get("last_exit_epoch")
+            if backup.get("loadstate") not in (None, "loaded"):
+                word, note = "fail", f"{unit}: unit not loaded"
+            elif backup.get("result") not in ("success", None) or backup.get("activestate") == "failed":
+                word, note = "fail", f"{unit}: last run {backup.get('result') or 'failed'}"
+            elif last is None:
+                word, note = "fail", f"{unit}: never ran"
+            else:
+                age = (now - int(last)) / 3600
+                word = ("fail" if age >= float(backup.get("fail_h", 54))
+                        else "warn" if age >= float(backup.get("warn_h", 30)) else "pass")
+                note = f"{unit}: ok {_hours(age)} ago"
+                newest = age if newest is None else min(newest, age)
+            worst = _worse(worst, word)
+            parts.append(note)
+        if parts:
+            value = "ok" if worst == "pass" else "late" if worst == "warn" else "failed"
+            datum = f"{len(parts)} backups" if newest is None else f"newest {_hours(newest)}"
+            rows.append(_row(f"server:{name}:backup", worst, "backup", f"{name} backup", value, datum, "; ".join(parts)))
+        ignore = {str(unit) for unit in server.get("ignore_failed") or []}
+        failed = [str(unit) for unit in server.get("failed_units") or [] if str(unit) not in ignore]
+        down = [f"{unit} {state}" for unit, state in sorted((server.get("services") or {}).items()) if state != "active"]
+        if failed or down:
+            detail = "; ".join(([f"failed units: {', '.join(failed)}"] if failed else [])
+                               + ([f"not active: {', '.join(down)}"] if down else []))
+            rows.append(_row(f"server:{name}:services", "fail", "job", f"{name} services",
+                             f"{len(failed) + len(down)} down", (failed + down)[0], detail))
+        else:
+            count = len(server.get("services") or {})
+            rows.append(_row(f"server:{name}:services", "pass", "job", f"{name} services", "ok",
+                             f"{count} active", f"{count} named services active; no failed units"))
+        pct = server.get("disk_pct")
+        if pct is not None:
+            warn_pct = float(server.get("disk_warn_pct", 80))
+            fail_pct = float(server.get("disk_fail_pct", 90))
+            word = "fail" if pct >= fail_pct else "warn" if pct >= warn_pct else "pass"
+            rows.append(_row(f"server:{name}:disk", word, "disk", f"{name} disk", _pct(pct),
+                             f"warn {_num(warn_pct)}%", f"root disk {_pct(pct)} used; warn {_num(warn_pct)}%, fail {_num(fail_pct)}%"))
     return rows
 
 

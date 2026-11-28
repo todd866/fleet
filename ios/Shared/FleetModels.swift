@@ -1163,6 +1163,173 @@ public func filterAndSortRows(
     }
 }
 
+public struct DriveDestination: Codable, Sendable, Hashable {
+    public var name: String
+    public var query: String
+    public var lat: Double?
+    public var lon: Double?
+    public var source: String
+    public var placeID: String?
+    public var eventStart: String?
+
+    enum CodingKeys: String, CodingKey {
+        case name, query, lat, lon, source
+        case placeID = "place_id"
+        case eventStart = "event_start"
+    }
+
+    public init(
+        name: String,
+        query: String,
+        lat: Double? = nil,
+        lon: Double? = nil,
+        source: String,
+        placeID: String? = nil,
+        eventStart: String? = nil
+    ) {
+        self.name = name
+        self.query = query
+        self.lat = lat
+        self.lon = lon
+        self.source = source
+        self.placeID = placeID
+        self.eventStart = eventStart
+    }
+}
+
+public struct DriveMusicPick: Codable, Sendable, Hashable {
+    public var stationID: String
+    public var stationName: String
+    public var lensID: String
+    public var mood: String?
+    public var source: String
+    public var url: String
+
+    enum CodingKeys: String, CodingKey {
+        case mood, source, url
+        case stationID = "station_id"
+        case stationName = "station_name"
+        case lensID = "lens_id"
+    }
+
+    public init(
+        stationID: String,
+        stationName: String,
+        lensID: String,
+        mood: String? = nil,
+        source: String,
+        url: String
+    ) {
+        self.stationID = stationID
+        self.stationName = stationName
+        self.lensID = lensID
+        self.mood = mood
+        self.source = source
+        self.url = url
+    }
+}
+
+public struct DriveBriefResponse: Codable, Sendable, Hashable {
+    public var ok: Bool
+    public var generatedAt: Int
+    public var destination: DriveDestination?
+    public var wazeURL: String
+    public var music: DriveMusicPick
+    public var volume: Double
+    public var volumePct: Int
+    public var summary: String
+    public var expiresAt: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case ok, destination, music, volume, summary
+        case generatedAt = "generated_at"
+        case wazeURL = "waze_url"
+        case volumePct = "volume_pct"
+        case expiresAt = "expires_at"
+    }
+
+    public init(
+        ok: Bool = true,
+        generatedAt: Int,
+        destination: DriveDestination?,
+        wazeURL: String,
+        music: DriveMusicPick,
+        volume: Double,
+        volumePct: Int,
+        summary: String,
+        expiresAt: Int? = nil
+    ) {
+        self.ok = ok
+        self.generatedAt = generatedAt
+        self.destination = destination
+        self.wazeURL = wazeURL
+        self.music = music
+        self.volume = volume
+        self.volumePct = volumePct
+        self.summary = summary
+        self.expiresAt = expiresAt
+    }
+
+    public var resolvedWazeURL: URL {
+        URL(string: wazeURL) ?? URL(string: "waze://")!
+    }
+
+    public static func isPhysicalLocation(_ raw: String?) -> Bool {
+        guard let raw else { return false }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 2 else { return false }
+        let folded = trimmed.lowercased().split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        let virtualTokens: Set<String> = [
+            "online", "virtual", "remote", "phone", "call", "tbd",
+            "zoom", "teams", "google meet", "slack huddle", "none", "n/a", "na", "-",
+        ]
+        if virtualTokens.contains(folded) { return false }
+        let virtualHosts = [
+            "http://", "https://", "zoom.us", "teams.microsoft",
+            "meet.google", "webex", "facetime", "whereby", "gotomeeting",
+        ]
+        return !virtualHosts.contains { folded.contains($0) }
+    }
+
+    public static func offlineFallback(
+        eventTitle: String? = nil,
+        eventLocation: String? = nil,
+        eventStart: String? = nil
+    ) -> DriveBriefResponse {
+        let dest: DriveDestination?
+        let wazeURL: String
+        if isPhysicalLocation(eventLocation), let loc = eventLocation?.trimmingCharacters(in: .whitespacesAndNewlines) {
+            let label = (eventTitle?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 } ?? loc
+            let encoded = loc.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? loc
+            wazeURL = "waze://?q=\(encoded)&navigate=yes"
+            dest = DriveDestination(name: label, query: loc, source: "calendar", eventStart: eventStart)
+        } else {
+            dest = nil
+            wazeURL = "waze://"
+        }
+        let music = DriveMusicPick(
+            stationID: "alt",
+            stationName: "Alt",
+            lensID: "home-station:alt",
+            mood: nil,
+            source: "offline-fallback",
+            url: "ontotheradio://play?station=alt"
+        )
+        let summary = dest.map { "Waze → \($0.name) · \(music.stationName) · 45%" } ?? "Waze · \(music.stationName) · 45%"
+        return DriveBriefResponse(
+            ok: true,
+            generatedAt: Int(Date().timeIntervalSince1970),
+            destination: dest,
+            wazeURL: wazeURL,
+            music: music,
+            volume: 0.45,
+            volumePct: 45,
+            summary: summary,
+            expiresAt: nil
+        )
+    }
+}
+
 public enum FleetFormatter {
     public static func relativeTime(fromEpoch epoch: Int?, now: Date = Date()) -> String {
         guard let epoch, epoch > 0 else { return "—" }

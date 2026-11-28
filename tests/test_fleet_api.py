@@ -109,6 +109,9 @@ class FleetAPITests(unittest.TestCase):
             "primary": "primary",
             "job_label_prefixes": ["example"],
         }))
+        self.cfg["drive_places_file"] = str(self.home / ".config/fleet/drive-places.json")
+        self.cfg["drive_plan_file"] = str(self.home / ".local/state/fleet-api/drive-plan.json")
+        self.cfg["music_stations_file"] = str(self.home / "stations.json")
         store = srv.FleetDataStore(self.cfg)
         self.server = srv.FleetHTTPServer(("127.0.0.1", 0), store, self.token, self.cfg)
         self.port = self.server.server_address[1]
@@ -377,6 +380,110 @@ class FleetAPITests(unittest.TestCase):
         self.assertIn('ua="ProbeBot/1.0 evil"', logged)
         self.assertIn("?t=REDACTED", logged)
         self.assertNotIn("supersecrettoken123", logged)
+
+    def test_drive_brief_priority_calendar_routines_and_shuffle(self) -> None:
+        # Unauthenticated request denied
+        code, _ = self._req("/v1/drive/brief")
+        self.assertEqual(code, 401)
+
+        places_path = Path(self.cfg["drive_places_file"])
+        places_path.write_text(json.dumps({
+            "default_volume": 0.42,
+            "places": {
+                "home": {"name": "Home", "query": "10 Home St", "lat": -31.9505, "lon": 115.8605, "radius_m": 400},
+                "work": {"name": "North Clinic", "query": "200 Hospital Ave", "lat": -31.9100, "lon": 115.8700, "radius_m": 400},
+            },
+            "routines": [
+                {"days": ["mon", "tue", "wed", "thu", "fri"], "start_hour": 6, "end_hour": 10, "place_id": "work", "when_near": "home"},
+            ],
+            "music_schedule": {
+                "morning": ["alt", "new"],
+                "evening": ["chill", "late-wire"],
+            },
+        }))
+        Path(self.cfg["music_stations_file"]).write_text(json.dumps({
+            "stations": [
+                {"id": "alt", "name": "Alt"},
+                {"id": "new", "name": "New music"},
+                {"id": "chill", "name": "Chill"},
+                {"id": "late-wire", "name": "Late wire"},
+            ]
+        }))
+
+        # Routine matches weekday morning near home
+        code, raw = self._req("/v1/drive/brief?lat=-31.9506&lon=115.8604&hour=8&dow=0", token=self.token)
+        self.assertEqual(code, 200)
+        doc = json.loads(raw)
+        self.assertEqual(doc["destination"]["source"], "routine")
+        self.assertEqual(doc["destination"]["name"], "North Clinic")
+        self.assertTrue(doc["waze_url"].startswith("waze://?ll=-31.910000,115.870000"))
+        self.assertEqual(doc["volume"], 0.42)
+        self.assertEqual(doc["volume_pct"], 42)
+        self.assertIn(doc["music"]["station_id"], ("alt", "new"))
+
+        # Already at work -> routine suppressed, returns home instead
+        code, raw = self._req("/v1/drive/brief?lat=-31.9101&lon=115.8701&hour=8&dow=0", token=self.token)
+        doc_away = json.loads(raw)
+        self.assertEqual(doc_away["destination"]["source"], "return_home")
+        self.assertEqual(doc_away["destination"]["name"], "Home")
+
+        # Virtual calendar location is ignored, falls back to routine or plain waze
+        code, raw = self._req("/v1/drive/brief?event_title=Sync&event_location=https%3A%2F%2Fzoom.us%2Fj%2F123&hour=20&dow=5", token=self.token)
+        doc_virt = json.loads(raw)
+        self.assertIsNone(doc_virt["destination"])
+        self.assertEqual(doc_virt["waze_url"], "waze://")
+
+        # Physical calendar location takes precedence over routine
+        code, raw = self._req("/v1/drive/brief?lat=-31.9506&lon=115.8604&hour=8&dow=0&event_title=Dentist&event_location=45%20Bay%20Rd", token=self.token)
+        doc_cal = json.loads(raw)
+        self.assertEqual(doc_cal["destination"]["source"], "calendar")
+        self.assertEqual(doc_cal["destination"]["name"], "Dentist")
+        self.assertEqual(doc_cal["waze_url"], "waze://?q=45%20Bay%20Rd&navigate=yes")
+
+        # Shuffle advances music choice
+        _, s1 = self._req("/v1/drive/brief?hour=8&dow=0&shuffle=1", token=self.token)
+        _, s2 = self._req("/v1/drive/brief?hour=8&dow=0&shuffle=1", token=self.token)
+        self.assertNotEqual(json.loads(s1)["music"]["station_id"], json.loads(s2)["music"]["station_id"])
+
+        # Drive plan override beats calendar and routine, clamps volume, and clears cleanly
+        code, raw = self._req(
+            "/v1/actions/drive-plan",
+            method="POST",
+            body={"destination_name": "Coffee", "destination_query": "1 Bean Ln", "station_id": "chill", "volume_pct": 99, "ttl_hours": 4},
+            token=self.token,
+        )
+        self.assertEqual(code, 200)
+        ovr = json.loads(raw)
+        self.assertTrue(ovr["ok"])
+        self.assertEqual(ovr["brief"]["destination"]["source"], "override")
+        self.assertEqual(ovr["brief"]["music"]["station_id"], "chill")
+        self.assertEqual(ovr["brief"]["volume"], 0.85)
+        self.assertEqual(ovr["brief"]["volume_pct"], 85)
+
+        _, cal_ovr = self._req("/v1/drive/brief?event_title=Dentist&event_location=45%20Bay%20Rd", token=self.token)
+        self.assertEqual(json.loads(cal_ovr)["destination"]["source"], "override")
+
+        # Expired override is ignored
+        plan_path = Path(self.cfg["drive_plan_file"])
+        expired = json.loads(plan_path.read_text())
+        expired["expires_at"] = int(time.time()) - 10
+        plan_path.write_text(json.dumps(expired))
+        _, after_exp = self._req("/v1/drive/brief?hour=20&dow=5", token=self.token)
+        self.assertIsNone(json.loads(after_exp)["destination"])
+
+        code, _ = self._req("/v1/actions/drive-plan", method="POST", body={"clear": True}, token=self.token)
+        self.assertEqual(code, 200)
+
+        # Custom stations inside drive-places.json override music_stations_file
+        places_doc = json.loads(places_path.read_text())
+        places_doc["stations"] = [{"id": "dance", "name": "Dance"}, {"id": "chill", "name": "Chill"}]
+        places_doc["music_schedule"] = {"afternoon": ["dance"]}
+        places_path.write_text(json.dumps(places_doc))
+        code, raw = self._req("/v1/drive/brief?hour=15&dow=2", token=self.token)
+        self.assertEqual(code, 200)
+        cust = json.loads(raw)
+        self.assertEqual(cust["music"]["station_id"], "dance")
+        self.assertEqual(cust["music"]["station_name"], "Dance")
 
 
 if __name__ == "__main__":

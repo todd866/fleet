@@ -10,6 +10,7 @@ import hmac
 import html
 import ipaddress
 import json
+import math
 import os
 import plistlib
 import re
@@ -59,6 +60,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "mail_ack_file": "~/.local/state/fleet-api/mail-ack.json",
     "snooze_file": "~/.local/state/fleet-api/snoozed.json",
     "site_config": "~/.config/fleet/site.json",
+    "drive_places_file": "~/.config/fleet/drive-places.json",
+    "drive_plan_file": "~/.local/state/fleet-api/drive-plan.json",
+    "music_stations_file": "~/Projects/music-radio/data/stations.json",
     "remote_action_hosts": [],
     "read_rate_limit_per_min": 60,
     "write_rate_limit_per_min": 20,
@@ -316,11 +320,16 @@ class FleetDataStore:
         self.mail_ack_file = _expand(cfg.get("mail_ack_file") or "~/.local/state/fleet-api/mail-ack.json")
         self.snooze_file = _expand(cfg.get("snooze_file") or "~/.local/state/fleet-api/snoozed.json")
         self.site_config_path = _expand(cfg.get("site_config") or "~/.config/fleet/site.json")
+        self.drive_places_file = _expand(cfg.get("drive_places_file") or "~/.config/fleet/drive-places.json")
+        self.drive_plan_file = _expand(cfg.get("drive_plan_file") or "~/.local/state/fleet-api/drive-plan.json")
+        self.music_stations_file = _expand(cfg.get("music_stations_file") or "~/Projects/music-radio/data/stations.json")
         self.started_at = time.monotonic()
         self._refresh_lock = threading.Lock()
         self._refresh_running = False
         self._mail_ack_lock = threading.Lock()
         self._snooze_lock = threading.Lock()
+        self._drive_lock = threading.Lock()
+        self._drive_shuffle_idx = 0
 
     def _site_meta(self) -> dict[str, Any]:
         doc = _read_json(self.site_config_path, {})
@@ -1304,6 +1313,411 @@ class FleetDataStore:
         self._audit("dispatch-fix", {"to": to, "key": key or None, "len": len(full_text)})
         return 200, {"ok": True, "to": to, "id": out, "detail": f"Dispatched to {to}"}
 
+    # MARK: - Drive Brief & Override Plan
+
+    _VIRTUAL_LOCATION_TOKENS = frozenset({
+        "online", "virtual", "remote", "phone", "call", "tbd",
+        "zoom", "teams", "google meet", "slack huddle", "none", "n/a", "na", "-",
+    })
+    _VIRTUAL_URL_HOSTS = (
+        "http://", "https://", "zoom.us", "teams.microsoft",
+        "meet.google", "webex", "facetime", "whereby", "gotomeeting",
+    )
+    _DEFAULT_DRIVE_STATIONS: tuple[dict[str, str], ...] = (
+        {"id": "kexp", "name": "KEXP"},
+        {"id": "doublej", "name": "Double J"},
+        {"id": "rrr", "name": "RRR"},
+        {"id": "pbs", "name": "PBS"},
+        {"id": "bbc6", "name": "6 Music"},
+        {"id": "nts", "name": "NTS"},
+        {"id": "rp", "name": "Radio Paradise"},
+    )
+    _DAY_ABBR = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+    @classmethod
+    def _is_physical_location(cls, raw: str) -> bool:
+        cleaned = raw.strip()
+        if not cleaned or len(cleaned) < 2:
+            return False
+        folded = " ".join(cleaned.lower().split())
+        if folded in cls._VIRTUAL_LOCATION_TOKENS:
+            return False
+        if any(tok in folded for tok in cls._VIRTUAL_URL_HOSTS):
+            return False
+        return True
+
+    @staticmethod
+    def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+        r_m = 6_371_000.0
+        phi1 = math.radians(lat1)
+        phi2 = math.radians(lat2)
+        d_phi = math.radians(lat2 - lat1)
+        d_lam = math.radians(lon2 - lon1)
+        a = math.sin(d_phi / 2.0) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(d_lam / 2.0) ** 2
+        return 2.0 * r_m * math.atan2(math.sqrt(a), math.sqrt(max(0.0, 1.0 - a)))
+
+    @staticmethod
+    def _build_waze_url(dest: dict[str, Any] | None) -> str:
+        if not isinstance(dest, dict):
+            return "waze://"
+        lat = dest.get("lat")
+        lon = dest.get("lon")
+        if isinstance(lat, (int, float)) and not isinstance(lat, bool) and isinstance(lon, (int, float)) and not isinstance(lon, bool):
+            return f"waze://?ll={float(lat):.6f},{float(lon):.6f}&navigate=yes"
+        query = str(dest.get("query") or "").strip()
+        if query:
+            return f"waze://?q={urllib.parse.quote(query, safe='')}&navigate=yes"
+        return "waze://"
+
+    @staticmethod
+    def _optional_coord(val: Any) -> float | None:
+        if isinstance(val, bool) or val is None or val == "":
+            return None
+        try:
+            num = float(val)
+        except (TypeError, ValueError):
+            return None
+        return num if math.isfinite(num) else None
+
+    @staticmethod
+    def _clamp_volume(raw_vol: Any, default: float = 0.45) -> float:
+        try:
+            if isinstance(raw_vol, bool) or raw_vol is None:
+                val = default
+            else:
+                val = float(raw_vol)
+        except (TypeError, ValueError):
+            val = default
+        if not math.isfinite(val):
+            val = default
+        return round(min(0.85, max(0.15, val)), 2)
+
+    def _load_drive_stations(self, places_doc: dict[str, Any] | None = None) -> list[dict[str, str]]:
+        def _parse(raw_list: Any) -> list[dict[str, str]]:
+            out: list[dict[str, str]] = []
+            seen: set[str] = set()
+            if isinstance(raw_list, list):
+                for item in raw_list:
+                    if not isinstance(item, dict):
+                        continue
+                    sid = str(item.get("id") or "").strip()
+                    name = str(item.get("name") or sid).strip()
+                    if sid and sid not in seen:
+                        seen.add(sid)
+                        out.append({"id": sid, "name": name})
+            return out
+
+        custom = _parse(places_doc.get("stations") if isinstance(places_doc, dict) else None)
+        if custom:
+            return custom
+        doc = _read_json(self.music_stations_file, None)
+        raw_list = doc.get("stations") if isinstance(doc, dict) else (doc if isinstance(doc, list) else None)
+        loaded = _parse(raw_list)
+        return loaded if loaded else [dict(s) for s in self._DEFAULT_DRIVE_STATIONS]
+
+    def _load_drive_places(self) -> dict[str, Any]:
+        doc = _read_json(self.drive_places_file, {})
+        return doc if isinstance(doc, dict) else {}
+
+    def _load_active_drive_plan(self) -> dict[str, Any] | None:
+        with self._drive_lock:
+            doc = _read_json(self.drive_plan_file, None)
+        if not isinstance(doc, dict):
+            return None
+        exp = self._optional_coord(doc.get("expires_at"))
+        if exp is not None and exp <= time.time():
+            return None
+        return doc
+
+    def _save_drive_plan(self, plan: dict[str, Any]) -> None:
+        with self._drive_lock:
+            self.drive_plan_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.drive_plan_file.with_name(f".{self.drive_plan_file.name}.{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(plan, separators=(",", ":")), encoding="utf-8")
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, self.drive_plan_file)
+
+    def _clear_drive_plan(self) -> None:
+        with self._drive_lock:
+            try:
+                self.drive_plan_file.unlink()
+            except FileNotFoundError:
+                pass
+
+    @staticmethod
+    def _place_to_dest(place_id: str, place: dict[str, Any], source: str) -> dict[str, Any] | None:
+        if not isinstance(place, dict):
+            return None
+        name = str(place.get("name") or place_id).strip() or place_id
+        query = str(place.get("query") or place.get("address") or name).strip()
+        lat = FleetDataStore._optional_coord(place.get("lat"))
+        lon = FleetDataStore._optional_coord(place.get("lon"))
+        if lat is None or lon is None:
+            lat, lon = None, None
+        if not query and lat is None:
+            return None
+        return {
+            "name": name,
+            "query": query or name,
+            "lat": lat,
+            "lon": lon,
+            "source": source,
+            "place_id": place_id,
+            "event_start": None,
+        }
+
+    def _is_already_at_place(self, lat: float | None, lon: float | None, place: dict[str, Any]) -> bool:
+        if lat is None or lon is None or not isinstance(place, dict):
+            return False
+        p_lat = self._optional_coord(place.get("lat"))
+        p_lon = self._optional_coord(place.get("lon"))
+        if p_lat is None or p_lon is None:
+            return False
+        radius = self._optional_coord(place.get("radius_m")) or 400.0
+        return self._haversine_m(lat, lon, p_lat, p_lon) <= max(50.0, radius)
+
+    def build_drive_brief(
+        self,
+        lat: float | None = None,
+        lon: float | None = None,
+        event_title: str = "",
+        event_location: str = "",
+        event_start: str = "",
+        hour: int | None = None,
+        dow: int | None = None,
+        shuffle: bool = False,
+    ) -> dict[str, Any]:
+        places_doc = self._load_drive_places()
+        plan = self._load_active_drive_plan()
+        stations = self._load_drive_stations(places_doc)
+        stations_by_id = {s["id"]: s for s in stations}
+
+        now_local = dt.datetime.now()
+        cur_hour = now_local.hour if hour is None else max(0, min(23, int(hour)))
+        cur_dow = now_local.weekday() if dow is None else (int(dow) % 7)
+        dow_abbr = self._DAY_ABBR[cur_dow]
+
+        raw_places = places_doc.get("places")
+        places: dict[str, dict[str, Any]] = raw_places if isinstance(raw_places, dict) else {}
+
+        dest: dict[str, Any] | None = None
+
+        # 1. Active override plan
+        if plan:
+            p_pid = str(plan.get("place_id") or "").strip()
+            p_query = str(plan.get("destination_query") or "").strip()
+            p_name = str(plan.get("destination_name") or "").strip()
+            p_lat = self._optional_coord(plan.get("lat"))
+            p_lon = self._optional_coord(plan.get("lon"))
+            if p_pid and p_pid in places:
+                dest = self._place_to_dest(p_pid, places[p_pid], "override")
+                if dest and p_name:
+                    dest["name"] = p_name
+            elif p_query or (p_lat is not None and p_lon is not None):
+                dest = {
+                    "name": p_name or p_query or "Pinned Destination",
+                    "query": p_query or p_name or f"{p_lat:.6f},{p_lon:.6f}",
+                    "lat": p_lat if (p_lat is not None and p_lon is not None) else None,
+                    "lon": p_lon if (p_lat is not None and p_lon is not None) else None,
+                    "source": "override",
+                    "place_id": None,
+                    "event_start": None,
+                }
+
+        # 2. Upcoming Calendar event with a physical location
+        if dest is None and self._is_physical_location(event_location):
+            ev_loc = event_location.strip()
+            ev_title = event_title.strip()
+            dest = {
+                "name": ev_title or ev_loc,
+                "query": ev_loc,
+                "lat": None,
+                "lon": None,
+                "source": "calendar",
+                "place_id": None,
+                "event_start": event_start.strip() or None,
+            }
+
+        # 3. Configured routines (days + hour window + optional when_near)
+        if dest is None:
+            raw_routines = places_doc.get("routines")
+            if isinstance(raw_routines, list):
+                for routine in raw_routines:
+                    if not isinstance(routine, dict):
+                        continue
+                    days = [str(d).strip().lower() for d in (routine.get("days") or []) if str(d).strip()]
+                    if days and dow_abbr not in days:
+                        continue
+                    start_h = routine.get("start_hour")
+                    end_h = routine.get("end_hour")
+                    if isinstance(start_h, int) and isinstance(end_h, int):
+                        if start_h <= end_h:
+                            if not (start_h <= cur_hour < end_h):
+                                continue
+                        else:
+                            if not (cur_hour >= start_h or cur_hour < end_h):
+                                continue
+                    when_near = str(routine.get("when_near") or "").strip()
+                    if when_near and lat is not None and lon is not None:
+                        near_place = places.get(when_near)
+                        if not near_place or not self._is_already_at_place(lat, lon, near_place):
+                            continue
+                    target_id = str(routine.get("place_id") or routine.get("place") or "").strip()
+                    target_place = places.get(target_id) if target_id else None
+                    if not target_place:
+                        continue
+                    if self._is_already_at_place(lat, lon, target_place):
+                        continue
+                    dest = self._place_to_dest(target_id, target_place, "routine")
+                    if dest:
+                        if routine.get("label"):
+                            dest["name"] = str(routine["label"]).strip()
+                        break
+
+        # 4. Return home if away from home coordinates
+        if dest is None and lat is not None and lon is not None and isinstance(places.get("home"), dict):
+            home_place = places["home"]
+            if not self._is_already_at_place(lat, lon, home_place):
+                dest = self._place_to_dest("home", home_place, "return_home")
+
+        waze_url = self._build_waze_url(dest)
+
+        # Music selection
+        if 5 <= cur_hour <= 10:
+            bucket = "morning"
+        elif 11 <= cur_hour <= 14:
+            bucket = "midday"
+        elif 15 <= cur_hour <= 17:
+            bucket = "afternoon"
+        elif 18 <= cur_hour <= 21:
+            bucket = "evening"
+        else:
+            bucket = "night"
+
+        music_schedule = places_doc.get("music_schedule")
+        bucket_ids: list[str] = []
+        if isinstance(music_schedule, dict) and isinstance(music_schedule.get(bucket), list):
+            bucket_ids = [str(s).strip() for s in music_schedule[bucket] if str(s).strip()]
+
+        matched_ids = [sid for sid in bucket_ids if sid in stations_by_id]
+        pool_ids = matched_ids if matched_ids else ([s["id"] for s in stations] or bucket_ids)
+
+        override_sid = str((plan or {}).get("station_id") or "").strip()
+        override_mood = str((plan or {}).get("music_mood") or "").strip() or None
+        plan_expires_at = self._optional_coord((plan or {}).get("expires_at"))
+
+        if override_sid and not shuffle:
+            chosen_id = override_sid
+            chosen_name = stations_by_id.get(chosen_id, {}).get("name") or chosen_id.replace("-", " ").title()
+            msource = "override"
+        else:
+            if not pool_ids:
+                pool_ids = [s["id"] for s in self._DEFAULT_DRIVE_STATIONS]
+            day_idx = now_local.timetuple().tm_yday
+            with self._drive_lock:
+                if shuffle:
+                    self._drive_shuffle_idx += 1
+                offset = self._drive_shuffle_idx
+            idx = (day_idx + offset) % len(pool_ids)
+            if shuffle and override_sid and len(pool_ids) > 1 and pool_ids[idx] == override_sid:
+                idx = (idx + 1) % len(pool_ids)
+            chosen_id = pool_ids[idx]
+            chosen_name = stations_by_id.get(chosen_id, {}).get("name") or chosen_id.replace("-", " ").title()
+            msource = "shuffle" if shuffle else f"schedule:{bucket}"
+
+        lens_id = chosen_id if chosen_id.startswith("lens:") or chosen_id.startswith("home-station:") else f"home-station:{chosen_id}"
+        music = {
+            "station_id": chosen_id,
+            "station_name": chosen_name,
+            "lens_id": lens_id,
+            "mood": override_mood or bucket,
+            "source": msource,
+            "url": f"ontotheradio://play?station={urllib.parse.quote(chosen_id, safe='')}",
+        }
+
+        default_vol = places_doc.get("default_volume")
+        raw_vol = (plan or {}).get("volume") if (plan and plan.get("volume") is not None) else default_vol
+        volume = self._clamp_volume(raw_vol, default=0.45)
+        volume_pct = int(round(volume * 100))
+
+        if dest:
+            summary = f"Waze → {dest['name']} · {chosen_name} · {volume_pct}%"
+        else:
+            summary = f"Waze · {chosen_name} · {volume_pct}%"
+
+        return {
+            "ok": True,
+            "generated_at": int(time.time()),
+            "destination": dest,
+            "waze_url": waze_url,
+            "music": music,
+            "volume": volume,
+            "volume_pct": volume_pct,
+            "summary": summary,
+            "expires_at": int(plan_expires_at) if plan_expires_at is not None else None,
+        }
+
+    def action_drive_plan(self, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        if payload.get("clear") is True:
+            self._clear_drive_plan()
+            self._audit("drive-plan-clear", {})
+            return 200, {"ok": True, "cleared": True, "brief": self.build_drive_brief()}
+
+        raw_ttl = payload.get("ttl_hours", 6)
+        if isinstance(raw_ttl, bool) or not isinstance(raw_ttl, (int, float)):
+            return 400, {"ok": False, "error": "ttl_hours must be 1..72"}
+        ttl_hours = float(raw_ttl)
+        if ttl_hours < 1 or ttl_hours > 72:
+            return 400, {"ok": False, "error": "ttl_hours must be 1..72"}
+
+        place_id = str(payload.get("place_id") or "").strip()[:80]
+        dest_name = str(payload.get("destination_name") or "").strip()[:120]
+        dest_query = str(payload.get("destination_query") or "").strip()[:300]
+        station_id = str(payload.get("station_id") or "").strip()[:80]
+        music_mood = str(payload.get("music_mood") or "").strip()[:60]
+        note = str(payload.get("note") or "").strip()[:200]
+
+        lat = self._optional_coord(payload.get("lat"))
+        lon = self._optional_coord(payload.get("lon"))
+        if (lat is None) != (lon is None):
+            return 400, {"ok": False, "error": "lat and lon must both be provided"}
+
+        vol_val: float | None = None
+        if payload.get("volume") is not None:
+            if isinstance(payload.get("volume"), bool) or not isinstance(payload.get("volume"), (int, float)):
+                return 400, {"ok": False, "error": "volume must be numeric 0.15..0.85"}
+            vol_val = self._clamp_volume(payload["volume"])
+        elif payload.get("volume_pct") is not None:
+            if isinstance(payload.get("volume_pct"), bool) or not isinstance(payload.get("volume_pct"), (int, float)):
+                return 400, {"ok": False, "error": "volume_pct must be numeric 15..85"}
+            vol_val = self._clamp_volume(float(payload["volume_pct"]) / 100.0)
+
+        if not any([place_id, dest_query, lat is not None, station_id, music_mood, vol_val is not None]):
+            return 400, {"ok": False, "error": "provide destination, station, mood, or volume"}
+
+        expires_at = int(time.time() + ttl_hours * 3600)
+        plan: dict[str, Any] = {
+            "set_at": int(time.time()),
+            "expires_at": expires_at,
+            "place_id": place_id or None,
+            "destination_name": dest_name or None,
+            "destination_query": dest_query or None,
+            "lat": lat,
+            "lon": lon,
+            "station_id": station_id or None,
+            "music_mood": music_mood or None,
+            "volume": vol_val,
+            "note": note or None,
+        }
+        self._save_drive_plan(plan)
+        self._audit("drive-plan-set", {
+            "place_id": plan["place_id"],
+            "has_query": bool(dest_query),
+            "station_id": plan["station_id"],
+            "ttl_hours": ttl_hours,
+        })
+        return 200, {"ok": True, "plan": plan, "brief": self.build_drive_brief()}
+
 
 class FleetHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
@@ -1412,6 +1826,37 @@ class FleetAPIHandler(BaseHTTPRequestHandler):
         }
         if path in routes:
             self._send_json(HTTPStatus.OK, routes[path](), head_only=head_only)
+            return
+
+        if path == "/v1/drive/brief":
+            def _opt_str(key: str) -> str:
+                return (qs.get(key) or [""])[0]
+
+            def _opt_int(key: str) -> int | None:
+                raw = _opt_str(key).strip()
+                if not raw:
+                    return None
+                try:
+                    return int(raw)
+                except ValueError:
+                    return None
+
+            lat_val = FleetDataStore._optional_coord(_opt_str("lat"))
+            lon_val = FleetDataStore._optional_coord(_opt_str("lon"))
+            if (lat_val is None) != (lon_val is None):
+                lat_val, lon_val = None, None
+            shuffle_flag = _opt_str("shuffle").strip().lower() in ("1", "true", "yes")
+            body = self.srv.store.build_drive_brief(
+                lat=lat_val,
+                lon=lon_val,
+                event_title=_opt_str("event_title"),
+                event_location=_opt_str("event_location"),
+                event_start=_opt_str("event_start"),
+                hour=_opt_int("hour"),
+                dow=_opt_int("dow"),
+                shuffle=shuffle_flag,
+            )
+            self._send_json(HTTPStatus.OK, body, head_only=head_only)
             return
 
         if path == "/v1/job-log":
@@ -1564,6 +2009,8 @@ a.btn{{display:block;text-align:center;text-decoration:none;padding:15px 18px;bo
             code, body = self.srv.store.action_host_action(payload)
         elif path == "/v1/actions/dispatch-fix":
             code, body = self.srv.store.action_dispatch_fix(payload)
+        elif path == "/v1/actions/drive-plan":
+            code, body = self.srv.store.action_drive_plan(payload)
         else:
             code, body = HTTPStatus.NOT_FOUND, {"ok": False, "error": "unknown action"}
         self._send_json(code, body)
@@ -1578,8 +2025,58 @@ def main(argv: list[str] | None = None) -> int:
     services.add_argument("query", nargs="?", default="")
     services.add_argument("--json", action="store_true")
     services.add_argument("--config", type=Path)
+
+    drv = sub.add_parser("drive", help="Inspect or override the CarPlay drive brief")
+    drv_sub = drv.add_subparsers(dest="drive_cmd", required=True)
+    drv_brief = drv_sub.add_parser("brief", help="Show the computed drive brief")
+    drv_brief.add_argument("--json", action="store_true")
+    drv_brief.add_argument("--shuffle", action="store_true")
+    drv_brief.add_argument("--config", type=Path)
+
+    drv_set = drv_sub.add_parser("set", help="Pre-set destination, station, mood, or volume")
+    drv_set.add_argument("--to", dest="query", default="", help="Destination address or search query")
+    drv_set.add_argument("--name", default="", help="Display label for destination")
+    drv_set.add_argument("--place", default="", help="Saved place ID from drive-places.json")
+    drv_set.add_argument("--station", default="", help="Music station ID")
+    drv_set.add_argument("--mood", default="", help="Music mood override")
+    drv_set.add_argument("--volume", type=int, default=None, help="Volume percent (15..85)")
+    drv_set.add_argument("--ttl", type=float, default=6.0, help="Override TTL in hours (1..72)")
+    drv_set.add_argument("--config", type=Path)
+
+    drv_clear = drv_sub.add_parser("clear", help="Clear any active drive plan override")
+    drv_clear.add_argument("--config", type=Path)
+
     args = ap.parse_args(argv)
     cfg = load_config(args.config)
+    if args.cmd == "drive":
+        store = FleetDataStore(cfg)
+        if args.drive_cmd == "brief":
+            doc = store.build_drive_brief(shuffle=args.shuffle)
+            if args.json:
+                print(json.dumps(doc, ensure_ascii=False))
+            else:
+                print(doc["summary"])
+                print("waze:", doc["waze_url"])
+                print("music:", doc["music"]["station_id"], f"({doc['music']['url']})")
+            return 0
+        if args.drive_cmd == "set":
+            payload: dict[str, Any] = {
+                "ttl_hours": args.ttl,
+                "place_id": args.place or None,
+                "destination_name": args.name or None,
+                "destination_query": args.query or None,
+                "station_id": args.station or None,
+                "music_mood": args.mood or None,
+                "volume_pct": args.volume,
+            }
+            code, doc = store.action_drive_plan(payload)
+            print(json.dumps(doc, ensure_ascii=False))
+            return 0 if code == 200 else 1
+        if args.drive_cmd == "clear":
+            code, doc = store.action_drive_plan({"clear": True})
+            print(json.dumps(doc, ensure_ascii=False))
+            return 0 if code == 200 else 1
+        return 1
     if args.cmd == "services":
         doc = FleetDataStore(cfg).build_services()
         query = args.query.casefold()

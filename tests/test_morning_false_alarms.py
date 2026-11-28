@@ -460,6 +460,8 @@ class AuditFixes(unittest.TestCase):
         self.assertEqual(r["job:primary:stable"].status, "pass")
         self.assertEqual(r["job:primary:crashloop"].status, "fail")
         self.assertEqual(r["job:primary:dead"].status, "fail")
+        merged = collect._merge_jobs({}, [{"label": "com.example.stable", "loaded": True, "state": "running", "exit": -9, "uptime_s": 3600}])
+        self.assertEqual(merged[0]["uptime_s"], 3600)
 
 
 if __name__ == "__main__":

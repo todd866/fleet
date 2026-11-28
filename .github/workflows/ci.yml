@@ -25,4 +25,7 @@ jobs:
           zsh -n bin/utc-daily
           python3 -m py_compile bin/utc-schedule bin/git-stale-locks bin/tripwire bin/idrive-ingest bin/home-mirror bin/fleet-join bin/fleet
       - name: Python tool tests
-        run: FLEET_SITE=/nonexistent python3 -m unittest discover -s tests -p 'test_*.py' -v
+        # A few suites import pytest for its fixtures; the runner's Python does not ship it.
+        run: |
+          python3 -m pip install --quiet --user pytest || python3 -m pip install --quiet --break-system-packages pytest
+          FLEET_SITE=/nonexistent python3 -m unittest discover -s tests -p 'test_*.py' -v

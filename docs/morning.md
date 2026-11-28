@@ -85,6 +85,24 @@ A job installed on a Mac with no `jobs.tsv` line has no project and no review da
 review rows cannot see it. The digest names these in one `unregistered` row (warn). Working
 that item means adding the line, with a project and a review date, or proposing removal.
 
+## Rented servers
+
+A server outside the fleet (a VPS) is watched by reading it, not by trusting it to report.
+`bin/server-health` runs on the hub every 15 minutes (the `server-health` launchd job in `launchd/`),
+asks each server in `~/.config/fleet/servers.json` over ssh with an unprivileged login, and writes
+`~/.local/state/fleet/server-health/status.json`. The digest turns that into three rows a server:
+
+| Row | Fails when |
+|---|---|
+| `server:<name>:backup` | a backup unit's last run did not succeed, it never ran, or its last success is older than `fail_h` (warn at `warn_h`; defaults 30 and 54) |
+| `server:<name>:services` | systemd marks a unit failed (other than `ignore_failed`), or a named service is not active |
+| `server:<name>:disk` | the root disk is at or past `disk_fail_pct` (warn at `disk_warn_pct`; defaults 80 and 90) |
+| `server:<name>:reach` | ssh could not read the server, or the reading is more than two hours old |
+
+The server list is private and stays out of the repository; the tool's header shows its shape.
+A row says the unit ran and exited cleanly, not that the backup restores: prove that with a
+restore drill on the server.
+
 ## Project checks
 
 `mac-registry` descriptions name the projects (`name`, category, status, text). Status `active` or `unknown` is checked. `archive` and `dormant` are skipped unless the repo has a check file.

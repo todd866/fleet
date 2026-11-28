@@ -95,5 +95,14 @@ struct FleetShortcuts: AppShortcutsProvider {
             shortTitle: "Ask Command",
             systemImageName: "sparkles"
         )
+        AppShortcut(
+            intent: PrepareDriveIntent(),
+            phrases: [
+                "Prepare drive in \(.applicationName)",
+                "Start drive with \(.applicationName)"
+            ],
+            shortTitle: "Prepare Drive",
+            systemImageName: "car.fill"
+        )
     }
 }

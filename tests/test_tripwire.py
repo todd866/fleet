@@ -209,6 +209,33 @@ printf '%s\\n' "$TEST_REPORT"
             send.return_value = subprocess.CompletedProcess([], 0, stdout="unavailable\n429")
             self.assertEqual(module.text_review("zai", record, 3), (None, "provider HTTP 429"))
 
+    def test_text_reviewer_is_told_what_a_wire_is_and_its_suspicion_still_holds(self):
+        # 27 and 28 Nov 2026: a text-only reviewer read wire "launchd" as the launchd binary and returned
+        # SUSPICIOUS for an edited LaunchAgent. The fix is to say what the wire watches. Its SUSPICIOUS must
+        # still stand: tripwire undoes a hold on NEEDS REVIEW, so a downgrade would re-enable an unreviewed job.
+        loader = importlib.machinery.SourceFileLoader("investigator2", str(ROOT / "bin/tripwire-investigate"))
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader("investigator2", loader))
+        loader.exec_module(module)
+        record = {"changes": [{"wire": "launchd", "what": "/private/path/job.plist",
+                               "before": "sha:50b03a0ed27e91be", "after": "sha:2af4293d8ccabfe5"}]}
+        evidence, drill = module.remote_evidence(record)
+        row = evidence["observations"][0]
+        self.assertFalse(drill)
+        self.assertIn("NOT the launchd program", row["meaning"])
+        self.assertNotIn("/private/path", json.dumps(evidence))
+        self.assertEqual(set(module.WIRE_MEANING), module.REMOTE_WIRES)
+        text = "VERDICT: SUSPICIOUS\nA system binary changed."
+        reply = {"stop_reason": "end_turn", "content": [{"type": "text", "text": text}]}
+        response = subprocess.CompletedProcess([], 0, stdout=json.dumps(reply) + "\n200")
+        with mock.patch.object(module.subprocess, "run", return_value=response):
+            report, status = module.text_review("zai", record, 3)
+        self.assertEqual((status, module.reports.verdict(report)), ("complete", "VERDICT: SUSPICIOUS"))
+        self.assertEqual(report, text)
+        hostile = {"stop_reason": "end_turn", "content": [{"type": "text", "text": "VERDICT: HOSTILE\nx"}]}
+        response = subprocess.CompletedProcess([], 0, stdout=json.dumps(hostile) + "\n200")
+        with mock.patch.object(module.subprocess, "run", return_value=response):
+            self.assertEqual(module.reports.verdict(module.text_review("zai", record, 3)[0]), "VERDICT: HOSTILE")
+
     def test_first_run_records_and_raises_nothing(self):
         self.check()
         self.assertEqual(self.incidents(), [])

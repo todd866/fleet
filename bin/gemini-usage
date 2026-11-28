@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+"""gemini-usage: read Antigravity / Google AI quota windows and write them where ai-capacity and Glancebar look.
+
+Writes ~/.local/state/gemini-usage/quota.json. Runs the official `agy -p "/usage"` slash command
+(read-only, zero model tokens) and calibrates tokens-left empirically from local Antigravity
+transcripts (~/.gemini/antigravity*/brain/*/.system_generated/logs/transcript.jsonl).
+"""
+import datetime as dt
+import glob
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+
+HOME = pathlib.Path.home()
+STATE = HOME / ".local/state/gemini-usage"
+AGY = HOME / ".local/bin/agy"
+
+POOL_MAP = {
+    ("Gemini Models", "Weekly Limit Remaining"): ("week", 10080),
+    ("Gemini Models", "Five Hour Limit Remaining"): ("5h", 300),
+    ("Claude and GPT models", "Weekly Limit Remaining"): ("claude-gpt-week", 10080),
+    ("Claude and GPT models", "Five Hour Limit Remaining"): ("claude-gpt-5h", 300),
+    ("Gemini 4 Argon", "Gemini 4 Argon Weekly Limit"): ("argon-week", 10080),
+}
+
+
+def parse_iso(ts: str):
+    if not ts:
+        return None
+    try:
+        return dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def parse_usage_output(text: str) -> list[dict]:
+    windows = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or "\t" not in line:
+            continue
+        parts = [p.strip() for p in line.split("\t")]
+        if len(parts) < 3:
+            continue
+        group, label, pct_str = parts[0], parts[1], parts[2]
+        reset_str = parts[3] if len(parts) >= 4 else None
+        m = re.search(r"(\d+(?:\.\d+)?)%", pct_str)
+        if not m:
+            continue
+        pct = float(m.group(1))
+        mapped = POOL_MAP.get((group, label))
+        if not mapped:
+            slug = re.sub(r"[^a-z0-9]+", "-", f"{group}-{label}".lower()).strip("-")
+            mapped = (slug, 10080 if "week" in label.lower() else 300)
+        pool, minutes = mapped
+        windows.append({
+            "pool": pool,
+            "group": group,
+            "label": label,
+            "remainingPct": pct,
+            "resetAt": reset_str,
+            "windowMinutes": minutes,
+        })
+    return windows
+
+
+def scan_transcript_tokens(now: dt.datetime, windows: list[dict]) -> dict:
+    paths = sorted(set(
+        glob.glob(str(HOME / ".gemini/antigravity/brain/*/.system_generated/logs/transcript.jsonl"))
+        + glob.glob(str(HOME / ".gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl"))
+    ))
+    today_start = now.astimezone().replace(hour=0, minute=0, second=0, microsecond=0).astimezone(dt.timezone.utc)
+    week_ago = now - dt.timedelta(days=7)
+
+    bounds = {}
+    for w in windows:
+        if w["pool"] in ("week", "5h", "claude-gpt-week", "claude-gpt-5h"):
+            reset_dt = parse_iso(w.get("resetAt") or "")
+            if reset_dt:
+                start_dt = reset_dt - dt.timedelta(minutes=w["windowMinutes"])
+                bounds[w["pool"]] = (start_dt, reset_dt)
+
+    today_all = 0
+    today_billable = 0
+    week_all = 0
+    week_billable = 0
+    pool_tokens = {"week": 0, "5h": 0, "claude-gpt-week": 0, "claude-gpt-5h": 0}
+    turns_today = 0
+
+    for p in paths:
+        try:
+            with open(p, "r", errors="replace") as fh:
+                for line in fh:
+                    if '"input_tokens"' not in line and '"output_tokens"' not in line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except ValueError:
+                        continue
+                    i = int(row.get("input_tokens") or 0)
+                    c = int(row.get("cache_read_tokens") or 0)
+                    o = int(row.get("output_tokens") or 0)
+                    if not (i or c or o):
+                        continue
+                    total = i + c + o
+                    bill = i + o
+                    ts = parse_iso(str(row.get("created_at") or ""))
+                    if not ts:
+                        continue
+                    model = str(row.get("model") or "").lower()
+                    is_claude_gpt = ("claude" in model) or ("gpt" in model)
+                    is_gemini = (not is_claude_gpt) and (
+                        (not model) or ("gemini" in model) or ("neon" in model)
+                        or ("carbon" in model) or ("argon" in model) or ("hydrogen" in model)
+                    )
+                    if ts >= today_start:
+                        today_all += total
+                        today_billable += bill
+                        turns_today += 1
+                    if ts >= week_ago:
+                        week_all += total
+                        week_billable += bill
+                    target_pools = ("claude-gpt-week", "claude-gpt-5h") if is_claude_gpt else (("week", "5h") if is_gemini else ())
+                    for pool in target_pools:
+                        if pool in bounds:
+                            start_dt, end_dt = bounds[pool]
+                            if start_dt <= ts <= end_dt:
+                                pool_tokens[pool] += total
+        except OSError:
+            continue
+
+    return {
+        "todayTokensAll": today_all,
+        "todayTokens": today_billable,
+        "weekTokensAll": week_all,
+        "weekTokens": week_billable,
+        "turnsToday": turns_today,
+        "poolTokensUsed": pool_tokens,
+    }
+
+
+def load_calibration() -> dict:
+    p = STATE / "calibration.json"
+    try:
+        d = json.loads(p.read_text())
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_calibration(cal: dict) -> None:
+    tmp = STATE / "calibration.json.tmp"
+    tmp.write_text(json.dumps(cal, indent=1) + "\n")
+    tmp.replace(STATE / "calibration.json")
+
+
+def main() -> int:
+    if not AGY.is_file():
+        print("gemini-usage: agy not found", file=sys.stderr)
+        return 1
+    env = dict(os.environ)
+    env["PATH"] = f"{HOME}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+    res = None
+    last_exc = None
+    for attempt in range(2):
+        try:
+            res = subprocess.run(
+                [str(AGY), "-p", "/usage", "--mode", "plan", "--print-timeout", "45s"],
+                capture_output=True, text=True, timeout=65, env=env,
+            )
+            if res.returncode == 0 and parse_usage_output(res.stdout or ""):
+                break
+        except subprocess.TimeoutExpired as exc:
+            last_exc = exc
+            res = None
+        except OSError as exc:
+            print(f"gemini-usage: agy failed: {exc}", file=sys.stderr)
+            return 1
+    if res is None:
+        print(f"gemini-usage: agy failed after retry: {last_exc}", file=sys.stderr)
+        return 1
+
+    windows = parse_usage_output(res.stdout or "")
+    if not windows:
+        err = (res.stderr or res.stdout or "").strip()[:300]
+        print(f"gemini-usage: no quota rows (rc={res.returncode}): {err}", file=sys.stderr)
+        return 1
+
+    now = dt.datetime.now(dt.timezone.utc)
+    STATE.mkdir(parents=True, exist_ok=True)
+    tok = scan_transcript_tokens(now, windows)
+    cal = load_calibration()
+
+    for w in windows:
+        pool = w["pool"]
+        used_pct = max(0.0, 100.0 - float(w["remainingPct"]))
+        used_tok = int(tok["poolTokensUsed"].get(pool, 0))
+        tpp = None
+        if used_pct >= 2.0 and used_tok > 0:
+            tpp = round(used_tok / used_pct)
+            cal[pool] = {"tokensPerPt": tpp, "observedAt": now.isoformat().replace("+00:00", "Z"),
+                         "usedPct": used_pct, "usedTokens": used_tok}
+        elif pool in cal and isinstance(cal[pool], dict):
+            tpp = cal[pool].get("tokensPerPt")
+        if tpp and tpp > 0:
+            w["tokensPerPt"] = int(tpp)
+            w["tokensLeft"] = int(round(tpp * float(w["remainingPct"])))
+        if used_tok > 0:
+            w["usedTokens"] = used_tok
+
+    save_calibration(cal)
+
+    # Primary pools exposed to Glancebar & ai-capacity: week and 5h first, others preserved in extraWindows.
+    primary = [w for w in windows if w["pool"] in ("week", "5h")]
+    extra = [w for w in windows if w["pool"] not in ("week", "5h")]
+
+    out = {
+        "fetchedAt": now.isoformat().replace("+00:00", "Z"),
+        "source": "agy /usage",
+        "windows": primary,
+        "extraWindows": extra,
+        "tokens": {
+            "todayAll": tok["todayTokensAll"],
+            "todayBillable": tok["todayTokens"],
+            "weekAll": tok["weekTokensAll"],
+            "weekBillable": tok["weekTokens"],
+            "turnsToday": tok["turnsToday"],
+        },
+    }
+    tmp = STATE / "quota.json.tmp"
+    tmp.write_text(json.dumps(out, indent=1) + "\n")
+    tmp.replace(STATE / "quota.json")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

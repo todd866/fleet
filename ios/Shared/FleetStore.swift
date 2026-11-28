@@ -59,6 +59,17 @@ public final class FleetStore: Sendable {
         loadJSON(MorningResponse.self, filename: "morning.json")
     }
 
+    public func saveDriveBrief(_ brief: DriveBriefResponse) {
+        saveJSON(brief, filename: "drive-brief.json")
+        #if canImport(WidgetKit)
+        WidgetCenter.shared.reloadTimelines(ofKind: "FleetDriveWidget")
+        #endif
+    }
+
+    public func loadDriveBrief() -> DriveBriefResponse? {
+        loadJSON(DriveBriefResponse.self, filename: "drive-brief.json")
+    }
+
     private func saveJSON<T: Encodable>(_ value: T, filename: String) {
         lock.lock()
         defer { lock.unlock() }

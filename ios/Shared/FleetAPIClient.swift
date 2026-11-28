@@ -103,6 +103,87 @@ public actor FleetAPIClient {
         try await request(path: "/v1/mail")
     }
 
+    public func fetchDriveBrief(
+        lat: Double? = nil,
+        lon: Double? = nil,
+        eventTitle: String? = nil,
+        eventLocation: String? = nil,
+        eventStart: String? = nil,
+        shuffle: Bool = false
+    ) async throws -> DriveBriefResponse {
+        var items: [URLQueryItem] = []
+        if let lat, let lon {
+            items.append(URLQueryItem(name: "lat", value: String(format: "%.6f", lat)))
+            items.append(URLQueryItem(name: "lon", value: String(format: "%.6f", lon)))
+        }
+        if let eventTitle, !eventTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            items.append(URLQueryItem(name: "event_title", value: eventTitle))
+        }
+        if let eventLocation, !eventLocation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            items.append(URLQueryItem(name: "event_location", value: eventLocation))
+        }
+        if let eventStart, !eventStart.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            items.append(URLQueryItem(name: "event_start", value: eventStart))
+        }
+        if shuffle {
+            items.append(URLQueryItem(name: "shuffle", value: "1"))
+        }
+        if items.isEmpty {
+            return try await request(path: "/v1/drive/brief")
+        }
+        var comps = URLComponents()
+        comps.queryItems = items
+        let query = comps.percentEncodedQuery ?? ""
+        return try await request(path: "/v1/drive/brief?\(query)")
+    }
+
+    public func setDrivePlan(
+        destinationQuery: String? = nil,
+        destinationName: String? = nil,
+        placeID: String? = nil,
+        stationID: String? = nil,
+        musicMood: String? = nil,
+        volumePct: Int? = nil,
+        ttlHours: Int = 6
+    ) async throws -> DriveBriefResponse {
+        struct DrivePlanBody: Encodable {
+            let destination_query: String?
+            let destination_name: String?
+            let place_id: String?
+            let station_id: String?
+            let music_mood: String?
+            let volume_pct: Int?
+            let ttl_hours: Int
+        }
+        struct DrivePlanEnvelope: Decodable {
+            let ok: Bool
+            let brief: DriveBriefResponse
+        }
+        let body = DrivePlanBody(
+            destination_query: destinationQuery,
+            destination_name: destinationName,
+            place_id: placeID,
+            station_id: stationID,
+            music_mood: musicMood,
+            volume_pct: volumePct,
+            ttl_hours: ttlHours
+        )
+        let encoded = try JSONEncoder().encode(body)
+        let env: DrivePlanEnvelope = try await request(path: "/v1/actions/drive-plan", method: "POST", body: encoded)
+        return env.brief
+    }
+
+    public func clearDrivePlan() async throws -> DriveBriefResponse {
+        struct ClearBody: Encodable { let clear: Bool }
+        struct DrivePlanEnvelope: Decodable {
+            let ok: Bool
+            let brief: DriveBriefResponse
+        }
+        let encoded = try JSONEncoder().encode(ClearBody(clear: true))
+        let env: DrivePlanEnvelope = try await request(path: "/v1/actions/drive-plan", method: "POST", body: encoded)
+        return env.brief
+    }
+
     public func sendMail(to: String, text: String) async throws -> ActionResultResponse {
         try await postAction(path: "/v1/actions/mail", payload: ["to": to, "text": text])
     }

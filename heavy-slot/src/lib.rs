@@ -349,10 +349,16 @@ pub fn cool_ok(dir: &Path, sample: &str) -> bool {
         return true;
     }
     let g = parse_glance_sample(sample);
-    if let Some(ref th) = g.thermal
-        && th != "nominal"
-    {
-        return false;
+    let chip_under = g.chip_c.is_some_and(|c| c <= max as u32);
+    match g.thermal.as_deref() {
+        None | Some("nominal") => {}
+        // macOS reports "moderate" whenever anything at all is running and is not yet slowing the Mac
+        // down. Holding on it meant every queued job waited the full cool-down (20 min) at 72 °C
+        // against a 105 °C target, with slots free (28 Nov 2026). It passes when the chip itself is
+        // known to be under the target; an unknown chip temperature still holds.
+        Some("moderate") if chip_under => {}
+        // "heavy" and "trapping": the system is throttling. Always wait.
+        Some(_) => return false,
     }
     if let Some(chip) = g.chip_c
         && chip > max as u32
@@ -1440,6 +1446,29 @@ mod tests {
 
         let g3 = parse_glance_sample("garbage chipC:abc thermal:BOOM");
         assert!(g3.chip_c.is_none());
+    }
+
+    #[test]
+    fn cool_gate_passes_moderate_only_when_the_chip_is_under_target() {
+        let dir = env::temp_dir().join(format!("heavy-slot-cool-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("cool"), "95\n").unwrap();
+        // nominal, and moderate with a cool chip, run
+        assert!(cool_ok(&dir, r#"{"chipC":55,"thermal":"nominal"}"#));
+        assert!(cool_ok(&dir, r#"{"chipC":72,"thermal":"moderate"}"#));
+        assert!(cool_ok(&dir, r#"{"chipC":95,"thermal":"moderate"}"#));
+        // a chip over the target holds whatever the state says
+        assert!(!cool_ok(&dir, r#"{"chipC":96,"thermal":"moderate"}"#));
+        assert!(!cool_ok(&dir, r#"{"chipC":96,"thermal":"nominal"}"#));
+        // moderate with no chip reading holds: the temperature is what excuses it
+        assert!(!cool_ok(&dir, r#"{"thermal":"moderate"}"#));
+        // a throttling Mac always holds, however cool the chip reads
+        assert!(!cool_ok(&dir, r#"{"chipC":60,"thermal":"heavy"}"#));
+        assert!(!cool_ok(&dir, r#"{"chipC":60,"thermal":"trapping"}"#));
+        // no target file: the gate is off
+        fs::remove_file(dir.join("cool")).unwrap();
+        assert!(cool_ok(&dir, r#"{"chipC":120,"thermal":"heavy"}"#));
+        let _ = fs::remove_dir(&dir);
     }
 
     #[test]

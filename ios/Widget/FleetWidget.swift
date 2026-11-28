@@ -211,5 +211,6 @@ struct FleetStatusWidget: Widget {
 struct FleetWidgetBundle: WidgetBundle {
     var body: some Widget {
         FleetStatusWidget()
+        FleetDriveWidget()
     }
 }
