@@ -69,6 +69,19 @@ pub fn run(
     if let Err(e) = &self_test {
         issues.push(format!("guard self-test: {e}"));
     }
+    // The hooks name their programs by absolute path. A hook whose program is missing fails to
+    // start, and the providers treat a hook that fails as no objection: every guard off.
+    let hook_bin = site.hook_bin_path(&paths.home)?;
+    if !is_program(&hook_bin) {
+        issues.push(format!(
+            "hook program missing or not executable: {} (the generated hooks run it by this path; install it there or set `hook_bin` in agentkit.toml)",
+            hook_bin.display()
+        ));
+    }
+    let context_bin = hook_bin.with_file_name("agent-context");
+    if !is_program(&context_bin) {
+        warnings.push(format!("context program missing or not executable: {}", context_bin.display()));
+    }
     // A guard switched off in site config: until 21 Nov 2026 one write of `disabled = [...]`
     // turned guards off and doctor stayed green. Now a disable the owner has accepted
     // (`agentkit doctor --accept-guards`, which records a hash of [guards]) is a warning that
@@ -255,6 +268,11 @@ fn format_line(row: &Row) -> String {
         "{mark} {:<8} rules {:<8} guards {:<14} context {:<3} memory {}",
         row.id, row.rules, row.guards, row.context, row.memory
     )
+}
+
+fn is_program(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
 fn project_tree_dirty(dir: &std::path::Path) -> bool {

@@ -175,32 +175,38 @@ pub fn plan(paths: &Paths, site: &Site) -> Result<Vec<Planned>, String> {
             });
         }
     }
-    let bin = std::env::var("AGENTKIT_BIN").unwrap_or_else(|_| "agentkit".into());
+    // The hook binary by absolute path, from site config or the default under home, never
+    // from the environment or `PATH`: until 28 Nov 2026 hooks ran a bare `agentkit`, so a
+    // script of that name anywhere earlier on `PATH` (or `AGENTKIT_BIN` at sync time) became
+    // the guard.
+    let bin = site.hook_bin_path(&paths.home)?;
+    let bin = bin.to_string_lossy().into_owned();
+    let bin = bin.as_str();
     if has("claude") {
         files.push(hook_file(
             paths.home.join(".claude/settings.json"),
-            merge_claude(&paths.home.join(".claude/settings.json"), &bin, site, &paths.config)?,
+            merge_claude(&paths.home.join(".claude/settings.json"), bin, site, &paths.config)?,
             vec!["claude"],
         ));
     }
     if has("codex") {
         files.push(hook_file(
             paths.home.join(".codex/hooks.json"),
-            merge_codex(&paths.home.join(".codex/hooks.json"), &bin, site)?,
+            merge_codex(&paths.home.join(".codex/hooks.json"), bin, site)?,
             vec!["codex"],
         ));
     }
     if has("cursor") {
         files.push(hook_file(
             paths.home.join(".cursor/hooks.json"),
-            merge_cursor(&paths.home.join(".cursor/hooks.json"), &bin, site)?,
+            merge_cursor(&paths.home.join(".cursor/hooks.json"), bin, site)?,
             vec!["cursor"],
         ));
     }
     if has("agy") {
         files.push(hook_file(
             paths.home.join(".gemini/config/hooks.json"),
-            merge_agy(&paths.home.join(".gemini/config/hooks.json"), &bin, site)?,
+            merge_agy(&paths.home.join(".gemini/config/hooks.json"), bin, site)?,
             vec!["agy"],
         ));
     }
@@ -480,18 +486,54 @@ fn is_managed(command: &str) -> bool {
         || command.contains("agentkit context")
 }
 
-fn context_hook_command(provider: &str) -> String {
-    format!("env AGENTKIT_PROVIDER={provider} agent-context")
+/// `agent-context` sits beside the hook binary and is named by absolute path like it.
+fn context_hook_command(provider: &str, bin: &str) -> String {
+    let context = Path::new(bin).with_file_name("agent-context");
+    format!("env AGENTKIT_PROVIDER={provider} {}", context.display())
 }
 
+/// The top-level Claude settings keys an agent's `Write` or `Edit` may change; the guard-config
+/// guard refuses a change to any other key, and names it. An allow-list, because a list of
+/// dangerous keys always trails the product: besides `hooks`, `env` and `disableAllHooks`
+/// there are keys that run a program outside PreToolUse (`statusLine`, `apiKeyHelper`), keys
+/// that load code (`enabledPlugins`, `extraKnownMarketplaces`, `enableAllProjectMcpServers`,
+/// `enabledMcpjsonServers`), and whatever the next release adds. What is here is what agents
+/// were seen to write for ordinary work on these Macs (permission allow-lists in a project's
+/// settings, the `$schema` line) and plain preferences that run nothing, load nothing and
+/// change no approval posture. Everything else is the owner's to change.
+pub const CLAUDE_AGENT_MAY_CHANGE: &[&str] = &[
+    "$schema", "permissions", "model", "effortLevel", "theme", "tui", "feedbackDrafts", "skipWorkflowUsageWarning",
+    "workflowSizeGuideline", "daemonColdStart", "agentPushNotifEnabled", "enableWorkflows",
+];
+
+/// Claude settings keys that run or load code, or set the environment every hook runs in:
+/// why the allow-list above exists, kept as a list for the refusal message and for callers
+/// that want the known-dangerous names. Not complete, by its nature.
+pub const CLAUDE_RUNS_OR_ENV: &[&str] = &[
+    "env", "statusLine", "apiKeyHelper", "awsAuthRefresh", "awsCredentialExport", "otelHeadersHelper",
+    "fileSuggestion", "enabledPlugins", "extraKnownMarketplaces", "enableAllProjectMcpServers",
+    "enabledMcpjsonServers", "mcpServers",
+];
+
 /// Claude settings keys a shared file may never set: model choice, approval posture, per-host
-/// paths and the hooks agentkit renders itself.
-const CLAUDE_NEVER_SHARED: &[&str] = &[
+/// paths, the hooks agentkit renders itself, and the keys that run a program or set the
+/// environment (one shared file must not switch the guards off on every Mac, or set their
+/// environment). Plugin enablement is not here: sharing it between the Macs is what the
+/// shared file is for, and that file is site config, which no agent writes.
+pub const CLAUDE_NEVER_SHARED: &[&str] = &[
     "hooks", "model", "effortLevel", "permissions", "skipDangerousModePermissionPrompt",
-    "statusLine", "autoMode", "apiKeyHelper", "awsAuthRefresh", "awsCredentialExport",
+    "statusLine", "autoMode", "apiKeyHelper", "awsAuthRefresh", "awsCredentialExport", "otelHeadersHelper",
+    "fileSuggestion",
     // One shared file must not switch the guards off on every Mac, or set their environment.
     "disableAllHooks", "env",
 ];
+
+/// The Codex config keys an agent's edit may change, at the top level and inside a profile:
+/// model choice and manner. `notify` runs a program, `mcp_servers` starts them,
+/// `shell_environment_policy` sets the environment, `approval_policy` and `sandbox_mode` are
+/// the approval posture, `projects` is the trust list, and `hooks`, `features` and `profile`
+/// decide whether the guards run at all; those and anything not listed are the owner's.
+pub const CODEX_AGENT_MAY_CHANGE: &[&str] = &["model", "model_reasoning_effort", "personality"];
 
 /// Top-level keys from `rules/claude-settings.json` (written on the reference Mac, copied to the
 /// others with the rules) set into this Mac's Claude settings, so every Mac has the same plugins,
@@ -545,7 +587,7 @@ fn merge_claude(path: &Path, bin: &str, site: &Site, config: &Path) -> Result<St
         let slot = hooks_obj.entry(event).or_insert_with(|| json!([]));
         scrub_claude_array(slot);
         if let Some(arr) = slot.as_array_mut() {
-            arr.push(json!({"hooks": [{"type": "command", "command": context_hook_command("claude"), "timeout": 8}]}));
+            arr.push(json!({"hooks": [{"type": "command", "command": context_hook_command("claude", bin), "timeout": 8}]}));
         }
     }
     if site.manage_model {
@@ -620,7 +662,7 @@ fn merge_codex(path: &Path, bin: &str, site: &Site) -> Result<String, String> {
             arr.push(json!({
                 "hooks": [{
                     "type": "command",
-                    "command": context_hook_command("codex"),
+                    "command": context_hook_command("codex", bin),
                     "timeout": 8
                 }]
             }));
@@ -658,7 +700,7 @@ fn merge_cursor(path: &Path, bin: &str, site: &Site) -> Result<String, String> {
         let slot = obj.entry(event).or_insert_with(|| json!([]));
         scrub_cursor_array(slot);
         if let Some(arr) = slot.as_array_mut() {
-            arr.push(json!({"command": context_hook_command("cursor")}));
+            arr.push(json!({"command": context_hook_command("cursor", bin)}));
         }
     }
     Ok(pretty(&root))

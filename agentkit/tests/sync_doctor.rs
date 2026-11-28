@@ -30,6 +30,9 @@ impl Home {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join(".config/agentkit")).unwrap();
         fs::create_dir_all(root.join(".local/bin")).unwrap();
+        // The hook programs where the generated hooks look for them.
+        std::os::unix::fs::symlink(bin("agentkit"), root.join(".local/bin/agentkit")).unwrap();
+        std::os::unix::fs::symlink(bin("agent-context"), root.join(".local/bin/agent-context")).unwrap();
         fs::create_dir_all(root.join(".local/state")).unwrap();
         fs::create_dir_all(root.join(".codex")).unwrap();
         let mut codex_cfg = String::new();
@@ -64,11 +67,13 @@ impl Home {
         self.write("memory/INDEX.md", "# Memory index\n\n");
     }
     fn run(&self, args: &[&str]) -> (i32, String, String) {
+        // Placed by a flag: agentkit takes no path from the environment. The config and state
+        // folders follow the home.
         let out = Command::new(bin("agentkit"))
             .args(args)
+            .arg("--home")
+            .arg(&self.root)
             .env("HOME", &self.root)
-            .env("AGENTKIT_CONFIG", self.config())
-            .env("AGENTKIT_STATE", self.root.join(".local/state/agentkit"))
             .env("AGENTKIT_SKIP_SSH_RESOLVE", "1")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -175,6 +180,8 @@ fn sync_refuses_a_project_path_outside_home() {
 fn guard_binary_answers_deny_and_allow() {
     let home = Home::new();
     let deny = Command::new(bin("guard-hard-delete"))
+        .arg("--home")
+        .arg(&home.root)
         .env("HOME", &home.root)
         .env("AGENTKIT_SKIP_SSH_RESOLVE", "1")
         .stdin(Stdio::piped())
@@ -188,6 +195,8 @@ fn guard_binary_answers_deny_and_allow() {
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["decision"], "deny");
     let mut child = Command::new(bin("guard-hard-delete"))
+        .arg("--home")
+        .arg(&home.root)
         .env("HOME", &home.root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -205,6 +214,8 @@ fn guard_binary_relative_delete_follows_claude_project_dir() {
     let home = Home::new();
     let decision = |dir: &str| {
         let mut child = Command::new(bin("guard-hard-delete"))
+            .arg("--home")
+            .arg(&home.root)
             .env("HOME", &home.root)
             .env("CLAUDE_PROJECT_DIR", dir)
             .env("AGENTKIT_SKIP_SSH_RESOLVE", "1")
@@ -383,9 +394,9 @@ fn disabled_guard_skips_hooks_and_reports_in_doctor() {
     use std::io::Write;
     let payload = r#"{"tool_name":"Bash","tool_input":{"command":"git push origin main"}}"#;
     let out = Command::new(bin("agentkit"))
-        .args(["hook", "cursor", "push"])
+        .args(["hook", "cursor", "push", "--home"])
+        .arg(&home.root)
         .env("HOME", &home.root)
-        .env("AGENTKIT_CONFIG", home.config())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -431,10 +442,9 @@ fn an_accepted_guard_disable_warns_and_a_changed_one_fails_again() {
         let mut child = Command::new("script")
             .args(["-q", "/dev/null"])
             .arg(bin("agentkit"))
-            .args(["doctor", "--accept-guards"])
+            .args(["doctor", "--accept-guards", "--home"])
+            .arg(&home.root)
             .env("HOME", &home.root)
-            .env("AGENTKIT_CONFIG", home.config())
-            .env("AGENTKIT_STATE", home.root.join(".local/state/agentkit"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -508,9 +518,9 @@ fn hook_all_is_stricter_than_any_single_guard() {
     let payload = r#"{"tool_name":"Bash","tool_input":{"command":"rm -rf /Users/agentkit-hookall/x && git push origin main"}}"#;
     let run = |guard: &str| {
         let mut child = Command::new(bin("agentkit"))
-            .args(["hook", "claude", guard])
+            .args(["hook", "claude", guard, "--home"])
+            .arg(&home.root)
             .env("HOME", &home.root)
-            .env("AGENTKIT_CONFIG", home.config())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -531,9 +541,9 @@ fn example_site_syncs_under_a_temp_home() {
     let home = Home::new();
     let example = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("example");
     let out = Command::new(bin("agentkit"))
-        .args(["sync", "--apply", "--config", example.to_str().unwrap()])
+        .args(["sync", "--apply", "--config", example.to_str().unwrap(), "--home"])
+        .arg(&home.root)
         .env("HOME", &home.root)
-        .env("AGENTKIT_STATE", home.root.join(".local/state/agentkit"))
         .env("AGENTKIT_SKIP_SSH_RESOLVE", "1")
         .output()
         .unwrap();
@@ -542,9 +552,9 @@ fn example_site_syncs_under_a_temp_home() {
     assert!(out.status.success(), "{stderr}{stdout}");
     assert!(home.root.join(".claude/CLAUDE.md").is_file(), "{stdout}");
     let out = Command::new(bin("agentkit"))
-        .args(["doctor", "--config", example.to_str().unwrap()])
+        .args(["doctor", "--config", example.to_str().unwrap(), "--home"])
+        .arg(&home.root)
         .env("HOME", &home.root)
-        .env("AGENTKIT_STATE", home.root.join(".local/state/agentkit"))
         .env("AGENTKIT_SKIP_SSH_RESOLVE", "1")
         .output()
         .unwrap();

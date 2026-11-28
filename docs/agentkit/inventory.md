@@ -46,6 +46,6 @@ Coupling is what is true of the hand-maintained layer today. The neutral home is
 - **all** — MCP tokens and connector secrets are not in the canonical site. Mitigation: Leave them in each provider's private config. Sync does not read or write them.
 - **all** — Headless-worker hard-delete exemption is config, not a built-in hostname. Mitigation: Put worker aliases in `guards.air_aliases` before `sync --apply`, or deletes on that worker stay denied.
 - **all** — Email-in-command denial needs a private substring file. Mitigation: Set `guards.email_substrings_file`. The addresses never go in the repo. Until the file exists, the legacy Claude hook still carries that rule if it is left installed.
-- **all** — Generated hooks call `agentkit` and `agent-context` by name. Mitigation: Install both on `PATH` before `sync --apply`. Doctor checks the hook text and the decision logic, not that a particular binary is installed.
+- **all** — Generated hooks call `agentkit` and `agent-context` by absolute path (`~/.local/bin`, or `hook_bin` in the site). Mitigation: Install both there before `sync --apply`. Doctor fails when the hook program is missing. The guard refuses agents writing either file, but any same-user process can; a root-owned `hook_bin` is the real control.
 - **Alternate Claude launchers** — A separate settings tree may keep its own memory notebook. Mitigation: Not merged by this crate. Point a later import at it, or keep using that launcher's store.
 

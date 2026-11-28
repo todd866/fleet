@@ -1,8 +1,16 @@
 # agentkit
 
 One operating layer for Claude Code, Codex, and Cursor. The private site lives in
-`~/.config/agentkit` (or `AGENTKIT_CONFIG`). This crate is the generator, the schema,
+`~/.config/agentkit`. This crate is the generator, the schema,
 and a sanitized example. It does not contain hosts, addresses, or secrets.
+
+agentkit finds the account's home in the user database and its config, state folder and
+ledger under it. No environment variable moves them (`HOME`, `AGENTKIT_CONFIG`,
+`AGENTKIT_STATE` and `AGENTKIT_DECISIONS` did until 28 Nov 2026): a hook inherits its
+environment from the agent it guards, so a variable that chose the config let that agent
+choose it. `--home DIR` works in another tree (the test suite, trying a site out), and only
+with it may `--config DIR`, `--state DIR` and `--ledger PATH|off` be given; for the account's
+own home they are refused. The generated hook commands carry none of these flags.
 
 `sync` is a dry-run until `--apply`. Apply copies any replaced file to
 `~/.local/state/agentkit/backups/<unix>/` and writes only under `$HOME`. A project
@@ -23,14 +31,25 @@ path outside `$HOME` is refused.
 | `agentkit memory import --from DIR` | Copy Claude `*/memory/*.md` into the notebook. Skips secret-shaped files. |
 | `agentkit memory path` | Print the notebook directory. |
 
-Generated hooks call `agentkit` and `agent-context` by name. Both have to be on `PATH`
-before `sync --apply`. The global rule file also lists the five prohibitions, for a
-surface that never loads its hook file. That text does not enforce them.
+Generated hooks call `agentkit` and `agent-context` by absolute path:
+`~/.local/bin/agentkit` with `agent-context` beside it, or wherever `hook_bin` in
+`agentkit.toml` says (an absolute path; a root-owned folder is the strongest choice). Nothing
+on `PATH` can stand in for them, `guard-config` refuses agents writing either file or
+removing the folder that holds them, and doctor fails when the hook program is not there.
+Install both before `sync --apply`, and run `sync --apply` again after moving them. The
+global rule file also lists the five prohibitions, for a surface that never loads its hook
+file. That text does not enforce them.
 
 Guard binaries, same decision on stdin, neutral JSON on stdout: `guard-hard-delete`,
 `guard-icloud`, `guard-offload-heavy`, `guard-cd-outside`, `guard-push`.
-`decision` is `allow`, `ask`, or `deny`. A parse error allows, as the hooks they
-replace do. The deny rules are not relaxed.
+`decision` is `allow`, `ask`, or `deny`.
+
+A hook that cannot do its job refuses the call and records the refusal in the ledger: input
+that is unreadable, not UTF-8, not JSON or not a JSON object is `guard-input`; an
+`agentkit.toml` that is there but cannot be read or is invalid is `guard-setup`. (The
+providers read "no answer" as "no objection", so until 28 Nov 2026 a tool call the parser
+rejected was allowed, unrecorded.) With no `agentkit.toml` at all, every guard runs with its
+defaults.
 
 ## Site
 
@@ -85,7 +104,7 @@ have no binary of their own:
 | `approval-files` | deny creating an `APPROVE_*` marker file from a shell (`touch`, redirect, `tee`, `cp`, `mv`, `install`, over ssh too) or with `Write`/`Edit`; the owner creates those |
 | `idrive-cleanup` | deny starting IDrive's Archive Cleanup (AppleScript, the client's program, a cleanup script); the patterns are `guards.idrive_cleanup_patterns` |
 | `secrets` | deny any command that names a private key (a file in `~/.ssh` that is not public material, an `id_<type>` key anywhere, a `guards.secret_paths` entry), the `~/.ssh` folder, or a glob that reaches one on disk, unless its program uses keys in place: `ssh`, git, `ssh-add`, `ssh-keygen`, `chmod`, `ls`, `stat`, `trash`, `echo`/`agent-mail` (text only), `cp`/`mv` within `~/.ssh`, and `scp`/`rsync`/`sftp` to a fleet Mac with no `-o`/`-F`/`-J`/`-S`/`-e`/`--rsh`. Quotes, `$VAR` assignments and `cd` on the line are followed. Also `Read` and `Grep` of a key or the folder, and a decrypted keychain dump. Deny only, never ask. A tripwire for an agent talked into it, not a sandbox: a script file the agent writes and then runs is not read |
-| `guard-config` | deny writes to agentkit's site config (`~/.config/agentkit` and the loaded `AGENTKIT_CONFIG` directory, except `memory/`, `skills/`, `rules/*.md`, `rules/projects/` and `paused-providers`) and to the hook files the guards run through (`~/.codex/hooks.json`, `~/.cursor/hooks.json`): shell writes (redirect, `tee`, `sed -i`, `cp`/`mv`/`ln` onto, moving or removing them or a folder that holds them, `chmod`, a `git` checkout over them, an inline script) and `Write`/`Edit`. `.claude/settings*.json` and `.codex/config.toml` (in any directory, a project's included) take a `Write`/`Edit` that leaves `hooks` and `disableAllHooks` as they are, and for Codex every key at any depth that names hooks or features, and the `profile` selector; `.codex/hooks.json` and `.cursor/hooks.json` in any directory are not written. Shell writes to any of them are denied, and so is a write whose target has a glob, an unresolved `$` or a backtick that could land on one (`~/.c*/…`, `$D/hooks.json`), an output or extract option aimed at one (`-o`, `-O`, `-d`, `-C`, `--output`), with same-line assignments, `cd` and `pushd`/`popd` followed. Any JSON `Write`/`Edit` that adds a `disableAllHooks` is denied |
+| `guard-config` | deny writes to agentkit's site config (`~/.config/agentkit`, except `memory/`, `skills/`, `rules/*.md`, `rules/projects/` and `paused-providers`), to the hook files the guards run through (`~/.codex/hooks.json`, `~/.cursor/hooks.json`, `~/.gemini/config/hooks.json`) and to the programs the hooks run (`agentkit`, `agent-context`). The rule is by what is touched, not by which program touches it: a command that is not known only to read (`cat`, `grep`, `rg`, `jq`, `diff`, `ls`, `stat`, `shasum`, `sed`/`awk` without in-place or a file named in the script, `find` without `-exec`, `tar` making an archive, the git subcommands that read or record) is refused when any word, option value or assignment in front of it names a protected path exactly, also through a glob the shell would expand, a `for` variable, a literal assignment, or `xargs` fed the path by a pipe. A patch tool's envelope (`*** Update File:`) is judged by the files it names. Every refusal starts `Refused for <path>:` and says why. Text that only mentions a path (a message, a here-document written to a file, a quoted argument) and reads of it are not writes. On top of the general rule: shell writes (redirect, `tee`, `sed -i`, `cp`/`mv`/`ln` onto, moving or removing them or a folder that holds them, `chmod`, a `git` checkout over them, an inline script) and `Write`/`Edit`. `.claude/settings*.json` and `.codex/config.toml` (in any directory, a project's included) take a `Write`/`Edit` that leaves `hooks` and `disableAllHooks` as they are, and for Codex every key at any depth that names hooks or features, and the `profile` selector; `.codex/hooks.json` and `.cursor/hooks.json` in any directory are not written. Shell writes to any of them are denied, and so is a write whose target has a glob, an unresolved `$` or a backtick that could land on one (`~/.c*/…`, `$D/hooks.json`), an output or extract option aimed at one (`-o`, `-O`, `-d`, `-C`, `--output`), with same-line assignments, `cd` and `pushd`/`popd` followed. Any JSON `Write`/`Edit` that adds a `disableAllHooks` is denied |
 
 `secrets`, known gaps (review of 16 Nov 2026; evasions by an agent working around the
 guard, not normal use): a Grep is judged by its glob's text, not by whether its root holds
@@ -167,8 +186,33 @@ purpose because closing them would refuse ordinary work:
   `subprocess`) is caught only for the forms listed in the tests.
 - A path reached through a variable set earlier (`d=$HOME/Documents; ... "$d"`) or
   through a glob is not resolved.
-- Only Claude's file-edit tools are judged by path; the Codex and Cursor hooks see
-  shell commands only.
+- Only Claude's and Antigravity's file-edit tools are judged by path, and a patch tool by the
+  files its envelope names; any other tool a provider adds is not judged.
+- A write whose target is not on the command line: a patch body, a script file, an archive
+  unpacked above a protected folder, a path computed at run time. `guard-config` judges
+  named paths. The control for the rest is ownership: a root-owned `hook_bin`, and the
+  site config and hook files made immutable by the owner.
+- A Claude settings edit may change only the top-level keys in `CLAUDE_AGENT_MAY_CHANGE`
+  (`generate.rs`: `permissions`, `$schema`, `model`, `effortLevel` and a few plain
+  preferences); a Codex config edit only `model`, `model_reasoning_effort` and `personality`,
+  at the top level or in a profile. Any other key is refused by name: `hooks`, `env`,
+  `disableAllHooks`, the keys that run a program (`statusLine`, `notify`), load code
+  (`enabledPlugins`, `mcp_servers`) or set the approval posture, and any key a later release
+  adds, are the owner's to change.
+
+Compiled in, the same on every Mac, whatever site config says:
+
+- The keys the guards sign with, `ledger.key` and `tripwire.key` in agentkit's state folder,
+  are opened by agentkit and tripwire and by nothing else. `secrets` and `guard-config` each
+  refuse a command, a `Read` or a `Grep` that names one, a glob that reaches one, a script
+  that opens one, a copy (to another fleet Mac included) and a recursive read or archive of
+  the folder they are in. `ls`, `stat` and `wc` on a key, and reading the ledger beside it,
+  are fine.
+- tripwire's records (`~/.local/state/fleet/tripwire/`) and config
+  (`~/.config/fleet/tripwire.json`) are read freely and written only by `tripwire` itself.
+- `$TMPDIR` is believed only when the folder it resolves to (symlinks followed) lies inside
+  `/tmp` or `/var/folders` and neither is nor holds the home folder; a delete target is
+  resolved the same way before it is compared with the temp roots.
 - An approval marker is an honour system: `AGENTKIT_PUSH_APPROVED=1` answers a gated
   push, and a remote branch delete when it prefixes that one command alone on its
   line. It never answers a force push or `--force-with-lease`.

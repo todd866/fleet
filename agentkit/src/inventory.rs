@@ -202,8 +202,8 @@ pub const GAPS: &[Gap] = &[
     },
     Gap {
         provider: "all",
-        gap: "Generated hooks call `agentkit` and `agent-context` by name.",
-        mitigation: "Install both on `PATH` before `sync --apply`. Doctor checks the hook text and the decision logic, not that a particular binary is installed.",
+        gap: "Generated hooks call `agentkit` and `agent-context` by absolute path (`~/.local/bin`, or `hook_bin` in the site).",
+        mitigation: "Install both there before `sync --apply`. Doctor fails when the hook program is missing. The guard refuses agents writing either file, but any same-user process can; a root-owned `hook_bin` is the real control.",
     },
     Gap {
         provider: "Alternate Claude launchers",

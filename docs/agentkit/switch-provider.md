@@ -9,7 +9,7 @@ hard delete and an iCloud-wide trash. It does not start Cursor.
 ## Checklist
 
 1. Copy `agentkit/example/` to `~/.config/agentkit`. Do not commit that copy.
-2. Put `agentkit` and `agent-context` on `PATH` (`~/.local/bin`). Generated hooks call those names. Doctor checks the hook file and the decision logic, not which file answered.
+2. Install `agentkit` and `agent-context` in `~/.local/bin` (or set `hook_bin` in `agentkit.toml` to where `agentkit` is). Generated hooks call them by absolute path, and doctor fails when the hook program is not there.
 3. Put the real global rules in `rules/global.md` and each project in `rules/projects/<name>.md`. The generated global file also lists the five prohibitions, so a surface that skips its hook file still has them as text. Text is not enforcement.
 4. Fill `guards.air_aliases` and `guards.allowed_cd` from the live hook before the first apply. An empty air list denies worker deletes. That is stricter, and it is easy to miss.
 5. If addresses must not appear in commands, set `guards.email_substrings_file` to a file that stays out of git.

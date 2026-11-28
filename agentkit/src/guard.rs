@@ -1,8 +1,8 @@
-//! Standalone guard decisions. Each one reads a shell command (Claude
-//! `tool_input.command`, Cursor `command`, or a bare string) and answers
-//! allow, ask, or deny. Parse failures allow, matching the hooks these
-//! replace: a broken stdin must not become a new way to stall a session.
-//! The deny rules themselves are not relaxed.
+//! Standalone guard decisions. Each one reads a tool call (Claude
+//! `tool_input.command`, Cursor `command`, a file tool's path) and answers
+//! allow, ask, or deny. A tool call that cannot be read is refused by the
+//! caller (`crate::judge`): the providers take "no answer" as "no objection",
+//! so allowing on a parse failure let a malformed call through unjudged.
 
 use crate::site::GuardConfig;
 
@@ -52,12 +52,13 @@ impl Decision {
     pub fn is_ask(&self) -> bool { self.decision == "ask" }
 }
 
+/// One guard's decision on a tool call given as JSON text. `Err` when the text is not a JSON
+/// object: there is nothing to judge, and the caller refuses the call.
 pub fn decide_json(name: &str, raw: &str, cfg: &GuardConfig) -> Result<Decision, ()> {
-    let value: Value = if raw.trim().is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_str(raw).map_err(|_| ())?
-    };
+    let value: Value = serde_json::from_str(raw).map_err(|_| ())?;
+    if !value.is_object() {
+        return Err(());
+    }
     Ok(decide_value(name, &value, cfg))
 }
 
@@ -94,14 +95,20 @@ pub fn combine_decisions(decisions: impl IntoIterator<Item = Decision>) -> Decis
 }
 
 pub fn decide_all(value: &Value, cfg: &GuardConfig, enabled: &[&str]) -> Decision {
-    if let Some(path) = read_target(value) {
-        // A file-reading tool call: only the secrets guard reads its path.
-        return if enabled.contains(&"secrets") { secrets_read(&path, cfg) } else { Decision::allow() };
+    if read_target(value).is_some() {
+        // A file-reading tool call: the secrets guard reads its path, and guard-config keeps
+        // the guards' own keys from being read.
+        let decisions = ["secrets", "guard-config"]
+            .iter()
+            .filter(|name| enabled.contains(name))
+            .map(|name| decide_value(name, value, cfg));
+        return combine_decisions(decisions);
     }
     if !is_shell(value) {
-        // A file-writing tool call: only the two path guards answer, from the path alone. The
-        // content is never read, and a missing or malformed path allows.
-        if file_target(value).is_none() {
+        // A file-writing tool call: only the path guards answer. A tool the guard does not
+        // know (an MCP tool, a provider's own) is allowed unless it carries a patch envelope,
+        // whose file names the same guards judge.
+        if file_target(value).is_none() && patch_targets(value).is_empty() {
             return Decision::allow();
         }
         let decisions = FILE_TOOL_GUARDS
@@ -118,7 +125,11 @@ pub fn decide_value(name: &str, value: &Value, cfg: &GuardConfig) -> Decision {
     let adjusted = call_dir(value, cfg);
     let cfg = adjusted.as_ref().unwrap_or(cfg);
     if let Some(path) = read_target(value) {
-        return if name == "secrets" { secrets_read(&path, cfg) } else { Decision::allow() };
+        return match name {
+            "secrets" => secrets_read(&path, cfg),
+            "guard-config" => guard_config_read(&path, cfg),
+            _ => Decision::allow(),
+        };
     }
     if !is_shell(value) {
         // A file-writing tool call carries the path it writes. Two guards protect paths, not
@@ -130,7 +141,15 @@ pub fn decide_value(name: &str, value: &Value, cfg: &GuardConfig) -> Decision {
                 "guard-config" => guard_config_file(&path, value, cfg),
                 _ => Decision::allow(),
             },
-            None => Decision::allow(),
+            None => {
+                let paths = patch_targets(value);
+                match name {
+                    "slot-files" => combine_decisions(paths.iter().map(|p| slot_files_path(p, cfg))),
+                    "approval-files" => combine_decisions(paths.iter().map(|p| approval_files_path(p, cfg))),
+                    "guard-config" => guard_config_patch(&paths, cfg),
+                    _ => Decision::allow(),
+                }
+            }
         };
     }
     let command = command_of(value);
@@ -226,14 +245,20 @@ fn call_dir(value: &Value, cfg: &GuardConfig) -> Option<GuardConfig> {
 }
 
 fn command_of(value: &Value) -> String {
-    if let Some(s) = value.get("command").and_then(|c| c.as_str()) {
-        return s.to_string();
+    let raw = value
+        .get("command")
+        .filter(|c| c.is_string() || c.is_array())
+        .or_else(|| tool_input_of(value).and_then(|t| t.get("command").or_else(|| t.get("CommandLine"))));
+    match raw {
+        Some(Value::String(s)) => s.clone(),
+        // A command given as its words (`["bash", "-lc", "rm -rf x"]`): judged as the line a
+        // shell would read, not skipped as "no command".
+        Some(Value::Array(words)) => {
+            let words: Vec<&str> = words.iter().filter_map(|w| w.as_str()).collect();
+            shlex::try_join(words.iter().copied()).unwrap_or_else(|_| words.join(" "))
+        }
+        _ => String::new(),
     }
-    tool_input_of(value)
-        .and_then(|t| t.get("command").or_else(|| t.get("CommandLine")))
-        .and_then(|c| c.as_str())
-        .unwrap_or("")
-        .to_string()
 }
 
 pub fn format_agy(d: &Decision) -> String {
@@ -328,7 +353,7 @@ fn try_compiled(pattern: &str) -> Option<Rex> {
     Some(compiled(pattern))
 }
 
-const TEMP_ROOTS: &[&str] = &["/tmp/", "/private/tmp/", "/var/folders/", "/private/var/folders/"];
+use crate::site::TEMP_ROOTS;
 const DELETERS: &[&str] = &["rm", "rmdir", "unlink", "shred", "srm"];
 const WRAPPERS: &[&str] = &[
     "sudo", "command", "builtin", "nohup", "time", "env", "xargs", "exec", "nice", "timeout",
@@ -1686,10 +1711,39 @@ fn quoted_substitutions(text: &str) -> Vec<String> {
                 }
                 let close = i.min(b.len());
                 let inner = &text[open.min(close)..close];
-                for mark in ["$(", "`"] {
-                    for (at, _) in inner.match_indices(mark) {
-                        out.push(inner[at + mark.len()..].to_string());
+                // `$(` runs up to the parenthesis that closes it.
+                for (at, _) in inner.match_indices("$(") {
+                    let body = &inner[at + 2..];
+                    let end = subst_end(body.as_bytes(), 0);
+                    let cut = if end > 0 && body.as_bytes()[end - 1] == b')' { end - 1 } else { end };
+                    out.push(body[..cut.min(body.len())].to_string());
+                }
+                // Backticks pair up: what stands between an opening one and the next is run,
+                // what follows the closing one is the string's text again. (Until 28 Nov 2026
+                // the text after the closing backtick was read as a command too, so a message
+                // like "ran `ls` and it's fine; rm -rf ~/old is next" was judged as shell.) An
+                // escaped backtick may open a nested one: what follows it is read as before.
+                let ib = inner.as_bytes();
+                let mut opened: Option<usize> = None;
+                let mut k = 0;
+                while k < ib.len() {
+                    if ib[k] == b'\\' {
+                        if ib.get(k + 1) == Some(&b'`') {
+                            out.push(inner[k + 2..].to_string());
+                        }
+                        k += 2;
+                        continue;
                     }
+                    if ib[k] == b'`' {
+                        match opened.take() {
+                            Some(start) => out.push(inner[start..k].to_string()),
+                            None => opened = Some(k + 1),
+                        }
+                    }
+                    k += 1;
+                }
+                if let Some(start) = opened {
+                    out.push(inner[start..].to_string());
                 }
                 i += 1;
             }
@@ -1705,6 +1759,45 @@ fn redirect_targets(text: &str) -> Vec<String> {
     compiled(r#">{1,2}\|?\s*((?:"[^"]*"|'[^']*'|\\.|[^\s;&|()<>'"\\]+)+)"#)
         .captures_iter(text)
         .iter()
+        .filter_map(|c| c.get(1).map(|m| without_quoting(m.as_str())))
+        .collect()
+}
+
+/// The same, for the redirects the shell itself would act on: the `>` stands outside any
+/// quotes. `echo "a > b"` and a message that says `-> ~/.claude/settings.json` redirect
+/// nothing. (Text inside quotes that another program may run is read as its own unit, where
+/// its `>` is outside quotes again.)
+fn live_redirect_targets(text: &str) -> Vec<String> {
+    let b = text.as_bytes();
+    let mut quoted = vec![false; b.len()];
+    let (mut i, mut single, mut double) = (0usize, false, false);
+    while i < b.len() {
+        let c = b[i];
+        if single {
+            quoted[i] = true;
+            single = c != b'\'';
+        } else if c == b'\\' {
+            if double {
+                quoted[i] = true;
+                if i + 1 < b.len() {
+                    quoted[i + 1] = true;
+                }
+            }
+            i += 1;
+        } else if double {
+            quoted[i] = true;
+            double = c != b'"';
+        } else if c == b'\'' {
+            single = true;
+        } else if c == b'"' {
+            double = true;
+        }
+        i += 1;
+    }
+    compiled(r#">{1,2}\|?\s*((?:"[^"]*"|'[^']*'|\\.|[^\s;&|()<>'"\\]+)+)"#)
+        .captures_iter(text)
+        .iter()
+        .filter(|c| c.get(0).is_some_and(|m| !quoted[m.start()]))
         .filter_map(|c| c.get(1).map(|m| without_quoting(m.as_str())))
         .collect()
 }
@@ -1750,14 +1843,13 @@ fn is_temp(path: &str, cfg: &GuardConfig) -> bool {
         return false;
     }
     let path = path.as_str();
+    // The target, symlinks resolved, against the temp roots, symlinks resolved: `/tmp` and
+    // `/private/tmp` are one folder, and a link inside a temp root that leads out of it
+    // (`/tmp/x -> ~`) is where it leads. `$TMPDIR` adds no root of its own: its value is only
+    // believed when it lies inside these roots (crate::site::trusted_tmp), and until 28 Nov
+    // 2026 a `TMPDIR` that resolved to the home folder made everything under home "temp".
     let mut roots: Vec<String> = TEMP_ROOTS.iter().map(|s| (*s).to_string()).collect();
-    if let Some(tmp) = &cfg.tmpdir {
-        let mut real = resolve_path(&tmp.to_string_lossy(), cfg);
-        if !real.ends_with('/') {
-            real.push('/');
-        }
-        roots.push(real);
-    }
+    roots.extend(crate::site::canonical_temp_roots().iter().map(|r| format!("{}/", r.to_string_lossy().trim_end_matches('/'))));
     let mut resolved = resolve_path(&expand_path(path, cfg), cfg);
     if !resolved.ends_with('/') {
         resolved.push('/');
@@ -1846,7 +1938,14 @@ fn find_heredoc(line: &str) -> Option<(usize, usize, String)> {
 /// else (a pipe after it, `eval "$(cat <<EOF`, `source /dev/stdin <<EOF`, a bare `cat <<EOF`
 /// whose output an enclosing construct may run) is read as commands.
 fn heredoc_is_data(head: &str, tail: &str) -> bool {
-    if tail.contains('|') || tail.contains("$(") || tail.contains('`') || tail.contains(';') || tail.contains('&') {
+    // What follows the delimiter on its line up to the next `;`, `&&` or `||` belongs to the
+    // command the body feeds. Commands after that are separate ones, read from the line like
+    // any other: `cat > notes.md <<'EOF' && git add notes.md` does not make the notes a script.
+    // (`2>&1` is not a separator; a lone `&` is left as before and reads the body as commands.)
+    let own_end = [";", "&&", "||"].iter().filter_map(|sep| tail.find(sep)).min().unwrap_or(tail.len());
+    let (tail, rest) = tail.split_at(own_end);
+    let rest_plain = rest.is_empty() || pieces(rest).iter().all(|p| p.closed);
+    if tail.contains('|') || tail.contains("$(") || tail.contains('`') || tail.replace("2>&1", "").contains('&') || !rest_plain {
         return false;
     }
     if compiled(r#"^\s*(?:git\s+(?:commit|tag)|gh|agent-mail)\s[^;&|`$()<>]*"\$\(cat\s*$"#).is_match(head) {
@@ -2065,8 +2164,9 @@ fn is_tool(word: &str, tool: &str) -> bool {
     if !word.contains('/') {
         return false;
     }
-    let path = match (word.strip_prefix("~/"), std::env::var_os("HOME")) {
-        (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
+    // The account's home, not `$HOME`: the hook's environment is the guarded agent's.
+    let path = match (word.strip_prefix("~/"), crate::site::account_home()) {
+        (Some(rest), Some(home)) => home.join(rest),
         _ => PathBuf::from(word),
     };
     fs::canonicalize(path).ok().is_some_and(|p| p.file_name().is_some_and(|n| n == tool))
@@ -2244,7 +2344,7 @@ fn offload(cmd: &str, cfg: &GuardConfig) -> Decision {
     // configuration, so every shell command paid for it and stalled when the worker was slow.
     let worker = match &cfg.offload_worker {
         Some(worker) => worker.clone(),
-        None => crate::site::probe_offload(&cfg.home).unwrap_or_default(),
+        None => crate::site::probe_offload(cfg).unwrap_or_default(),
     };
     if worker.is_empty() {
         return Decision::allow();
@@ -3024,6 +3124,35 @@ fn guarded_files(cfg: &GuardConfig) -> Vec<(String, Guarded)> {
     ]
 }
 
+/// The programs the hooks run (`agentkit`, `agent-context`), resolved.
+fn hook_bin_paths(cfg: &GuardConfig) -> Vec<String> {
+    cfg.hook_bins().iter().map(|b| resolve_path(&b.to_string_lossy(), cfg)).collect()
+}
+
+/// A folder that holds a program the hooks run (`~/.local/bin`, `~/.local`) or tripwire's
+/// records or config (`~/.local/state/fleet`, `~/.config/fleet`): removing, moving or locking
+/// it takes them with it. Putting a new file into it does not.
+fn holds_hook_bin(token: &str, cfg: &GuardConfig) -> Option<String> {
+    let t = expand_vars(token, cfg);
+    if t.is_empty() || t.contains(['$', '`', '*', '?', '[']) {
+        return None;
+    }
+    let full = resolve_path(&t, cfg);
+    let top = full.trim_end_matches('/');
+    let home = resolve_path(&cfg.home.to_string_lossy(), cfg);
+    let home = home.trim_end_matches('/');
+    if top.is_empty() || top == home || home.starts_with(&format!("{top}/")) {
+        return None;
+    }
+    let inside = format!("{top}/");
+    let (tripwire_dir, tripwire_config) = tripwire_paths(cfg);
+    hook_bin_paths(cfg)
+        .iter()
+        .chain([&tripwire_dir, &tripwire_config])
+        .any(|b| b.starts_with(&inside))
+        .then(|| top.to_string())
+}
+
 /// Is a resolved path one the guard-config guard protects? In agentkit's config directory
 /// everything is, except what agents are meant to write there: the shared notebook (`memory/`),
 /// `skills/`, the prose rules (`rules/*.md`, `rules/projects/`) and `paused-providers`.
@@ -3039,6 +3168,7 @@ fn guarded_kind(full: &str, cfg: &GuardConfig) -> Option<Guarded> {
                 || rel.starts_with("skills/")
                 || rel == "skills"
                 || rel == "paused-providers"
+                || rel == "rules/projects"
                 || rel.starts_with("rules/projects/")
                 || (rel.starts_with("rules/") && rel.ends_with(".md"));
             return if open { None } else { Some(Guarded::Whole) };
@@ -3046,6 +3176,15 @@ fn guarded_kind(full: &str, cfg: &GuardConfig) -> Option<Guarded> {
     }
     if let Some(k) = guarded_files(cfg).into_iter().find(|(p, _)| p == full).map(|(_, k)| k) {
         return Some(k);
+    }
+    // The programs the generated hooks run. One replaced by a script that exits 0 is every
+    // guard switched off (the providers read no answer as no objection).
+    if hook_bin_paths(cfg).iter().any(|b| b == full) {
+        return Some(Guarded::Whole);
+    }
+    // tripwire's records and config: read freely, written by tripwire alone.
+    if is_tripwire_path(full, cfg) {
+        return Some(Guarded::Whole);
     }
     // The decision ledger and its HMAC key (crate::ledger): an agent that could replace them
     // (a FIFO, a symlink, a truncation) could stall the hook or erase its own record.
@@ -3083,11 +3222,103 @@ fn guarded_kind(full: &str, cfg: &GuardConfig) -> Option<Guarded> {
 
 /// The ledger's protected folders and files, from the writer's own functions (crate::ledger).
 fn ledger_dirs(cfg: &GuardConfig) -> Vec<String> {
-    crate::ledger::protected_paths(&cfg.home).0.iter().map(|d| resolve_path(&d.to_string_lossy(), cfg)).collect()
+    crate::ledger::protected_paths(&cfg.home, &cfg.state(), &cfg.ledger()).0.iter().map(|d| resolve_path(&d.to_string_lossy(), cfg)).collect()
 }
 
 fn ledger_files(cfg: &GuardConfig) -> Vec<String> {
-    crate::ledger::protected_paths(&cfg.home).1.iter().map(|d| resolve_path(&d.to_string_lossy(), cfg)).collect()
+    crate::ledger::protected_paths(&cfg.home, &cfg.state(), &cfg.ledger()).1.iter().map(|d| resolve_path(&d.to_string_lossy(), cfg)).collect()
+}
+
+/// Keys kept in agentkit's state folder that the guards sign with: the ledger's HMAC key and
+/// tripwire's state key. Compiled in, not site config: they are the same on every Mac, and a
+/// site file an agent got at must not be able to drop them. agentkit and tripwire use them in
+/// place; no tool call reads, copies or writes them.
+const GUARD_KEY_NAMES: &[&str] = &["ledger.key", "tripwire.key"];
+
+fn guard_keys(cfg: &GuardConfig) -> Vec<String> {
+    let mut out: Vec<String> = ledger_dirs(cfg)
+        .iter()
+        .flat_map(|d| GUARD_KEY_NAMES.iter().map(move |n| format!("{}/{n}", d.trim_end_matches('/'))))
+        .collect();
+    // A ledger kept elsewhere has its key beside it.
+    out.push(resolve_path(&crate::ledger::key_path(&cfg.ledger()).to_string_lossy(), cfg));
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The guard key a word names, resolved: the file itself, or a glob the shell would expand to
+/// it. With the working folder unknown, a relative word whose last component is a key's name.
+fn guard_key_hit(word: &str, cfg: &GuardConfig, cwd_known: bool) -> Option<String> {
+    let keys = guard_keys(cfg);
+    let t = expand_vars(word, cfg);
+    if t.is_empty() || t.contains(['$', '`']) {
+        return (t.contains(['$', '`']) && GUARD_KEY_NAMES.iter().any(|n| t.ends_with(n))).then_some(t);
+    }
+    if t.contains(['*', '?', '[']) {
+        if t.len() > MAX_GLOB_LEN {
+            return None;
+        }
+        let abs = if t.starts_with('/') { t.clone() } else { format!("{}/{t}", cfg.cwd.to_string_lossy().trim_end_matches('/')) };
+        return glob_matches(&abs, 200).into_iter().map(|m| resolve_path(&m, cfg)).find(|m| keys.contains(m));
+    }
+    let full = resolve_path(&t, cfg);
+    if keys.contains(&full) {
+        return Some(full);
+    }
+    let relative = !t.starts_with('/');
+    (!cwd_known && relative && GUARD_KEY_NAMES.contains(&base_name(&t))).then_some(t)
+}
+
+/// Does a folder hold a guard key: agentkit's state folder, or one above it? `skip_hidden` is
+/// for a search that does not enter dot folders (the Grep tool): from above `~/.local` it
+/// never reaches the keys.
+fn holds_guard_key(full: &str, cfg: &GuardConfig, skip_hidden: bool) -> Option<String> {
+    let top = full.trim_end_matches('/');
+    guard_keys(cfg).into_iter().find(|key| {
+        let dir = key.rfind('/').map(|j| &key[..j]).unwrap_or("");
+        if dir == top {
+            return true;
+        }
+        match dir.strip_prefix(&format!("{top}/")) {
+            Some(rest) => !skip_hidden || !rest.split('/').any(|c| c.starts_with('.')),
+            None => top.is_empty() && !skip_hidden,
+        }
+    })
+}
+
+const GUARD_KEY_REASON: &str = "it is a key the guards sign with (the ledger's HMAC key, tripwire's state key). agentkit and tripwire use it in place (`tripwire status`, `tripwire check`); no tool call reads, copies or changes it. To read the ledger or tripwire's records, name those files, not the folder or the key";
+
+fn guard_key_deny(rule: &str, path: &str, how: &str) -> Decision {
+    Decision::deny(rule, format!("Refused for `{path}`: {how}; {GUARD_KEY_REASON}."))
+}
+
+/// tripwire's own state folder and config: read by agents investigating an incident, written
+/// only by tripwire (and the owner). Compiled in for the same reason as the keys.
+fn tripwire_paths(cfg: &GuardConfig) -> (String, String) {
+    (
+        resolve_path(&cfg.home.join(".local/state/fleet/tripwire").to_string_lossy(), cfg),
+        resolve_path(&cfg.home.join(".config/fleet/tripwire.json").to_string_lossy(), cfg),
+    )
+}
+
+fn is_tripwire_path(full: &str, cfg: &GuardConfig) -> bool {
+    let (dir, config) = tripwire_paths(cfg);
+    full == config || full == dir || full.starts_with(&format!("{dir}/"))
+}
+
+/// A Read or Grep of a guard key, or a search rooted at a folder that holds one.
+fn guard_config_read(path: &str, cfg: &GuardConfig) -> Decision {
+    let full = resolve_path(&expand_vars(path, cfg), cfg);
+    if let Some(key) = guard_key_hit(path, cfg, true) {
+        return guard_key_deny("guard-config", &key, "this would read it");
+    }
+    if Path::new(&full).is_dir()
+        && let Some(key) = holds_guard_key(&full, cfg, true)
+    {
+        return guard_key_deny("guard-config", &key, &format!("a search of `{full}` would read it"));
+    }
+    Decision::allow()
 }
 
 /// The whole protected set: the ledger's files and folders, resolved.
@@ -3155,23 +3386,6 @@ fn word_paths(word: &str) -> Vec<String> {
     out
 }
 
-/// Names that, appearing anywhere in a word, may point at the ledger: each protected path's
-/// base name and the paths themselves.
-fn ledger_name_parts(cfg: &GuardConfig) -> Vec<String> {
-    let mut out = Vec::new();
-    for p in ledger_protected(cfg) {
-        if let Some(name) = std::path::Path::new(&p).file_name() {
-            out.push(name.to_string_lossy().into_owned());
-        }
-        out.push(p);
-    }
-    out.extend(ledger_needles(cfg));
-    out.retain(|w| !w.is_empty());
-    out.sort();
-    out.dedup();
-    out
-}
-
 /// The value glued to a short option (`-C~/x` -> `~/x`), cut on a character boundary.
 fn glued_value(word: &str) -> Option<&str> {
     if !word.starts_with('-') || word.starts_with("--") {
@@ -3181,6 +3395,34 @@ fn glued_value(word: &str) -> Option<&str> {
     chars.next()?;
     let (i, _) = chars.next()?;
     word.get(i..).filter(|v| !v.is_empty())
+}
+
+/// The command line without the here-documents that are data (`cat > file <<EOF`, a message
+/// for `git commit`, `gh` or `agent-mail`): body, `<<EOF` and closing line all removed. What a
+/// file is given to hold, or a message says, is not a command and names no write.
+fn without_data_heredocs(cmd: &str) -> String {
+    if !cmd.contains("<<") {
+        return cmd.to_string();
+    }
+    let lines: Vec<&str> = cmd.split('\n').collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        match find_heredoc(line) {
+            Some((start, end, delim)) if heredoc_is_data(&line[..start], &line[end..]) => {
+                out.push(format!("{}{}", &line[..start], &line[end..]));
+                let mut j = i + 1;
+                while j < lines.len() && lines[j].trim() != delim {
+                    j += 1;
+                }
+                i = j;
+            }
+            _ => out.push(line.to_string()),
+        }
+        i += 1;
+    }
+    out.join("\n")
 }
 
 /// A command whose structure the cwd tracking cannot follow: subshells, groups, compound
@@ -3193,44 +3435,58 @@ fn cwd_untrackable(cmd: &str) -> bool {
         .any(|w| matches!(w, "if" | "then" | "else" | "elif" | "fi" | "while" | "until" | "for" | "do" | "done" | "case" | "esac" | "function" | "select"))
 }
 
+/// Programs whose arguments are files they change, move, remove or replace. A word that is
+/// only guessed to be a command (text in a quoted argument, a string in a script, a later word
+/// of another program) counts as a write to the ledger only when it starts with one of these:
+/// prose that mentions a path is not a write to it.
+const CHANGERS: &[&str] = &[
+    "rm", "rmdir", "unlink", "mv", "cp", "gcp", "ln", "link", "truncate", "tee", "dd", "shred", "chmod", "chflags",
+    "chown", "touch", "mkfifo", "mknod", "install", "rsync", "ditto", "sed", "gsed", "perl", "srm", "trash", "patch",
+    "ed", "ex", "sponge", "xattr", ":",
+];
+
+/// A glob the shell itself expands: the word has a glob character and is not quoted whole in
+/// the text. A quoted pattern (`-name '*.log'`, `-p 'test_*.py'`) is handed to the program as
+/// it is and names no file here.
+fn shell_glob(word: &str, text: &str) -> bool {
+    word.contains(['*', '?', '['])
+        && !text.contains(&format!("'{word}'"))
+        && !text.contains(&format!("\"{word}\""))
+}
+
 /// Stat-only check, before any fast path: every word of every unit (and every redirect target),
 /// resolved against the working folder as unconditional `cd`/`pushd`/`popd` move it. A hit on
 /// the ledger's files or folders, an ancestor, or the ledger's inode denies unless the program
-/// only reads. A single-dash word, or any relative word once the folder is unknown (a `cd -`,
-/// a `cd` after `||`, in a pipe or a subshell, or to a target that cannot be resolved), is a hit
-/// when it contains a protected name. Defence in depth only: a same-user process can still
-/// rewrite the file, so the ledger is shipped every minute and the archive host's sequence
-/// check is the real control.
-fn ledger_write_hit(cmd: &str, cfg: &GuardConfig) -> bool {
-    // First, whole-command rules over every cd/pushd at any depth (tracked or not).
-    // (a) A target that resolves into or above the ledger's folder, with any program that is
-    //     not a reader (or any redirect), refuses the command.
-    // (b) A target known only at run time (`$(…)`, backticks, `cd -`, `+N`, a glob, an
-    //     unexpanded variable) refuses it only when the command also names a protected file,
-    //     folder or ancestor, or hands a glob, `.` or `..` to a non-reader or a redirect, or a
-    //     bare relative name to a redirect or a file-changing program (`: > *`,
-    //     `truncate -s0 decisions.jsonl`). Ordinary `cd "$dir" && make` stays allowed.
+/// only reads. Once the folder is unknown (a `cd -`, a `cd` after `||`, in a pipe or a
+/// subshell, or to a target only known at run time), a relative word can no longer be resolved,
+/// so it is judged by what it could be: a write (a redirect, a file-changing program) to a
+/// bare name, to the ledger's folder by name, to `.`, `..` or a glob the shell expands; any
+/// other program given the ledger's or the key's own file name, or such a glob. A test run
+/// or a build after `cd "$dir"` is not refused, whatever words it has (until 28 Nov 2026 the
+/// word `agentkit` or `state` anywhere on such a line was enough).
+/// Returns the path and how it would be written, for the refusal to name. Defence in depth
+/// only: a same-user process can still rewrite the file, so the ledger is shipped every minute
+/// and the archive host's sequence check is the real control.
+fn ledger_write_hit(cmd: &str, cfg: &GuardConfig) -> Option<(String, String)> {
     let units = units_deep(cmd);
-    let mut known_risky = false;
-    let mut runtime_cd = false;
+    // Judged on the line's own structure: a parenthesis in a quoted search pattern, or in the
+    // text of a here-document written to a file, is not a subshell.
+    let untrackable = cwd_untrackable(&blank_quotes(&without_data_heredocs(cmd)));
+    // A cd, at any depth, into the ledger's folder or one above it: with any program that is
+    // not a reader (or any redirect) the command is refused. Listing or reading there is fine.
+    let mut risky: Option<String> = None;
     for u in units.iter().filter(|u| u.remote.is_none() && matches!(u.prog(), "cd" | "pushd")) {
         if u.text.contains('`') || u.text.contains("$(") || u.sep == "$(" || u.sep == "`" {
-            runtime_cd = true;
             continue;
         }
-        match u.argv.get(1).map(String::as_str) {
-            None => {}
-            Some(t) if t == "-" || t.starts_with('+') || (t.starts_with('-') && t.len() > 1) => runtime_cd = true,
-            Some(t) => {
-                let e = expand_vars(t, cfg);
-                if e.contains(['$', '`', '*', '?', '[']) {
-                    runtime_cd = true;
-                } else {
-                    let full = resolve_path(&e, cfg);
-                    if in_ledger_dir(&full, cfg) || ledger_ancestor_hit(&full, cfg) {
-                        known_risky = true;
-                    }
-                }
+        if let Some(t) = u.argv.get(1).map(String::as_str) {
+            let e = expand_vars(t, cfg);
+            if t == "-" || t.starts_with('+') || t.starts_with('-') || e.contains(['$', '`', '*', '?', '[']) {
+                continue;
+            }
+            let full = resolve_path(&e, cfg);
+            if in_ledger_dir(&full, cfg) || ledger_ancestor_hit(&full, cfg) {
+                risky = Some(full);
             }
         }
     }
@@ -3238,37 +3494,38 @@ fn ledger_write_hit(cmd: &str, cfg: &GuardConfig) -> bool {
         let prog = u.prog();
         !prog.is_empty() && !is_readonly_ledger_unit(u) && !matches!(prog, "cd" | "pushd" | "popd")
     };
-    let any_redirect = units.iter().any(|u| !redirect_targets(&u.text).is_empty());
-    if known_risky && (any_redirect || units.iter().any(is_writer)) {
-        return true;
-    }
-    if runtime_cd {
-        const CHANGERS: &[&str] = &["rm", "rmdir", "unlink", "mv", "cp", "ln", "link", "truncate", "tee", "dd", "shred",
-                                    "chmod", "chflags", "chown", "touch", "mkfifo", "install", "rsync", "sed", "perl", "srm", ":"];
-        let parts = ledger_name_parts(cfg);
-        let names_protected = units.iter().any(|u| u.argv.iter().chain(std::iter::once(&u.text)).any(|w| parts.iter().any(|p| w.contains(p.as_str()))));
-        let vague = |w: &str| w.contains(['*', '?', '[']) || w == "." || w == ".." || w == "./" || w == "../";
-        let bare = |w: &str| !w.starts_with('-') && !w.contains('/') && !w.contains('=') && !w.is_empty();
-        let hands_vague = units.iter().any(|u| {
-            let prog = u.prog();
-            let targets = redirect_targets(&u.text);
-            targets.iter().any(|t| vague(t) || bare(t))
-                || (is_writer(u) && u.argv.iter().skip(1).any(|w| vague(w)))
-                || (CHANGERS.contains(&prog) && u.argv.iter().skip(1).any(|w| bare(w)))
-        });
-        if names_protected || hands_vague {
-            return true;
+    if let Some(dir) = risky {
+        let redirect = units.iter().find_map(|u| live_redirect_targets(&u.text).into_iter().next());
+        if let Some(t) = redirect {
+            return Some((dir, format!("the line changes into that folder and redirects output to `{t}`")));
+        }
+        // A word that is only guessed to be a command counts when it is a file-changing one.
+        if let Some(u) = units.iter().find(|u| is_writer(u) && (!(u.guessed || u.later) || CHANGERS.contains(&u.prog()))) {
+            return Some((dir, format!("the line changes into that folder and runs `{}`, which is not known only to read", u.prog())));
         }
     }
     let mut local = cfg.clone();
     let mut stack: Vec<PathBuf> = Vec::new();
     let mut cwd_known = true;
-    let parts = ledger_name_parts(cfg);
-    let named = |w: &str| parts.iter().any(|p| w.contains(p.as_str()));
-    let untrackable = cwd_untrackable(cmd);
-    let hit = |t: &str, c: &GuardConfig, known: bool| {
+    // The ledger's own file names, and the names of its folder and the folders above it.
+    let files: Vec<String> = ledger_files(cfg)
+        .iter()
+        .filter_map(|f| Path::new(f).file_name().map(|n| n.to_string_lossy().into_owned()))
+        .chain(std::iter::once(crate::doctor::GUARDS_BASELINE_FILE.to_string()))
+        .collect();
+    let folders: Vec<String> = ledger_needles(cfg).into_iter().filter(|n| !n.contains('/') && !files.contains(n)).collect();
+    let paths = ledger_protected(cfg);
+    // How strongly a unit writes: a redirect and a file-changing program write what they are
+    // given; any other program that is not a reader may.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Writes {
+        Surely,
+        Maybe,
+    }
+    let hit = |t: &str, c: &GuardConfig, known: bool, writes: Writes, text: &str| -> bool {
+        let names_file = |w: &str| files.iter().any(|f| w.contains(f.as_str())) || paths.iter().any(|p| w.contains(p.as_str()));
         if t.starts_with('-') && !t.starts_with("--") {
-            if named(t) {
+            if names_file(t) {
                 return true;
             }
             if let Some(v) = glued_value(t) {
@@ -3278,16 +3535,35 @@ fn ledger_write_hit(cmd: &str, cfg: &GuardConfig) -> bool {
                 }
             }
         }
-        if !known && !t.starts_with('/') && !t.starts_with('~') && named(t) {
-            return true;
+        if !known && !t.starts_with('/') && !t.starts_with('~') && !t.starts_with('-') {
+            let body = t.split_once('=').map(|(_, v)| v).unwrap_or(t);
+            let components: Vec<&str> = body.split('/').filter(|c| !c.is_empty()).collect();
+            if components.iter().any(|c| files.iter().any(|f| c == f)) || names_file(t) {
+                return true;
+            }
+            if shell_glob(t, text) {
+                return true;
+            }
+            // A write to a name directly in the folder (`rm notes.txt`, `> out`): if the folder
+            // is the ledger's, any name in it may be the ledger under another name. With a
+            // path, only the ledger's folder itself (`rm -rf state/agentkit`), not a file
+            // somewhere under a folder of that name (`sed -i … agentkit/src/guard.rs`).
+            if writes == Writes::Surely
+                && ((!t.contains('/') && !t.contains('=') && !t.is_empty())
+                    || components.last().is_some_and(|c| folders.iter().any(|f| c == f))
+                    || matches!(t, "." | ".." | "./" | "../"))
+            {
+                return true;
+            }
         }
         word_paths(t).iter().any(|w| {
             let full = resolve_path(&expand_vars(w, c), c);
             ledger_ancestor_hit(&full, c) || in_ledger_dir(&full, c)
         })
     };
+    let where_now = |known: bool| if known { "" } else { " (the working folder is only known at run time here, so a relative name may be the ledger's)" };
     let mut prev_sep = String::new();
-    for u in units_deep(cmd) {
+    for u in &units {
         let sep_before = std::mem::replace(&mut prev_sep, u.sep.clone());
         if u.remote.is_some() {
             continue;
@@ -3322,17 +3598,47 @@ fn ledger_write_hit(cmd: &str, cfg: &GuardConfig) -> bool {
             }
             continue;
         }
-        if redirect_targets(&u.text).iter().any(|t| hit(t, &local, cwd_known)) {
-            return true;
+        let speculative = u.guessed || u.later;
+        let changer = CHANGERS.contains(&prog);
+        // A redirect in text that is only guessed to be a command is judged with a changer's
+        // strength, as before; the text of a later unit is its parent's, already judged.
+        if !u.later
+            && let Some(t) = live_redirect_targets(&u.text).into_iter().find(|t| hit(t, &local, cwd_known, Writes::Surely, &u.text))
+        {
+            return Some((t.clone(), format!("a redirect (`> {t}`) would write it{}", where_now(cwd_known))));
         }
-        if is_readonly_ledger_unit(&u) {
+        // The keys kept beside the ledger are opened by agentkit and tripwire and by nothing
+        // else: a reader is refused them too. (`cat` on the ledger is fine; until 28 Nov 2026
+        // `cat` on its HMAC key was too, since the key sat under the same reader allowance.)
+        // Listing or sizing a key is not reading it.
+        if !speculative && !matches!(prog, "" | "ls" | "stat" | "wc" | "test" | "[" | "[[") {
+            let named = u
+                .argv
+                .iter()
+                .skip(1)
+                .flat_map(|w| {
+                    let mut words = word_paths(w);
+                    words.extend(glued_value(w).map(str::to_string));
+                    words
+                })
+                .chain(redirect_sources(&u.text))
+                .find_map(|w| guard_key_hit(&w, &local, cwd_known));
+            if let Some(key) = named {
+                return Some((key, format!("`{prog}` would read, copy or change it, and it is a key the guards sign with: agentkit and tripwire use it in place and nothing else opens it")));
+            }
+        }
+        if is_readonly_ledger_unit(u) || (speculative && !changer) {
             continue;
         }
-        if u.argv.iter().skip(1).any(|w| hit(w, &local, cwd_known)) {
-            return true;
+        let writes = if changer { Writes::Surely } else { Writes::Maybe };
+        if let Some(w) = u.argv.iter().skip(1).find(|w| hit(w, &local, cwd_known, writes, &u.text)) {
+            return Some((
+                w.clone(),
+                format!("`{prog}` was given it and is not a program known only to read{}", where_now(cwd_known)),
+            ));
         }
     }
-    false
+    None
 }
 
 fn in_ledger_dir(full: &str, cfg: &GuardConfig) -> bool {
@@ -3506,35 +3812,214 @@ fn guarded_dynamic(token: &str, cfg: &GuardConfig) -> bool {
 
 /// For a shell write: the path is protected, or is a folder under home that holds one
 /// (`mv ~/.codex /tmp/x`).
-fn guarded_shell_hit(token: &str, cfg: &GuardConfig) -> bool {
+/// Returns the resolved path, for the refusal to name.
+fn guarded_shell_path(token: &str, cfg: &GuardConfig) -> Option<String> {
     let t = expand_vars(token, cfg);
     if t.is_empty() {
-        return false;
+        return None;
     }
     let full = resolve_path(&t, cfg);
     if guarded_kind(&full, cfg).is_some() || ledger_ancestor_hit(&full, cfg) {
-        return true;
+        return Some(full);
     }
     // A `.claude`, `.codex` or `.cursor` folder itself, in any directory: replacing, moving or
     // removing it changes the hooks of everything under it.
     if HOOK_DIRS.contains(&base_name(full.trim_end_matches('/'))) {
-        return true;
+        return Some(full);
     }
     let home = resolve_path(&cfg.home.to_string_lossy(), cfg);
     let top = full.trim_end_matches('/');
     if top.len() <= home.len() || !top.starts_with(&format!("{home}/")) {
-        return false;
+        return None;
     }
     let inside = format!("{top}/");
-    guarded_files(cfg).iter().any(|(p, _)| p.starts_with(&inside))
+    let holds = guarded_files(cfg).iter().any(|(p, _)| p.starts_with(&inside))
         || agentkit_config_dirs(cfg).iter().any(|d| d.starts_with(&inside))
-        || ledger_dirs(cfg).iter().chain(ledger_files(cfg).iter()).any(|d| d.starts_with(&inside))
+        || ledger_dirs(cfg).iter().chain(ledger_files(cfg).iter()).any(|d| d.starts_with(&inside));
+    holds.then_some(full)
 }
 
-const GUARD_CONFIG_REASON: &str = "agentkit's site config and the hook files that run the guards are not written by agents: a change there can switch every guard off. Site config is the owner's to change; `agentkit sync --apply` regenerates the hook files from it. For other Claude or Codex settings, use the Edit tool on the file and leave its hooks (and disableAllHooks) as they are; that is allowed.";
+/// The resolved path when a word names exactly something the guard-config guard protects: a
+/// file or folder of agentkit's config (not its open parts), a hook file, a Claude or Codex
+/// settings file, the ledger's folder, a program the hooks run. A glob is expanded against
+/// the disk, as the shell would. Folders that merely hold such a file (`~/.claude`, `~/.config`)
+/// are not exact: naming one is not a write to what it holds.
+fn protected_exact(word: &str, cfg: &GuardConfig) -> Option<String> {
+    let t = expand_vars(word, cfg);
+    if t.is_empty() || t.contains(['$', '`']) {
+        return None;
+    }
+    // A URL whose path happens to end like a settings file is not a file here.
+    if t.contains("://") && !t.starts_with("file://") {
+        return None;
+    }
+    if t.contains(['*', '?', '[']) {
+        if t.len() > MAX_GLOB_LEN {
+            return None;
+        }
+        let abs = if t.starts_with('/') { t.clone() } else { format!("{}/{t}", cfg.cwd.to_string_lossy().trim_end_matches('/')) };
+        return glob_matches(&abs, 64).into_iter().find_map(|m| {
+            let full = resolve_path(&m, cfg);
+            guarded_kind(&full, cfg).map(|_| full)
+        });
+    }
+    let full = resolve_path(&t, cfg);
+    guarded_kind(&full, cfg).map(|_| full)
+}
 
-fn guard_config_deny() -> Decision {
-    Decision::deny("guard-config", GUARD_CONFIG_REASON)
+/// A word the guard cannot resolve (an unexpanded `$VAR`, a backtick) that spells a protected
+/// file's own name: `"$D/agentkit.toml"`, `$X/.codex/hooks.json`.
+fn unresolved_protected(word: &str, cfg: &GuardConfig) -> Option<String> {
+    const NAMES: &[&str] = &[
+        "agentkit.toml", "guards.toml", "guards-accepted.json", "hooks.json", ".claude/settings.json",
+        ".claude/settings.local.json", ".codex/config.toml", ".config/agentkit/",
+    ];
+    let t = expand_vars(word, cfg);
+    (t.contains(['$', '`']) && NAMES.iter().any(|n| t.contains(n))).then_some(t)
+}
+
+/// Every path a command's words may name: each argument, the value of `--opt=VALUE` or
+/// `name=VALUE`, the value glued to a short option, and the values assigned in front of the
+/// program (`GIT_WORK_TREE=dir git apply`).
+fn unit_path_words(u: &Unit) -> Vec<String> {
+    let mut out = Vec::new();
+    for a in u.argv.iter().skip(1) {
+        out.extend(word_paths(a));
+        if let Some(v) = glued_value(a) {
+            out.push(v.to_string());
+        }
+    }
+    out.extend(assignments(&u.text).into_iter().map(|(_, v)| v));
+    out
+}
+
+/// Programs that only read the files they are given, or do not touch files at all. Every other
+/// program handed a protected path is taken to write it: until 28 Nov 2026 the rule was the
+/// other way round (a list of writers), so `ed`, `patch`, `yq -i` and anything else not on the
+/// list could edit the site config and switch the guards off.
+const CONFIG_READERS: &[&str] = &[
+    "cat", "head", "tail", "less", "more", "bat", "wc", "ls", "stat", "file", "grep", "egrep", "fgrep", "rg", "ag",
+    "jq", "diff", "cmp", "comm", "shasum", "sha256sum", "sha1sum", "md5", "md5sum", "cksum", "du", "df", "tree",
+    "test", "[", "[[", "nl", "od", "hexdump", "strings", "basename", "dirname", "realpath", "readlink", "echo",
+    "printf", "cut", "tr", "sort", "column", "which", "type", "pwd", "true", "false", "export", "local", "declare",
+    "typeset", "readonly", "unset", "set", "return", "exit", "agent-mail", "agentkit",
+];
+
+/// Programs with a rule of their own in `guard_config` that knows which of their operands is
+/// written: a copy's source is read, its destination written.
+const COPIERS: &[&str] = &["cp", "gcp", "rsync", "ditto", "install", "ln", "link", "rclone", "scp", "mv"];
+
+/// `tar` making or listing an archive reads the files it is given. The archive itself is
+/// written, so it is returned to be judged on its own.
+fn tar_reads(argv: &[String]) -> Option<Option<&str>> {
+    let mut makes = false;
+    let mut archive = None;
+    let mut i = 1;
+    while i < argv.len() {
+        let a = argv[i].as_str();
+        if a == "--create" || a == "--list" {
+            makes = true;
+        } else if matches!(a, "--extract" | "--get" | "--append" | "--update" | "--delete") {
+            return None;
+        } else if a == "--file" {
+            archive = argv.get(i + 1).map(String::as_str);
+            i += 1;
+        } else if let Some(v) = a.strip_prefix("--file=") {
+            archive = Some(v);
+        } else if !a.starts_with("--") && (a.starts_with('-') || i == 1) {
+            let cluster = a.trim_start_matches('-');
+            if cluster.contains(['x', 'r', 'u']) {
+                return None;
+            }
+            makes |= cluster.contains(['c', 't']);
+            if cluster.ends_with('f') {
+                archive = argv.get(i + 1).map(String::as_str);
+                i += 1;
+            }
+        }
+        i += 1;
+    }
+    makes.then_some(archive)
+}
+
+/// Does this command only read the files it names?
+fn config_reader(u: &Unit) -> bool {
+    let prog = u.prog();
+    match prog {
+        "find" => is_readonly_ledger_unit(u),
+        // `less -o file` copies its input to a file.
+        "less" => !u.argv.iter().skip(1).any(|a| a.starts_with("-o") || a.starts_with("-O") || a.starts_with("--log-file")),
+        "sed" | "gsed" | "awk" | "gawk" | "mawk" => !edits_in_place(&u.argv),
+        _ => CONFIG_READERS.contains(&prog),
+    }
+}
+
+/// git subcommands that read the work tree or record it, and never write a file in it.
+const GIT_READS: &[&str] = &[
+    "status", "diff", "log", "show", "blame", "annotate", "add", "stage", "commit", "ls-files", "ls-tree", "grep",
+    "cat-file", "rev-parse", "rev-list", "check-ignore", "check-attr", "describe", "branch", "fetch", "push",
+    "remote", "tag", "shortlog", "merge-base", "for-each-ref", "show-ref", "diff-tree", "diff-index", "diff-files",
+    "name-rev", "reflog", "version", "help", "count-objects", "ls-remote", "var", "whatchanged", "range-diff",
+];
+
+/// The subcommand of a git command line: the first word that is not an option or an option's
+/// value.
+fn git_subcommand(argv: &[String]) -> Option<&str> {
+    let mut i = 1;
+    while i < argv.len() {
+        let a = argv[i].as_str();
+        if matches!(a, "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--exec-path" | "--super-prefix" | "--config-env") {
+            i += 2;
+        } else if a.starts_with('-') {
+            i += 1;
+        } else {
+            return Some(a);
+        }
+    }
+    None
+}
+
+/// An inline script's statement that moves, removes, replaces or locks what it names.
+fn script_changes_tree(stmt: &str) -> bool {
+    compiled(
+        r"shutil\.|os\.(?:rename|replace|remove|unlink|rmdir|removedirs|symlink|link|chmod|chown)|\.(?:unlink|rmdir|rename|symlink_to|hardlink_to|chmod)\s*\(|rmSync|renameSync|rmdirSync|unlinkSync|symlinkSync|chmodSync|FileUtils\.|File\.(?:delete|rename|unlink|symlink|chmod)|rmtree|remove_tree",
+    )
+    .is_match(stmt)
+}
+
+/// An inline script (`python3 -c`, `perl -e`, a here-document fed to an interpreter) that
+/// writes a protected path: it names one exactly (as written, or relative to home, which is
+/// how `Path.home() / ".config/…"` spells it) and writes anything at all; or one statement of
+/// it both names a folder that holds protected files and moves, removes or replaces something.
+/// A script that reads a file elsewhere under `~/.config` or `~/.local/state`, or writes a
+/// file whose text mentions such a path, names no protected file and is not refused.
+fn script_write_hit(text: &str, vars: &[(String, String)], cfg: &GuardConfig) -> Option<(String, String)> {
+    let mut at_home = cfg.clone();
+    at_home.cwd = cfg.home.clone();
+    if script_writes(text) || script_changes_tree(text) {
+        let named = file_words(text, vars)
+            .iter()
+            .find_map(|w| protected_exact(w, cfg).or_else(|| if w.starts_with('.') { protected_exact(w, &at_home) } else { None }));
+        if let Some(path) = named {
+            return Some((path, "an inline script that writes files names it".into()));
+        }
+    }
+    for stmt in text.split(['\n', ';']) {
+        if !script_changes_tree(stmt) {
+            continue;
+        }
+        if let Some(path) = file_words(stmt, vars).iter().find_map(|w| guarded_shell_path(w, cfg)) {
+            return Some((path, "an inline script moves, removes or replaces it, or the folder that holds it".into()));
+        }
+    }
+    None
+}
+
+const GUARD_CONFIG_REASON: &str = "agentkit's site config, the hook files that run the guards and the programs they run are not written by agents: a change there can switch every guard off. Reading them is fine (cat, grep, jq, the Read tool). Site config is the owner's to change; `agentkit sync --apply` regenerates the hook files from it. For other Claude or Codex settings, use the Edit tool on the file and leave its hooks, env, command keys and disableAllHooks as they are; that is allowed.";
+
+/// A refusal that names what would be written and why the guard thinks so.
+fn config_deny(path: &str, how: &str) -> Decision {
+    Decision::deny("guard-config", format!("Refused for `{path}`: {how}. {GUARD_CONFIG_REASON}"))
 }
 
 /// The file as a Write, Edit or MultiEdit would leave it; None when that cannot be known (the
@@ -3620,13 +4105,34 @@ fn codex_hook_keys(v: &toml::Value) -> std::collections::BTreeMap<String, String
     out
 }
 
+/// Every leaf value of a Codex config by its key path (segments joined by U+001F, since a
+/// project key is a path with dots in it).
+fn codex_leaves(v: &toml::Value) -> std::collections::BTreeMap<String, String> {
+    fn walk(v: &toml::Value, path: &str, out: &mut std::collections::BTreeMap<String, String>) {
+        match v.as_table() {
+            Some(t) if !t.is_empty() => {
+                for (k, child) in t {
+                    let next = if path.is_empty() { k.clone() } else { format!("{path}\u{1f}{k}") };
+                    walk(child, &next, out);
+                }
+            }
+            _ => {
+                out.insert(path.to_string(), v.to_string());
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(v, "", &mut out);
+    out
+}
+
 /// A Write, Edit or MultiEdit of a protected file, or of any JSON file that it would give a
 /// `disableAllHooks` it did not have.
 fn guard_config_file(path: &str, value: &Value, cfg: &GuardConfig) -> Decision {
     let full = resolve_path(&expand_vars(path, cfg), cfg);
     let kind = guarded_kind(&full, cfg);
     if kind == Some(Guarded::Whole) {
-        return guard_config_deny();
+        return config_deny(&full, "no agent writes this file");
     }
     if kind.is_none() && !full.to_ascii_lowercase().ends_with(".json") {
         return Decision::allow();
@@ -3642,15 +4148,19 @@ fn guard_config_file(path: &str, value: &Value, cfg: &GuardConfig) -> Decision {
             Some(after) => disable_count(&after) > disable_count(&disk),
             None => tool == "NotebookEdit" && loose_disable_count(&value.to_string()) > 0,
         };
-        return if added { guard_config_deny() } else { Decision::allow() };
+        return if added { config_deny(&full, "the edit adds a `disableAllHooks` key, which switches every hook off wherever Claude reads the file") } else { Decision::allow() };
     }
     let Some(kind) = kind else { return Decision::allow() };
     let Some(after) = edited_contents(value, &disk) else {
         // NotebookEdit, or an edit that will not apply: nothing a hook needs to allow here.
         let tool = tool_name_of(value).unwrap_or("");
-        return if matches!(tool, "Edit" | "MultiEdit" | "replace_file_content" | "multi_replace_file_content" | "edit_file") { Decision::allow() } else { guard_config_deny() };
+        return if matches!(tool, "Edit" | "MultiEdit" | "replace_file_content" | "multi_replace_file_content" | "edit_file") {
+            Decision::allow()
+        } else {
+            config_deny(&full, "the guard cannot tell what this tool would leave in the file")
+        };
     };
-    let same = match kind {
+    let changed: Option<String> = match kind {
         Guarded::ClaudeSettings => {
             let before: Value = serde_json::from_str(&disk).unwrap_or(Value::Null);
             match serde_json::from_str::<Value>(&after) {
@@ -3658,39 +4168,168 @@ fn guard_config_file(path: &str, value: &Value, cfg: &GuardConfig) -> Decision {
                     let off = next.get("disableAllHooks").is_some_and(|v| !matches!(v, Value::Bool(false) | Value::Null));
                     // `disableAllHooks` as a key at any depth, any case, escapes decoded.
                     let added = json_disable_count(&after).unwrap_or(usize::MAX) > disable_count(&disk);
-                    !off && !added && next.get("hooks") == before.get("hooks")
+                    // Only the top-level keys on the allow-list may differ afterwards. Until 28
+                    // Nov 2026 only `hooks` was compared, so an agent could add an `env` block
+                    // (the hook's own environment), a `statusLine` command, or switch a plugin
+                    // or a project's MCP servers on.
+                    let empty = serde_json::Map::new();
+                    let old = before.as_object().unwrap_or(&empty);
+                    let changed_key = match next.as_object() {
+                        Some(new) => old
+                            .keys()
+                            .chain(new.keys())
+                            .find(|k| old.get(*k) != new.get(*k) && !crate::generate::CLAUDE_AGENT_MAY_CHANGE.contains(&k.as_str()))
+                            .cloned(),
+                        None => Some("(the whole file)".into()),
+                    };
+                    if off || added {
+                        Some("the edit sets or adds `disableAllHooks`".into())
+                    } else {
+                        changed_key.map(|k| {
+                            let why = match k.as_str() {
+                                "hooks" => "the hooks are how the guards run",
+                                "env" => "it is the environment every hook runs in",
+                                k if crate::generate::CLAUDE_RUNS_OR_ENV.contains(&k) => "it runs or loads code outside the guards",
+                                _ => "it is not one of the keys agents change",
+                            };
+                            format!(
+                                "the edit changes its `{k}` key, and {why}. An agent may change only: {}",
+                                crate::generate::CLAUDE_AGENT_MAY_CHANGE.join(", ")
+                            )
+                        })
+                    }
                 }
-                Err(_) => false,
+                Err(_) => Some("the edit would leave it unparseable as JSON, so its hooks cannot be compared".into()),
             }
         }
         Guarded::CodexConfig => {
             let before: Option<toml::Value> = toml::from_str(&disk).ok();
             match toml::from_str::<toml::Value>(&after) {
-                Ok(next) => before.as_ref().map(codex_hook_keys).unwrap_or_default() == codex_hook_keys(&next),
-                Err(_) => false,
+                Ok(next) if before.as_ref().map(codex_hook_keys).unwrap_or_default() == codex_hook_keys(&next) => {
+                    // And nothing but the allow-listed keys differs, at the top level or inside
+                    // a profile: `notify` runs a program, `mcp_servers` starts them,
+                    // `approval_policy` and `sandbox_mode` are the approval posture.
+                    let old = before.as_ref().map(codex_leaves).unwrap_or_default();
+                    let new = codex_leaves(&next);
+                    let may = crate::generate::CODEX_AGENT_MAY_CHANGE;
+                    let allowed = |path: &str| {
+                        let parts: Vec<&str> = path.split('\u{1f}').collect();
+                        match parts.as_slice() {
+                            [key] => may.contains(key),
+                            ["profiles", _, key] => may.contains(key),
+                            _ => false,
+                        }
+                    };
+                    old.keys()
+                        .chain(new.keys())
+                        .find(|k| old.get(*k) != new.get(*k) && !allowed(k))
+                        .map(|k| {
+                            format!(
+                                "the edit changes its `{}` key, which is not one agents change. An agent may change only: {} (also inside a profile)",
+                                k.replace('\u{1f}', "."),
+                                may.join(", ")
+                            )
+                        })
+                }
+                Ok(_) => Some("the edit changes a hooks, features or profile key".into()),
+                Err(_) => Some("the edit would leave it unparseable as TOML, so its hook keys cannot be compared".into()),
             }
         }
-        Guarded::Whole => false,
+        Guarded::Whole => Some("no agent writes this file".into()),
     };
-    if same { Decision::allow() } else { guard_config_deny() }
+    match changed {
+        None => Decision::allow(),
+        Some(how) => config_deny(&full, &how),
+    }
 }
 
-/// Shell writes to the guard config and hook files: a redirect, `tee`, `sed -i`, `cp`/`mv`/`ln`
-/// onto them, moving or removing them (or a folder that holds them), `chmod`, a `git`
-/// checkout over them, an inline script that writes them. Reading them is fine.
+/// The files a patch envelope names (`*** Update File: path`, `*** Add File:`, `*** Delete
+/// File:`, `*** Move to:`), found in any string of a tool call's input. Codex's `apply_patch`
+/// writes files without a shell and without the file-tool fields `file_target` reads, so
+/// until 28 Nov 2026 a patch to the site config passed every guard unjudged.
+fn patch_targets(value: &Value) -> Vec<String> {
+    fn walk(v: &Value, out: &mut Vec<String>) {
+        match v {
+            Value::String(s) => {
+                for line in s.lines() {
+                    let line = line.trim_start();
+                    for mark in ["*** Update File:", "*** Add File:", "*** Delete File:", "*** Move to:"] {
+                        if let Some(path) = line.strip_prefix(mark) {
+                            let path = path.trim();
+                            if !path.is_empty() {
+                                out.push(path.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            Value::Array(a) => a.iter().for_each(|x| walk(x, out)),
+            Value::Object(m) => m.values().for_each(|x| walk(x, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    if let Some(input) = tool_input_of(value) {
+        walk(input, &mut out);
+    }
+    for key in ["input", "patch", "arguments"] {
+        if let Some(v) = value.get(key) {
+            walk(v, &mut out);
+        }
+    }
+    out
+}
+
+/// A patch that names a protected path. What the file would hold afterwards is not computed,
+/// so a settings file that an `Edit` may change (leaving its hooks alone) is refused here too.
+fn guard_config_patch(paths: &[String], cfg: &GuardConfig) -> Decision {
+    for path in paths {
+        let full = resolve_path(&expand_vars(path, cfg), cfg);
+        if guarded_kind(&full, cfg).is_some() {
+            return config_deny(&full, "a patch names it, and the guard cannot see what the patch would leave there");
+        }
+    }
+    Decision::allow()
+}
+
+/// Shell writes to the guard config, the hook files and the programs the hooks run. The rule
+/// is by what is touched: a command that is not known only to read, given a protected path in
+/// any word, option value or assignment in front of it, is refused. On top of that the
+/// commands whose target is not simply a word are followed: a redirect, a copy's destination
+/// (and what its sources would land on), moving or removing a folder that holds a protected
+/// file, a `git` command that rewrites the work tree, an output or extract option, an inline
+/// script that writes. Reading these files is fine, and so is text that only mentions them (a
+/// message, the content of a here-document written to another file). Every refusal names the
+/// path it is about.
 fn guard_config(cmd: &str, cfg: &GuardConfig) -> Decision {
-    let bare = without_quoting(cmd);
+    // Before any fast path: a write aimed at the ledger, its key, its folder, or the ledger
+    // under another name (a hard link made earlier, found by inode).
+    if let Some((path, how)) = ledger_write_hit(cmd, cfg) {
+        return config_deny(&path, &how);
+    }
+    // What a file is given to hold and what a message says are not on the line.
+    let line_owned = without_data_heredocs(cmd);
+    let line = line_owned.as_str();
+    let bare = without_quoting(line);
     let dirs = agentkit_config_dirs(cfg);
     let mut needles: Vec<String> = [
         ".config", "agentkit.toml", "guards.toml", "settings.json", "settings.local.json", "hooks.json", "config.toml",
         ".claude", ".codex", ".cursor", "accept-guards", "guards-accepted",
-        "decisions.jsonl", "ledger.key", "state/agentkit", ".local",
+        "decisions.jsonl", "ledger.key", "state/agentkit", ".local", "tripwire",
     ]
     .iter()
     .map(|s| (*s).to_string())
     .collect();
     needles.extend(cfg.config_dir.iter().filter_map(|d| d.file_name().map(|n| n.to_string_lossy().into_owned())));
     needles.extend(ledger_needles(cfg));
+    let default_bin = crate::site::default_hook_bin(&cfg.home);
+    for bin in cfg.hook_bins() {
+        needles.extend(bin.file_name().map(|n| n.to_string_lossy().into_owned()));
+        // A hook binary installed somewhere of the site's own: its folder's name too.
+        if bin.parent() != default_bin.parent() {
+            needles.extend(bin.parent().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()));
+        }
+    }
     let here = resolve_path(&cfg.cwd.to_string_lossy(), cfg);
     let home = resolve_path(&cfg.home.to_string_lossy(), cfg);
     let roots: Vec<String> = [".claude", ".codex", ".cursor", ".config"]
@@ -3698,33 +4337,61 @@ fn guard_config(cmd: &str, cfg: &GuardConfig) -> Decision {
         .map(|r| format!("{home}/{r}"))
         .chain(dirs.iter().cloned())
         .chain(ledger_dirs(cfg))
+        .chain(hook_bin_paths(cfg).iter().filter_map(|b| b.rfind('/').map(|j| b[..j].to_string())))
+        .chain(std::iter::once(tripwire_paths(cfg).0))
         .collect();
     let in_root = |d: &str| roots.iter().any(|r| d == r || d.starts_with(&format!("{r}/")));
     // A glob or a variable can name these files without any of the words (`~/.c*/a*/a*.toml`).
-    let dynamic = cmd.contains(['*', '?', '[', '$', '`']);
+    let dynamic = line.contains(['*', '?', '[', '$', '`']);
     // A copy can carry a hook folder in its source without naming one (`rsync -a /tmp/x/ ~/`).
-    let copies = compiled(r"\b(?:cp|rsync|ditto|install|rclone|mv|ln|gcp)\b").is_match(cmd);
-    // Before any fast path: a write aimed at the ledger, its key, its folder, or the ledger
-    // under another name (a hard link made earlier, found by inode).
-    if ledger_write_hit(cmd, cfg) {
-        return guard_config_deny();
-    }
-    if !dynamic && !copies && !needles.iter().any(|n| cmd.contains(n.as_str()) || bare.contains(n.as_str())) && !in_root(&here) {
+    let copies = compiled(r"\b(?:cp|rsync|ditto|install|rclone|mv|ln|gcp|scp)\b").is_match(line);
+    if !dynamic && !copies && !needles.iter().any(|n| line.contains(n.as_str()) || bare.contains(n.as_str())) && !in_root(&here) {
         return Decision::allow();
     }
     let all = units_deep(cmd);
-    let vars = literal_assignments(cmd);
-    let subst = |t: &str| vars.iter().fold(t.to_string(), |acc, (n, v)| acc.replace(&format!("${{{n}}}"), v).replace(&format!("${n}"), v));
+    let mut vars = literal_assignments(line);
+    fn subst_vars(t: &str, vars: &[(String, String)]) -> String {
+        vars.iter().fold(t.to_string(), |acc, (n, v)| acc.replace(&format!("${{{n}}}"), v).replace(&format!("${n}"), v))
+    }
     let mut local = cfg.clone();
     let mut stack: Vec<PathBuf> = Vec::new();
-    let named_in_text = |text: &str, c: &GuardConfig| file_words(text, &vars).iter().any(|w| guarded_shell_hit(w, c));
-    let accepts = bare.contains("accept-guards");
-    if any_unparsed(&all) && (named_in_text(cmd, &local) || in_root(&here) || accepts) {
-        return guard_config_deny();
+    // A part of the line that could not be read (a quote that never closes, `$'…'` quoting,
+    // nesting too deep): refused when that part names a protected path, or the shell is in a
+    // hook or config folder. Other parts of the line, and file content, do not count.
+    for u in all.iter().filter(|u| u.unparsed) {
+        const WHY: &str = "this part of the line cannot be read (a quote that never closes, `$'…'` quoting, or nesting too deep) and names it";
+        if let Some(path) = file_words(&u.text, &vars).iter().find_map(|w| guarded_shell_path(w, &local)) {
+            return config_deny(&path, WHY);
+        }
+        if in_root(&here) {
+            return config_deny(&here, "part of the line cannot be read and the shell's working folder is this hook or config folder");
+        }
+        if without_quoting(&u.text).contains("accept-guards") {
+            return config_deny("--accept-guards", "part of the line cannot be read and names the owner's acceptance step");
+        }
     }
+    let accepts = bare.contains("accept-guards");
+    // What an earlier command in a pipe printed for `xargs` to hand on.
+    let mut fed: Option<String> = None;
     for u in &all {
         let prog = u.prog();
         let operands = u.operands();
+        let certain = !u.guessed && !u.later && !u.unparsed;
+        // `for f in A B; do edit "$f"`: the loop variable is a protected path when a word of
+        // the list is, so the body is judged as if it named that path.
+        if certain && prog == "for" && u.argv.get(2).map(String::as_str) == Some("in") {
+            let name = u.argv[1].clone();
+            let listed: Vec<String> = u
+                .argv
+                .iter()
+                .skip(3)
+                .map(|w| subst_vars(w, &vars))
+                .filter(|w| protected_exact(w, &local).is_some() || unresolved_protected(w, &local).is_some())
+                .collect();
+            vars.extend(listed.into_iter().map(|w| (name.clone(), w)));
+            continue;
+        }
+        let subst = |t: &str| subst_vars(t, &vars);
         // `agentkit doctor --accept-guards` is the owner's acceptance of a guard switched off;
         // an agent running it would launder its own config change. A search for the words, a
         // commit message or mail that names it is text.
@@ -3756,121 +4423,286 @@ fn guard_config(cmd: &str, cfg: &GuardConfig) -> Decision {
         }
         // A literal assignment on the line is substituted; a target the guard still cannot
         // resolve (a glob, `$`, a backtick) counts when it could land on a protected path.
-        let hit = |t: &str| {
+        let hit = |t: &str| -> Option<String> {
             let t = subst(t);
-            guarded_shell_hit(&t, &local) || guarded_dynamic(&t, &local)
+            guarded_shell_path(&t, &local).or_else(|| guarded_dynamic(&t, &local).then(|| t.clone()))
         };
-        // Output and extract-directory options aimed at a protected path: `curl -o`,
-        // `unzip -d`, `tar -C ... -x`, `sort -o`. Programs that only read are left out.
-        let out_flag = (!READERS.contains(&prog) || prog == "sort")
-            && !matches!(prog, "git" | "ssh" | "grep" | "rg" | "find" | "du" | "jq" | "agentkit")
-            && u.argv.iter().enumerate().skip(1).any(|(i, a)| {
-                let value = if matches!(a.as_str(), "-o" | "-O" | "-d" | "-C" | "--output" | "--output-document" | "--output-dir" | "--directory") {
-                    u.argv.get(i + 1).map(String::as_str)
-                } else if let Some((name, v)) = a.split_once('=') {
-                    matches!(name, "--output" | "--output-document" | "--output-dir" | "--directory").then_some(v)
-                } else if a.starts_with("-o") && !a.starts_with("--") && a.len() > 2 {
-                    Some(&a[2..])
-                } else {
-                    None
-                };
-                value.is_some_and(|v| hit(v))
-            });
-        let any = operands.iter().any(|t| hit(t));
-        // Copy-type writers. The destination is `-t DIR` / `--target-directory[=]DIR` when
-        // given; otherwise any operand after the first may be it (flags and their values move
-        // the last word). What each source would leave behind is judged too: a `.claude`
-        // folder (or one inside the source) landing where one already is, or on a protected
-        // path, is a write to hooks (`cp -r /tmp/x/.claude proj/`, `rsync -a /tmp/x/ ~/`).
-        let onto = {
-            let mut target: Option<String> = None;
-            let mut i = 1;
-            while i < u.argv.len() {
-                let a = u.argv[i].as_str();
-                if a == "-t" || a == "--target-directory" {
-                    target = u.argv.get(i + 1).cloned();
-                    i += 1;
-                } else if let Some(v) = a.strip_prefix("--target-directory=") {
-                    target = Some(v.to_string());
-                } else if let Some(v) = a.strip_prefix("-t").filter(|v| !v.is_empty() && !a.starts_with("--")) {
-                    target = Some(v.to_string());
-                }
-                i += 1;
+        // The exact rule, for a program the guard has no special knowledge of.
+        let exact = |t: &str| -> Option<String> {
+            let t = subst(t);
+            protected_exact(&t, &local).or_else(|| unresolved_protected(&t, &local))
+        };
+        let refuse = |path: &str, how: String| Some(config_deny(path, &how));
+        let decision: Option<Decision> = 'unit: {
+            // 1. A redirect onto a protected path.
+            if let Some(path) = live_redirect_targets(&u.text).iter().find_map(|t| hit(t)) {
+                break 'unit refuse(&path, "a redirect on the line writes it".into());
             }
-            let (sources, dests): (Vec<String>, Vec<String>) = match &target {
-                Some(t) => (operands.iter().filter(|o| **o != t.as_str()).map(|s| s.to_string()).collect(), vec![t.clone()]),
-                None if operands.len() >= 2 => (
-                    operands[..operands.len() - 1].iter().map(|s| s.to_string()).collect(),
-                    operands[1..].iter().map(|s| s.to_string()).collect(),
-                ),
-                None => (Vec::new(), operands.iter().map(|s| s.to_string()).collect()),
-            };
-            dests.iter().any(|d| hit(d))
-                || dests.iter().any(|dest| {
+            // 2. Output and extract-directory options aimed at a protected path: `curl -o`,
+            // `unzip -d`, `tar -C ... -x`, `sort -o`. Programs that only read are left out.
+            if (!READERS.contains(&prog) || prog == "sort")
+                && !matches!(prog, "git" | "ssh" | "grep" | "rg" | "find" | "du" | "jq" | "agentkit")
+            {
+                for (i, a) in u.argv.iter().enumerate().skip(1) {
+                    let value = if matches!(a.as_str(), "-o" | "-O" | "-d" | "-C" | "--output" | "--output-document" | "--output-dir" | "--directory") {
+                        u.argv.get(i + 1).map(String::as_str)
+                    } else if let Some((name, v)) = a.split_once('=') {
+                        matches!(name, "--output" | "--output-document" | "--output-dir" | "--directory").then_some(v)
+                    } else if a.starts_with("-o") && !a.starts_with("--") && a.len() > 2 {
+                        Some(&a[2..])
+                    } else {
+                        None
+                    };
+                    if let Some(path) = value.and_then(|v| hit(v)) {
+                        break 'unit refuse(&path, format!("`{prog}` is told to write its output there (`{a}`)"));
+                    }
+                }
+            }
+            // 3. git. A subcommand that only reads or records the work tree may name anything.
+            // Any other one is refused when a word, an option value (`-C`, `--work-tree=`), a
+            // `GIT_WORK_TREE=`/`GIT_DIR=` in front or the shell's own folder puts it on a
+            // protected path; the ones that rewrite files, also for a folder that holds one.
+            if prog == "git" {
+                let sub = git_subcommand(&u.argv).unwrap_or("");
+                // `--output` writes a file whatever the subcommand (`git diff --output=F`).
+                for (i, a) in u.argv.iter().enumerate().skip(1) {
+                    let value = match a.split_once('=') {
+                        Some(("--output", v)) => Some(v),
+                        _ if a == "--output" || a == "-o" => u.argv.get(i + 1).map(String::as_str),
+                        _ => None,
+                    };
+                    if let Some(path) = value.and_then(|v| hit(v)) {
+                        break 'unit refuse(&path, format!("`git {sub}` is told to write its output there"));
+                    }
+                }
+                if !GIT_READS.contains(&sub) {
+                    let rewrites = matches!(
+                        sub,
+                        "checkout" | "restore" | "reset" | "stash" | "apply" | "am" | "pull" | "merge" | "rebase" | "clean"
+                            | "mv" | "rm" | "switch" | "cherry-pick" | "revert"
+                    ) || u.argv.iter().any(|a| {
+                        matches!(a.as_str(), "checkout" | "restore" | "reset" | "stash" | "apply" | "am" | "pull" | "merge" | "rebase" | "clean" | "mv" | "rm" | "switch" | "cherry-pick" | "revert")
+                    });
+                    let mut words = unit_path_words(u);
+                    words.extend(vars.iter().filter(|(n, _)| n.starts_with("GIT_")).map(|(_, v)| v.clone()));
+                    if let Some(path) = words.iter().find_map(|w| exact(w)) {
+                        break 'unit refuse(&path, format!("`git {sub}` can write there and is not a git command known only to read"));
+                    }
+                    if rewrites && let Some(path) = operands.iter().find_map(|t| hit(t)) {
+                        break 'unit refuse(&path, format!("`git {sub}` rewrites files in the work tree"));
+                    }
+                    let cwd = resolve_path(&local.cwd.to_string_lossy(), &local);
+                    if u.remote.is_none()
+                        && let Some(dir) = dirs.iter().find(|d| cwd == **d || cwd.starts_with(&format!("{d}/")))
+                    {
+                        break 'unit refuse(dir, format!("`git {sub}` runs in agentkit's config folder and is not a git command known only to read"));
+                    }
+                }
+                break 'unit None;
+            }
+            // 4. Copy-type writers. The destination is `-t DIR` / `--target-directory[=]DIR` when
+            // given; otherwise any operand after the first may be it (flags and their values move
+            // the last word). What each source would leave behind is judged too: a `.claude`
+            // folder (or one inside the source) landing where one already is, or on a protected
+            // path, is a write to hooks (`cp -r /tmp/x/.claude proj/`, `rsync -a /tmp/x/ ~/`); so
+            // is a file named like a hook program landing in the folder that holds it.
+            let onto = || -> Option<String> {
+                let mut target: Option<String> = None;
+                let mut i = 1;
+                while i < u.argv.len() {
+                    let a = u.argv[i].as_str();
+                    if a == "-t" || a == "--target-directory" {
+                        target = u.argv.get(i + 1).cloned();
+                        i += 1;
+                    } else if let Some(v) = a.strip_prefix("--target-directory=") {
+                        target = Some(v.to_string());
+                    } else if let Some(v) = a.strip_prefix("-t").filter(|v| !v.is_empty() && !a.starts_with("--")) {
+                        target = Some(v.to_string());
+                    }
+                    i += 1;
+                }
+                let (sources, dests): (Vec<String>, Vec<String>) = match &target {
+                    Some(t) => (operands.iter().filter(|o| **o != t.as_str()).map(|s| s.to_string()).collect(), vec![t.clone()]),
+                    None if operands.len() >= 2 => (
+                        operands[..operands.len() - 1].iter().map(|s| s.to_string()).collect(),
+                        operands[1..].iter().map(|s| s.to_string()).collect(),
+                    ),
+                    None => (Vec::new(), operands.iter().map(|s| s.to_string()).collect()),
+                };
+                if let Some(path) = dests.iter().find_map(|d| hit(d)) {
+                    return Some(path);
+                }
+                let home = resolve_path(&local.home.to_string_lossy(), &local);
+                let configs = agentkit_config_dirs(&local);
+                // Names that are protected where they land: the hook programs, tripwire's folder
+                // and config.
+                let bin_names: Vec<String> = hook_bin_paths(&local)
+                    .iter()
+                    .map(|b| base_name(b).to_string())
+                    .chain(["tripwire".to_string(), "tripwire.json".to_string()])
+                    .collect();
+                for dest in &dests {
                     let d = resolve_path(&expand_vars(&subst(dest), &local), &local);
                     let d = d.trim_end_matches('/');
-                    sources.iter().filter(|s| *s != dest).any(|src| {
+                    for src in sources.iter().filter(|s| *s != dest) {
                         let raw = subst(src);
                         let contents = raw.ends_with('/') || raw.ends_with("/.");
-                        let s = resolve_path(&expand_vars(&raw, &local), &local);
-                        let s = s.trim_end_matches('/');
-                        let base = base_name(s);
-                        // Where the source, and any hook folder inside it, would land.
-                        let mut landings: Vec<String> = Vec::new();
-                        if !contents {
-                            landings.push(format!("{d}/{base}"));
-                        }
-                        for h in HOOK_DIRS.iter().chain([".config"].iter()) {
-                            if Path::new(&format!("{s}/{h}")).exists() {
-                                landings.push(format!("{d}/{h}"));
-                                if !contents {
-                                    landings.push(format!("{d}/{base}/{h}"));
+                        let expanded = expand_vars(&raw, &local);
+                        // A glob in the source is what the shell makes of it.
+                        let each: Vec<String> = if expanded.contains(['*', '?', '[']) && !expanded.contains(['$', '`']) && expanded.len() <= MAX_GLOB_LEN {
+                            let abs = if expanded.starts_with('/') {
+                                expanded.clone()
+                            } else {
+                                format!("{}/{expanded}", local.cwd.to_string_lossy().trim_end_matches('/'))
+                            };
+                            glob_matches(&abs, 256)
+                        } else {
+                            vec![resolve_path(&expanded, &local)]
+                        };
+                        for s in &each {
+                            let s = s.trim_end_matches('/');
+                            let base = base_name(s);
+                            // Where the source, and any hook folder or hook program inside it,
+                            // would land.
+                            let mut landings: Vec<String> = Vec::new();
+                            if !contents {
+                                landings.push(format!("{d}/{base}"));
+                            }
+                            for h in HOOK_DIRS.iter().copied().chain([".config"]).chain(bin_names.iter().map(String::as_str)) {
+                                if Path::new(&format!("{s}/{h}")).exists() {
+                                    landings.push(format!("{d}/{h}"));
+                                    if !contents {
+                                        landings.push(format!("{d}/{base}/{h}"));
+                                    }
                                 }
                             }
+                            let landed = landings.into_iter().find(|to| {
+                                let parent = to.rfind('/').map(|j| &to[..j]).unwrap_or("");
+                                // a protected file, a hook folder merged into one that is there (or
+                                // made at home), or over agentkit's config folder or its parent
+                                guarded_kind(to, &local).is_some()
+                                    || (HOOK_DIRS.contains(&base_name(to)) && (Path::new(to).exists() || parent == home))
+                                    || configs.iter().any(|c| c == to || c.starts_with(&format!("{to}/")))
+                            });
+                            if landed.is_some() {
+                                return landed;
+                            }
                         }
-                        let home = resolve_path(&local.home.to_string_lossy(), &local);
-                        let configs = agentkit_config_dirs(&local);
-                        landings.iter().any(|to| {
-                            let parent = to.rfind('/').map(|j| &to[..j]).unwrap_or("");
-                            // a protected file, a hook folder merged into one that is there (or
-                            // made at home), or over agentkit's config folder or its parent
-                            guarded_kind(to, &local).is_some()
-                                || (HOOK_DIRS.contains(&base_name(to)) && (Path::new(to).exists() || parent == home))
-                                || configs.iter().any(|c| c == to || c.starts_with(&format!("{to}/")))
-                        })
-                    })
+                    }
+                }
+                None
+            };
+            // A link or copy whose SOURCE is the ledger, its key or its state folder makes a second
+            // name for it (`ln decisions.jsonl notes.jsonl && : > notes.jsonl`).
+            if matches!(prog, "ln" | "link" | "cp" | "gcp" | "install" | "rsync" | "ditto" | "rclone")
+                && let Some(path) = operands.iter().find_map(|t| {
+                    let full = resolve_path(&expand_vars(&subst(t), &local), &local);
+                    (ledger_ancestor_hit(&full, &local) || guarded_kind(&full, &local).is_some_and(|_| in_ledger_dir(&full, &local))).then_some(full)
                 })
-        };
-        let git_rewrites = prog == "git"
-            && u.argv.iter().any(|a| {
-                matches!(a.as_str(), "checkout" | "restore" | "reset" | "stash" | "apply" | "am" | "pull" | "merge" | "rebase" | "clean" | "mv" | "rm" | "switch" | "cherry-pick" | "revert")
-            })
-            && (any
-                || u.argv.windows(2).any(|w| w[0] == "-C" && dirs.iter().any(|d| resolve_path(&expand_vars(&subst(&w[1]), &local), &local) == *d))
-                || (u.remote.is_none() && dirs.iter().any(|d| local.cwd.to_string_lossy() == *d || resolve_path(&local.cwd.to_string_lossy(), &local).starts_with(&format!("{d}/")))));
-        let wrote = redirect_targets(&u.text).iter().any(|t| hit(t))
-            || out_flag
-            || git_rewrites
-            || match prog {
-                "tee" | "truncate" | "mv" | "trash" | "rm" | "rmdir" | "unlink" | "shred" | "srm" | "sponge" | "chmod"
-                | "chflags" | "chown" | "xattr" | "mkfifo" | "mknod" => any,
-                // the files, not the script: `sed -i '' '1978s/.*/x/' f` names one file
-                "sed" | "gsed" | "perl" | "ruby" => edits_in_place(&u.argv) && script_tool_files(&u.argv).iter().any(|t| hit(t)),
-                // A link or copy whose SOURCE is the ledger, its key or its state folder makes a
-                // second name for it (`ln decisions.jsonl notes.jsonl && : > notes.jsonl`).
-                "ln" | "link" | "cp" | "gcp" | "install" | "rsync" | "ditto" | "rclone"
-                    if operands.iter().any(|t| {
-                        let full = resolve_path(&expand_vars(&subst(t), &local), &local);
-                        ledger_ancestor_hit(&full, &local) || guarded_kind(&full, &local).is_some_and(|_| in_ledger_dir(&full, &local))
-                    }) => true,
-                "cp" | "install" | "ln" | "rsync" | "ditto" | "rclone" => onto,
-                "link" => any,
-                "dd" => u.argv.iter().any(|a| a.strip_prefix("of=").is_some_and(|t| hit(t))),
-                _ => false,
+            {
+                break 'unit refuse(&path, format!("`{prog}` would make a second copy or name of the ledger"));
             }
-            || (runs_inline_script(prog) && script_writes(&u.text) && named_in_text(&u.text, &local));
-        if wrote {
-            return guard_config_deny();
+            // A link to a protected file is a second name for it: a later write to the link
+            // would not name the file at all.
+            if matches!(prog, "ln" | "link")
+                && let Some(path) = operands.iter().find_map(|t| exact(t))
+            {
+                break 'unit refuse(&path, format!("`{prog}` would make a second name for it, and a write to that name would go unseen"));
+            }
+            let named_writer = match prog {
+                "tee" | "truncate" | "trash" | "rm" | "rmdir" | "unlink" | "shred" | "srm" | "sponge" | "chmod" | "chflags"
+                | "chown" | "xattr" | "mkfifo" | "mknod" | "mv" | "link" => operands.iter().find_map(|t| hit(t)),
+                // the files, not the script: `sed -i '' '1978s/.*/x/' f` names one file
+                "sed" | "gsed" | "perl" | "ruby" if edits_in_place(&u.argv) => script_tool_files(&u.argv).iter().find_map(|t| hit(t)),
+                "dd" => u.argv.iter().find_map(|a| a.strip_prefix("of=").and_then(|t| hit(t))),
+                _ => None,
+            };
+            if let Some(path) = named_writer {
+                break 'unit refuse(&path, format!("`{prog}` changes, moves or removes what it is given"));
+            }
+            if matches!(prog, "cp" | "gcp" | "install" | "ln" | "rsync" | "ditto" | "rclone" | "scp" | "mv")
+                && let Some(path) = onto()
+            {
+                break 'unit refuse(&path, format!("`{prog}` would write there, or land a file or folder of that name there"));
+            }
+            // Removing, moving or locking a folder that holds a hook program takes it along.
+            let takes_folder = match prog {
+                "rm" | "rmdir" | "trash" | "unlink" | "shred" | "srm" | "chmod" | "chflags" | "chown" | "xattr" => operands.iter().find_map(|t| holds_hook_bin(&subst(t), &local)),
+                "mv" if operands.len() >= 2 => operands[..operands.len() - 1].iter().find_map(|t| holds_hook_bin(&subst(t), &local)),
+                "rsync" if u.argv.iter().any(|a| a.starts_with("--del") || a == "--remove-source-files") => {
+                    operands.iter().find_map(|t| holds_hook_bin(&subst(t), &local).or_else(|| {
+                        let full = resolve_path(&expand_vars(&subst(t), &local), &local);
+                        hook_bin_paths(&local).iter().any(|b| b.rfind('/').is_some_and(|j| b[..j] == *full.trim_end_matches('/'))).then_some(full)
+                    }))
+                }
+                _ => None,
+            };
+            if let Some(path) = takes_folder {
+                break 'unit refuse(&path, format!("it holds a program the hooks run or tripwire's records, and `{prog}` would remove, move or lock it"));
+            }
+            // 5. An inline script, on the command line or as a here-document's body.
+            if (runs_inline_script(prog) || (u.guessed && u.argv.is_empty()))
+                && let Some((path, how)) = script_write_hit(&u.text, &vars, &local)
+            {
+                break 'unit refuse(&path, how);
+            }
+            // 6. `sed` and `awk` read their file operands; a path in the script itself is one
+            // the script writes (`sed -n 'w FILE'`, `awk '{print > "FILE"}'`).
+            if matches!(prog, "sed" | "gsed" | "awk" | "gawk" | "mawk") {
+                let files = script_tool_files(&u.argv);
+                let in_script = u
+                    .argv
+                    .iter()
+                    .skip(1)
+                    .filter(|a| !files.contains(&a.as_str()))
+                    .find_map(|a| file_words(a, &vars).iter().find_map(|w| exact(w)));
+                if let Some(path) = in_script {
+                    break 'unit refuse(&path, format!("the `{prog}` script names it, and a script can write the files it names"));
+                }
+            }
+            // 7. A patch applied in agentkit's config folder writes files only the patch names.
+            if certain && prog == "patch" && u.remote.is_none() {
+                let cwd = resolve_path(&local.cwd.to_string_lossy(), &local);
+                if let Some(dir) = dirs.iter().find(|d| cwd == **d || cwd.starts_with(&format!("{d}/"))) {
+                    break 'unit refuse(dir, "`patch` runs in agentkit's config folder and writes the files its input names".into());
+                }
+            }
+            // 8. The general rule. A command that is certainly one (not text guessed to be a
+            // command, not a later word of another), whose program is not known only to read,
+            // has no rule of its own above and does not carry other commands that are judged
+            // themselves, given a protected path exactly.
+            if certain && !prog.is_empty() && !u.carrier && !COPIERS.contains(&prog) && !runs_inline_script(prog) {
+                let tar = if prog == "tar" { tar_reads(&u.argv) } else { None };
+                if let Some(Some(path)) = tar.map(|archive| archive.and_then(|a| exact(a))) {
+                    break 'unit refuse(&path, "`tar` would write its archive there".into());
+                }
+                let reads = config_reader(u) || tar.is_some();
+                // tripwire writes its own records and config; it is given nothing else here.
+                let own = |path: &String| is_tool(&u.argv[0], "tripwire") && is_tripwire_path(path, &local);
+                let named = unit_path_words(u).iter().filter_map(|w| exact(w)).find(|p| !own(p));
+                if !reads && let Some(path) = &named {
+                    break 'unit refuse(
+                        path,
+                        format!("`{prog}` was given it and is not a program the guard knows only reads (to read it use cat, grep, jq or the Read tool)"),
+                    );
+                }
+                // `echo PATH | xargs PROGRAM`: the path reaches a program that may write it.
+                if !reads && u.wrappers.iter().any(|w| w == "xargs") && let Some(path) = &fed {
+                    break 'unit refuse(path, format!("it is piped to `xargs {prog}`, and `{prog}` is not a program the guard knows only reads"));
+                }
+                // Only a program that prints the paths it is given feeds them on (`cat FILE |
+                // xargs` hands on what the file holds); a filter in between passes them along.
+                let prints_paths = matches!(prog, "echo" | "printf" | "ls" | "find" | "realpath" | "readlink" | "stat");
+                fed = match (u.sep.as_str(), prints_paths) {
+                    ("|", true) => named.or(fed.take()),
+                    ("|", false) => fed.take(),
+                    _ => None,
+                };
+            }
+            None
+        };
+        if let Some(d) = decision {
+            return d;
         }
     }
     Decision::allow()
@@ -3961,6 +4793,10 @@ fn is_private_key(path: &str, cfg: &GuardConfig) -> bool {
     }
     let full = key_path(path, cfg);
     let base = base_name(&full);
+    // The guards' own keys, wherever site config points `secret_paths`.
+    if GUARD_KEY_NAMES.contains(&base) && guard_keys(cfg).contains(&full) {
+        return true;
+    }
     let public = base.ends_with(".pub") || base.starts_with("known_hosts") || base.starts_with("authorized_keys")
         || base == "config" || base.starts_with("config.") || base == "agent" || base == "environment";
     let ssh = ssh_dir(cfg);
@@ -4130,6 +4966,15 @@ fn glob_matches(pattern: &str, cap: usize) -> Vec<String> {
 }
 
 fn secrets_read(path: &str, cfg: &GuardConfig) -> Decision {
+    if let Some(key) = guard_key_hit(path, cfg, true) {
+        return guard_key_deny("secrets", &key, "this would read it");
+    }
+    let full = key_path(path, cfg);
+    if Path::new(&full).is_dir()
+        && let Some(key) = holds_guard_key(&full, cfg, true)
+    {
+        return guard_key_deny("secrets", &key, &format!("a search of `{full}` would read it"));
+    }
     if names_secret(path, cfg) {
         Decision::deny("secrets", SECRETS_REASON)
     } else {
@@ -4223,7 +5068,11 @@ fn tree_reader(u: &Unit, cfg: &GuardConfig, vars: &[(String, String)]) -> (Optio
     let prog = u.prog();
     let argv = &u.argv;
     let subst = |a: &str| vars.iter().fold(a.replace("${HOME}", "$HOME"), |t, (n, v)| t.replace(&format!("${{{n}}}"), v).replace(&format!("${n}"), v));
-    let holds = |w: &str, c: &GuardConfig| holds_ssh_dir(&key_path(&subst(w), c), c);
+    // A member that holds ~/.ssh, or the folder the guards' own keys are in.
+    let holds = |w: &str, c: &GuardConfig| {
+        let full = key_path(&subst(w), c);
+        holds_ssh_dir(&full, c) || holds_guard_key(&full, c, false).is_some()
+    };
     let short_flags = |a: &str| a.starts_with('-') && !a.starts_with("--") && a.len() > 1;
     if matches!(prog, "tar" | "bsdtar" | "gtar") {
         let mut dir: Option<String> = None;
@@ -4354,6 +5203,16 @@ fn secrets(cmd: &str, cfg: &GuardConfig) -> Decision {
         if !named && !tree {
             continue;
         }
+        // One of the guards' own keys, by name or through the folder a recursive reader takes:
+        // the refusal names it, and no copy to another Mac is allowed for it.
+        let guard_key = words.iter().find_map(|w| {
+            guard_key_hit(w, &local, true)
+                .or_else(|| if tree { holds_guard_key(&key_path(w, &local), &local, false) } else { None })
+        });
+        let deny = || match &guard_key {
+            Some(key) => guard_key_deny("secrets", key, &format!("`{prog}` would read or copy it")),
+            None => Decision::deny("secrets", SECRETS_REASON),
+        };
         // A key read on stdin (`prog < key`, `$(<key)`) is data whatever the program is.
         let fed = redirect_sources(&u.text).iter().any(|w| {
             file_words(w, &vars).iter().any(|x| names_secret(x, &local))
@@ -4399,7 +5258,7 @@ fn secrets(cmd: &str, cfg: &GuardConfig) -> Decision {
             }
             return deny();
         }
-        if COPIERS.contains(&prog) {
+        if COPIERS.contains(&prog) && guard_key.is_none() {
             let redirect = u.argv.iter().skip(1).any(|a| {
                 a.starts_with("--rsh") || a.starts_with("--rsync-path") || a.starts_with("--proxy")
                     || (a.starts_with('-') && !a.starts_with("--") && a.contains(['o', 'F', 'J', 'S', 'e']))

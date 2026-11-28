@@ -406,15 +406,17 @@ fn offload_probe_runs_only_for_a_heavy_command() {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&probe, fs::Permissions::from_mode(0o755)).unwrap();
     }
-    // Only this test reads these two variables.
-    unsafe {
-        std::env::set_var("AGENTKIT_OFFLOAD_TARGET", &probe);
-        std::env::set_var("AGENTKIT_CONFIG", base.join("no-config"));
-    }
     // Loading the configuration must not start the probe: it can take 20 s when the worker
     // is slow to answer, and it used to run before every shell command.
-    let mut c = agentkit::site::guard_config_from_env();
-    c.home = base.join("home");
+    let home = base.join("home");
+    let paths = agentkit::Paths {
+        config: base.join("no-config"),
+        state: home.join(".local/state/agentkit"),
+        ledger: None,
+        home,
+    };
+    let (_, mut c) = agentkit::site::load_for_hook(&paths).unwrap();
+    c.offload_probe = Some(probe.clone());
     assert!(c.offload_worker.is_none(), "the probe ran while loading the configuration");
     assert!(!called.exists());
     for cmd in ["echo hello", "git status", "ls /tmp", "remote-run -- cargo test"] {
@@ -424,10 +426,6 @@ fn offload_probe_runs_only_for_a_heavy_command() {
     assert!(!called.exists(), "the probe ran for a light command");
     assert!(decide("offload-heavy", "cargo test", &c).is_deny());
     assert!(called.exists(), "the probe did not run for a heavy command");
-    unsafe {
-        std::env::remove_var("AGENTKIT_OFFLOAD_TARGET");
-        std::env::remove_var("AGENTKIT_CONFIG");
-    }
     let _ = fs::remove_dir_all(&base);
 }
 

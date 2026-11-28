@@ -12,8 +12,9 @@
 //! HMAC of the whole command. The HMAC key is a random file beside the ledger and never leaves
 //! this machine. No environment variables are written.
 //!
-//! Path: `$AGENTKIT_DECISIONS` when set (`off` disables the ledger), else
-//! `<agentkit state>/decisions.jsonl`.
+//! Path: `<agentkit state>/decisions.jsonl`, under the account's home. No environment variable
+//! moves it or switches it off: the hook's environment is the guarded agent's. The test suite
+//! passes `--state DIR` and `--ledger PATH|off` to the hook instead.
 
 use crate::guard::Decision;
 use fancy_regex::{Captures, Regex};
@@ -29,22 +30,19 @@ pub const MAX_LEDGER_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_CMD: usize = 2048;
 const MAX_FIELD: usize = 512;
 
-/// Where the ledger goes, or None when it is switched off.
-pub fn ledger_path(state_dir: &Path) -> Option<PathBuf> {
-    match std::env::var_os("AGENTKIT_DECISIONS") {
-        Some(v) if v == "off" => None,
-        Some(v) if !v.is_empty() => Some(PathBuf::from(v)),
-        _ => Some(state_dir.join("decisions.jsonl")),
-    }
+/// Where the ledger goes in a state folder.
+pub fn ledger_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("decisions.jsonl")
 }
 
-/// Append one line for this decision. Never panics, never returns an error.
-pub fn record(provider: &str, guard: &str, value: &Value, decision: &Decision, state_dir: &Path) {
-    let Some(path) = ledger_path(state_dir) else { return };
+/// Append one line for this decision to `ledger` (None: the test suite switched it off).
+/// Never panics, never returns an error.
+pub fn record(provider: &str, guard: &str, value: &Value, decision: &Decision, ledger: Option<&Path>) {
+    let Some(path) = ledger else { return };
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let key = hmac_key(&path);
+        let key = hmac_key(path);
         let line = build_line(provider, guard, value, decision, key.as_deref(), now_iso(), std::process::id(), parent_pid());
-        let _ = append_line(&path, &line);
+        let _ = append_line(path, &line);
     }));
 }
 
@@ -282,27 +280,20 @@ fn hmac_key(ledger: &Path) -> Option<Vec<u8>> {
     }
 }
 
-/// agentkit's state folder: `$AGENTKIT_STATE`, else `~/.local/state/agentkit`.
+/// agentkit's state folder under a home: `~/.local/state/agentkit`.
 pub fn default_state_dir(home: &Path) -> PathBuf {
-    std::env::var_os("AGENTKIT_STATE")
-        .filter(|d| !d.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".local/state/agentkit"))
+    home.join(".local/state/agentkit")
 }
 
-/// Everything the guard-config guard keeps agents from replacing, from the same functions the
-/// writer uses: the state folders, the ledger's folder, the ledger and its key.
-pub fn protected_paths(home: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
+/// Everything the guard-config guard keeps agents from replacing: the state folder under home,
+/// the state folder and ledger this hook was started with (the same unless a test moved them),
+/// and the ledger's key.
+pub fn protected_paths(home: &Path, state: &Path, ledger: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
     // The state folders are protected whole (any name in them, so a hard link made there is
     // covered); a custom ledger elsewhere protects its two files, and its folder as an ancestor.
-    let mut dirs = vec![home.join(".local/state/agentkit"), default_state_dir(home)];
-    let mut files = Vec::new();
-    if let Some(ledger) = ledger_path(&default_state_dir(home)) {
-        files.push(key_path(&ledger));
-        files.push(ledger);
-    }
+    let mut dirs = vec![default_state_dir(home), state.to_path_buf()];
     dirs.dedup();
-    (dirs, files)
+    (dirs, vec![key_path(ledger), ledger.to_path_buf()])
 }
 
 /// HMAC-SHA256, first `n` hex characters. With no key, a plain marker (no digest at all), so

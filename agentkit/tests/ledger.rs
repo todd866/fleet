@@ -64,19 +64,30 @@ fn iso_dates() {
     assert_eq!(ledger::iso_from(951_782_400, 0), "2000-02-29T00:00:00.000Z");
 }
 
-fn run_hook(state: &PathBuf, ledger_env: Option<&str>, payload: &str) -> (String, i32) {
+/// The hook, placed in a temporary tree by flags: it takes no path from the environment.
+fn hook_at(home: &std::path::Path, state: &std::path::Path, ledger: Option<&str>) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_agentkit"));
-    cmd.args(["hook", "claude", "all"])
-        .env("AGENTKIT_STATE", state)
-        .env("AGENTKIT_CONFIG", state.join("no-config"))
+    cmd.args(["hook", "claude", "all", "--home"])
+        .arg(home)
+        .arg("--state")
+        .arg(state)
+        .arg("--config")
+        .arg(state.join("no-config"))
         .env("AGENTKIT_SKIP_SSH_RESOLVE", "1")
-        .env("HOME", state)
+        .env("HOME", home)
+        .env_remove("AGENTKIT_DECISIONS")
+        .env_remove("AGENTKIT_STATE")
+        .env_remove("AGENTKIT_CONFIG")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped());
-    match ledger_env {
-        Some(v) => { cmd.env("AGENTKIT_DECISIONS", v); }
-        None => { cmd.env_remove("AGENTKIT_DECISIONS"); }
+    if let Some(v) = ledger {
+        cmd.args(["--ledger", v]);
     }
+    cmd
+}
+
+fn run_hook(state: &PathBuf, ledger_env: Option<&str>, payload: &str) -> (String, i32) {
+    let mut cmd = hook_at(state, state, ledger_env);
     let mut child = cmd.spawn().unwrap();
     child.stdin.take().unwrap().write_all(payload.as_bytes()).unwrap();
     let out = child.wait_with_output().unwrap();
@@ -169,17 +180,7 @@ fn mkfifo(path: &std::path::Path) {
 
 /// The hook answers within a few seconds or the test fails (a FIFO used to block it forever).
 fn run_hook_bounded(state: &PathBuf, payload: &str) -> String {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_agentkit"))
-        .args(["hook", "claude", "all"])
-        .env("AGENTKIT_STATE", state)
-        .env("AGENTKIT_CONFIG", state.join("no-config"))
-        .env("AGENTKIT_SKIP_SSH_RESOLVE", "1")
-        .env("HOME", state)
-        .env_remove("AGENTKIT_DECISIONS")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child = hook_at(state, state, None).spawn().unwrap();
     child.stdin.take().unwrap().write_all(payload.as_bytes()).unwrap();
     let start = std::time::Instant::now();
     loop {
@@ -306,19 +307,11 @@ fn short_and_padded_base64_secrets_are_redacted() {
     assert_eq!(n, 0, "{keep}");
 }
 
-fn hook_with_env(state: &PathBuf, envs: &[(&str, String)], payload: &str) -> String {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_agentkit"));
-    cmd.args(["hook", "claude", "all"])
-        .env("AGENTKIT_CONFIG", state.join("no-config"))
-        .env("AGENTKIT_SKIP_SSH_RESOLVE", "1")
-        .env("HOME", state.join("home"))
-        .env_remove("AGENTKIT_DECISIONS")
-        .env_remove("AGENTKIT_STATE")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped());
-    for (k, v) in envs {
-        cmd.env(k, v);
-    }
+/// The hook with its state folder and ledger somewhere of their own (`--state`, `--ledger`).
+fn hook_with_env(base: &PathBuf, placed: &[(&str, String)], payload: &str) -> String {
+    let given = |flag: &str| placed.iter().find(|(f, _)| *f == flag).map(|(_, v)| v.clone());
+    let state = given("--state").map(PathBuf::from).unwrap_or_else(|| base.join("home/.local/state/agentkit"));
+    let mut cmd = hook_at(&base.join("home"), &state, given("--ledger").as_deref());
     let mut child = cmd.spawn().unwrap();
     child.stdin.take().unwrap().write_all(payload.as_bytes()).unwrap();
     String::from_utf8_lossy(&child.wait_with_output().unwrap().stdout).into_owned()
@@ -332,7 +325,7 @@ fn custom_ledger_and_state_paths_and_their_ancestors_are_guarded_anywhere() {
     let ledger = base.join("logs/custom/dec.jsonl");
     fs::create_dir_all(&state).unwrap();
     fs::create_dir_all(ledger.parent().unwrap()).unwrap();
-    let envs = [("AGENTKIT_STATE", state.display().to_string()), ("AGENTKIT_DECISIONS", ledger.display().to_string())];
+    let envs = [("--state", state.display().to_string()), ("--ledger", ledger.display().to_string())];
     let l = ledger.display();
     let cases = [
         format!("rm {l}"),
@@ -505,15 +498,8 @@ fn multibyte_option_words_never_panic_and_a_panic_is_a_deny() {
     }
     let call = json!({"tool_name": "Bash", "tool_input": {"command": "tool -é~/.local/state/agentkit/decisions.jsonl"}}).to_string();
     assert!(run_hook(&state, Some("off"), &call).0.contains("deny"));
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_agentkit"));
-    cmd.args(["hook", "claude", "all"])
-        .env("AGENTKIT_STATE", &state)
-        .env("AGENTKIT_CONFIG", state.join("no-config"))
-        .env("AGENTKIT_DECISIONS", "off")
-        .env("AGENTKIT_TEST_PANIC", "1")
-        .env("HOME", &state)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped());
+    let mut cmd = hook_at(&state, &state, Some("off"));
+    cmd.env("AGENTKIT_TEST_PANIC", "1");
     let mut child = cmd.spawn().unwrap();
     child.stdin.take().unwrap().write_all(br#"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#).unwrap();
     let out = child.wait_with_output().unwrap();

@@ -9,6 +9,10 @@
   "properties": {
     "schema": { "const": 1 },
     "manage_model": { "type": "boolean", "default": false },
+    "hook_bin": {
+      "type": "string",
+      "description": "Absolute path (or ~/...) of the agentkit binary the generated hooks run; agent-context sits beside it. Default ~/.local/bin/agentkit."
+    },
     "projects": {
       "type": "array",
       "items": {
