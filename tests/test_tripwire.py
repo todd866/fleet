@@ -245,6 +245,22 @@ class TripwireTest(unittest.TestCase):
         with mock.patch.object(module.subprocess, "run", return_value=response):
             self.assertEqual(module.reports.verdict(module.text_review("zai", record, 3)[0]), "VERDICT: HOSTILE")
 
+    def test_a_hook_file_agentkit_would_write_is_not_held(self):
+        # Owner, 28 Nov 2026: a guard update rewrites every hook file, and that must not wait for him.
+        hook = str(self.home / "settings.json")
+        other = str(self.home / "hooks.json")
+        cfg = {"must_contain": [[hook, "agentkit hook"], [other, "agentkit hook"]]}
+        clean = lambda: "agentkit sync: no changes\n"
+        only_other = lambda: f"--- {other}\n+++ {other}\n-a\n+b\n"
+        this_one = lambda: f"--- {hook}\n+++ {hook}\n-a\n+b\n"
+        self.assertTrue(self.tw.generated_hook_file(cfg, hook, clean))
+        self.assertTrue(self.tw.generated_hook_file(cfg, hook, only_other))
+        self.assertFalse(self.tw.generated_hook_file(cfg, hook, this_one))    # differs from what agentkit writes
+        self.assertFalse(self.tw.generated_hook_file(cfg, hook, lambda: None))  # sync could not run: hold
+        self.assertFalse(self.tw.generated_hook_file(cfg, hook, lambda: "something unexpected"))
+        # never for a file that is not a guard hook file, such as the login keys
+        self.assertFalse(self.tw.generated_hook_file(dict(cfg, hold_files=[str(self.keys)]), str(self.keys), clean))
+
     def test_first_run_records_and_raises_nothing(self):
         self.check()
         self.assertEqual(self.incidents(), [])
