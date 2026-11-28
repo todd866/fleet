@@ -67,7 +67,7 @@
    "name": "job",
    "for_each_job": true,
    "check": "launchctl print gui/$UID/{label} >/dev/null 2>&1 || launchctl print system/{label} >/dev/null 2>&1",
-   "apply": "test -f {plist} && ~/.local/state/mac-sync/deploy-service.sh {plist}"
+   "apply": "test -f {plist} && ~/Projects/fleet/bin/deploy-service {plist}"
   },
   {
    "name": "morning snapshot",

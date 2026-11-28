@@ -1,0 +1,28 @@
+#!/bin/bash
+# deploy-service PLIST: install a launchd agent on THIS Mac from a plist written on another Mac.
+# Rewrites any nvm or Homebrew node path to this Mac's node, (re)bootstraps the job, prints its state.
+# Idempotent.
+#
+# This is the copy to run. It used to live in the synced setup folder, where any Mac sharing the
+# folder could rewrite it and mac-setup would run it (security audit, 28 Nov 2026). mac-setup runs
+# this file from its own checkout, on a plist the repository carries or pins.
+set -e
+src=${1:?usage: deploy-service PLIST}
+[ -f "$src" ] || { echo "deploy-service: no such plist: $src" >&2; exit 2; }
+# The Label, not the file name (19 Nov 2026: a plist copied to a temp name made a duplicate job).
+label=$(/usr/libexec/PlistBuddy -c "Print :Label" "$src" 2>/dev/null || basename "$src" .plist)
+# The label becomes a file name and a launchctl target.
+[[ "$label" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { echo "deploy-service: not a launchd label in $src" >&2; exit 2; }
+dst="$HOME/Library/LaunchAgents/$label.plist"
+node=$(ls -d "$HOME"/.nvm/versions/node/v*/bin/node 2>/dev/null | sort -V | tail -1); [ -n "$node" ] || node=/opt/homebrew/bin/node
+mkdir -p "$HOME/Library/LaunchAgents"
+sed -E "s#/Users/[^/]+/\.nvm/versions/node/v[0-9.]+/bin/node|/opt/homebrew/bin/node#$node#g" "$src" > "$dst.new"
+plutil -lint "$dst.new" >/dev/null && mv "$dst.new" "$dst"
+launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+# bootout returns before the old process has gone; an immediate bootstrap then fails with "5: Input/output error"
+# and, under set -e, the job was left unloaded (22 Nov 2026). Retry for ~10 s; the last try shows the error.
+n=0; until launchctl bootstrap "gui/$(id -u)" "$dst" 2>/dev/null; do n=$((n+1)); [ $n -ge 10 ] && { launchctl bootstrap "gui/$(id -u)" "$dst"; break; }; sleep 1; done
+sleep 2; launchctl print "gui/$(id -u)/$label" 2>/dev/null | awk -v l="$label" '/^\tstate =|last exit code/{printf "%s %s; ", l, $0} END{print ""}'
+# Include the installed fingerprint so a reviewer can match this one change to its incident.
+shasum -a 256 "$dst"
+echo "deploy-service: review any Tripwire incident for $label with tripwire status."

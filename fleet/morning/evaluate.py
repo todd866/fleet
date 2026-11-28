@@ -1952,8 +1952,16 @@ def _free_space_guard(name, status, now):
 def _mac_setup(name, status, now):
     """One row per Mac: how far its setup has drifted from the reference Mac (mac-setup). No drift passes;
     drift warns and names the first items; a pass older than an hour, or a daily package pass older than
-    36 hours on a follower, is stale."""
+    36 hours on a follower, is stale. A refusal fails: the Mac found a file in the synced setup folder
+    that the repository's pins do not vouch for and had no verified copy to use instead."""
     key, title = f"kit:{name}:setup", f"{name} setup"
+    refused = [str(r) for r in (status.get("refused") or [])]
+    if refused:
+        return _row(key, "fail", "kit", title, f"{len(refused)} refused", "not vouched for by the repository",
+                    f"{name} refused setup files from the synced folder: " + "; ".join(r[:200] for r in refused[:4])
+                    + (f"; and {len(refused) - 4} more" if len(refused) > 4 else "")
+                    + f". Full list: `mac-setup status` on {name}. If the reference Mac changed them, run `mac-setup pin` "
+                    "there, commit and push; otherwise treat the synced folder as altered.")
     drift = [str(d) for d in (status.get("drift") or [])]
     age = now - int(status.get("checked_at") or 0)
     pkg_at = status.get("packages_checked_at")
