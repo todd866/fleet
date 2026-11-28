@@ -34,12 +34,6 @@ undone, so that taking a few minutes to think costs nothing:
 | new or changed job in `~/Library/LaunchAgents` | disabled, and unloaded if it was loaded | enabled, and loaded again if it had been and its plist is still the one that was held | the investigator's BENIGN, or the owner |
 | login keys, a guard hook file, tripwire's config (`hold_files`, `must_contain`) | put back to the last checked version, or taken away if there was none; the changed version is kept in the incident's `held/` | the changed version returns, unless the file changed again meanwhile | the owner only |
 
-A guard hook file that is exactly what `agentkit sync` would write from the owner's own site
-config (its dry run reports no difference for that file) is not held: a guard update rewrites
-every hook file on every Mac, and that needs no owner. Both the site config and the agentkit
-binary are files the guard refuses agent writes to. A hook file that differs from what agentkit
-generates, or a sync that cannot run, is held as above (owner, 28 Nov 2026).
-
 Other watched files, system-wide jobs and accounts are investigated but not held: holding them
 needs root or would undo ordinary edits. The job that runs `tripwire` is never held, nor are
 the programs in `never_pause`. That job is known by its label, pinned when the owner accepts

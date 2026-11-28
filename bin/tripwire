@@ -610,39 +610,6 @@ def own_labels():
 
 # ---- holds: pause the changed thing now, in a way `release` can undo ----
 
-AGENTKIT_BIN = "~/.local/bin/agentkit"
-
-
-def generated_hook_file(config, path, run_sync=None):
-    """True when PATH is one of the guard hook files (must_contain) and agentkit, from the owner's own
-    site config, would write it exactly as it is now: `agentkit sync` (a dry run) reports no difference
-    for it. Owner, 28 Nov 2026: a guard update rewrites these files on every Mac, and waiting for him
-    each time was the wrong trade. The site config and the agentkit binary are both files the guard
-    refuses agent writes to, so a file that matches what they generate carries no agent's choice.
-    Anything else (a hand edit, a removed hook, a sync that cannot run) is held as before."""
-    if path not in [p for p, _ in config.get("must_contain", DEFAULT_MUST_CONTAIN)]:
-        return False
-    if run_sync is None:
-        def run_sync():
-            binary = expand(AGENTKIT_BIN)
-            if binary.is_symlink() or not binary.is_file():
-                return None
-            env = {"HOME": str(HOME), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "C.UTF-8"}
-            try:
-                done = subprocess.run([str(binary), "sync"], capture_output=True, text=True, env=env, timeout=60)
-            except (OSError, subprocess.TimeoutExpired):
-                return None
-            return done.stdout if done.returncode == 0 else None
-    out = run_sync()
-    if out is None:
-        return False
-    if out.strip() == "agentkit sync: no changes":
-        return True
-    full = str(expand(path))
-    named = [line[4:].strip() for line in out.splitlines() if line.startswith(("--- ", "+++ "))]
-    return bool(named) and full not in named
-
-
 def hold_paths(config):
     """Files a hold may put back, and so the only files a release may ever write."""
     paths = list(config.get("hold_files", HOLD_FILES)) + [p for p, _ in config.get("must_contain", DEFAULT_MUST_CONTAIN)]
@@ -740,8 +707,6 @@ def apply_holds(config, found, incident, kill=os.kill):
                 target = expand(path)
                 if path not in hold_paths(config) or target.is_dir():
                     continue
-                if generated_hook_file(config, path):
-                    continue  # exactly what agentkit writes from the owner's own config: nothing to hold
                 if change["wire"] == "files" and change.get("before") == "absent":
                     earlier = None  # it was not there when last checked: holding it takes it away again
                 else:
